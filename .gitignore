@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
+
+.env
+
+data/
+outputs/
+results/
+docs/
+logs/
+
+*.tar.gz
+submission/
+nohup.out
