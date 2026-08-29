@@ -15,3 +15,6 @@ logs/
 *.tar.gz
 submission/
 nohup.out
+
+.claude/
+.agents/
