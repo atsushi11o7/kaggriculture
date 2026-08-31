@@ -9,7 +9,8 @@ __pycache__/
 data/
 outputs/
 results/
-docs/
+docs/*
+!docs/game-overview.md
 logs/
 
 *.tar.gz
