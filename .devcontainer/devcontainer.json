@@ -25,7 +25,8 @@
     "CLAUDE_CONFIG_DIR": "/root/.claude",
     "CODEX_HOME": "/root/.codex",
     "LANG": "C.UTF-8",
-    "LC_ALL": "C.UTF-8"
+    "LC_ALL": "C.UTF-8",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
   },
   "shutdownAction": "none", 
   "customizations": {
