@@ -7,6 +7,8 @@ constants.py で決めた並び順(CROPS/ANIMALS/PRODUCTS/SHOPSのインデッ�
 元データの出典: data/kaggle_environments_src/kaggriculture.py
 """
 
+import jax.numpy as jnp
+
 from .constants import (
     ANIMALS,
     CROPS,
@@ -50,6 +52,13 @@ CROP_MAX_YIELD = (6, 4, 4, 4, 6)
 
 # True = 継続収穫型(トマト・イチゴ)、False = 一発収穫型
 CROP_IS_ONGOING = (False, False, True, True, False)
+
+# 収穫物がPRODUCTS(=SHED_ITEMSの先頭9個と同じ並び)の何番目かを表す対応表。
+# 作物は「植える対象」と「収穫物」の名前が一致するので、現状は単純に
+# CROPS[i] == PRODUCTS[i] という並びの一致により実質恒等写像だが、
+# ANIMAL_PRODUCT_IDX(動物→生産物、こちらは名前が一致しないので変換が必須)と
+# 対にして明示しておくことで、CROPS/PRODUCTSの並び順が将来変わっても壊れないようにする。
+CROP_PRODUCT_IDX = tuple(PRODUCTS.index(crop) for crop in CROPS)
 
 # ============================================================
 # 動物(ANIMALSと同じ並び順: GOOSE, COW, SHEEP)
@@ -111,15 +120,15 @@ MARKET_T = (400, 450, 200, 100, 300, 332, 122, 105, 200)
 
 # 在庫がI0を下回った(品薄)時に使う形状関数
 MARKET_BELOW_FUNC = (
-    FUNC_SQRT,   # WHEAT
+    FUNC_SQRT,  # WHEAT
     FUNC_HINGE,  # CARROT
     FUNC_HINGE,  # TOMATO
-    FUNC_SQRT,   # STRAWBERRY
-    FUNC_LOG,    # MELON
+    FUNC_SQRT,  # STRAWBERRY
+    FUNC_LOG,  # MELON
     FUNC_HINGE,  # EGG
-    FUNC_SQRT,   # MILK
-    FUNC_LOG,    # WOOL
-    FUNC_LINEAR, # FERTILIZER
+    FUNC_SQRT,  # MILK
+    FUNC_LOG,  # WOOL
+    FUNC_LINEAR,  # FERTILIZER
 )
 
 # 品薄側の価格の効き具合(T単位分だけ品薄になった時、基準価格の何倍動くか)
@@ -127,15 +136,15 @@ MARKET_BELOW_TARGET = (0.80, 1.00, 0.40, 0.70, 0.20, 0.40, 0.60, 0.20, 0.40)
 
 # 在庫がI0を上回った(供給過多)時に使う形状関数
 MARKET_ABOVE_FUNC = (
-    FUNC_LOG,    # WHEAT
-    FUNC_SQRT,   # CARROT
-    FUNC_SQRT,   # TOMATO
-    FUNC_LINEAR, # STRAWBERRY
-    FUNC_SQ,     # MELON
-    FUNC_LOG,    # EGG
-    FUNC_LINEAR, # MILK
-    FUNC_SQ,     # WOOL
-    FUNC_LINEAR, # FERTILIZER
+    FUNC_LOG,  # WHEAT
+    FUNC_SQRT,  # CARROT
+    FUNC_SQRT,  # TOMATO
+    FUNC_LINEAR,  # STRAWBERRY
+    FUNC_SQ,  # MELON
+    FUNC_LOG,  # EGG
+    FUNC_LINEAR,  # MILK
+    FUNC_SQ,  # WOOL
+    FUNC_LINEAR,  # FERTILIZER
 )
 
 # 供給過多側の価格の効き具合
@@ -176,3 +185,12 @@ TOWN_CENTER_PRODUCTS = tuple(p != "FERTILIZER" for p in PRODUCTS)
 
 # ショップの抽選は最大何インスタンスで打ち止めになるか(重複可、種類数の上限ではない)
 MAX_SHOP_INSTANCES = 8
+
+# --- 上記テーブルのうち、複数モジュールから参照されるもののjnp版 ---
+# 単一モジュールでしか使わない配列は、そのモジュール内でjnp.array(...)する方が
+# 参照元が追いやすいのでここには置かない。ここに置くのは、同じテーブルを別々の
+# ファイルで作り直すと値がズレた時に気づきにくい(片方だけ将来変更されて他方が
+# 古いまま、といった事故につながる)ものだけ。
+CROP_IS_ONGOING_JAX = jnp.array(CROP_IS_ONGOING)
+CROP_FIRST_YIELD_DAY_JAX = jnp.array(CROP_FIRST_YIELD_DAY, dtype=jnp.int32)
+CROP_MAX_YIELD_JAX = jnp.array(CROP_MAX_YIELD, dtype=jnp.int32)
