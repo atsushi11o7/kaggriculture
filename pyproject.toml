@@ -12,6 +12,9 @@ dependencies = [
     # 数値計算・データハンドリング
     "numpy>=1.26",
     "pandas>=2.2",
+    # GPUシミュレータ(kaggricultureのGPU移植本体が依存する。学習の有無に関わらず必要)
+    # [cuda12]: CUDA対応のjaxlibを取得する。素の"jax"指定だとCPU専用ビルドが入る
+    "jax[cuda12]>=0.4",
     # Kaggle（対戦環境 / CLI）
     "kaggle-environments==1.32.7",
     "kaggle>=1.7",
