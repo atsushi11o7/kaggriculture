@@ -38,7 +38,7 @@ state, reward, done = jitted_step(state, action)
 
 - **公式シミュレータとの一致**: `scripts/generate_golden_traces.py`でKaggle提供版(CPU)から生成したトレースと、`scripts/validate_against_golden_trace.py`で全ターン突き合わせている。乱数(雑草の自然発生・店の抽選)が絡まない設定(`weedSpawnChance: 0`、`townShopUnlockInterval`を十分大きくする)なら、全フィールド・reward・doneが完全一致することを確認済み(引数無しで`validate_against_golden_trace.py`を実行すると、コミット済みの3トレースを全ターン検証する)
 - **乱数**: JAXの乱数(threefry)を使うため、Pythonの`random.Random`(メルセンヌ・ツイスタ)とはビット単位で一致しない。雑草の自然発生・店の抽選は「確率分布として正しい」ことのみ保証する(具体的にどのマスに雑草が生えるかは元の実行結果と一致しなくてよい)
-- **観測のマスキングは未実装**: `State`は内部シミュレータとして両プレイヤーの全情報(相手の納屋・種・持ち物を含む)を平等に保持している。Kaggle提供版は各プレイヤーに相手の`private`(納屋・種・持ち物)を隠した観測を渡すが、その「エージェントに見せる観測を作る(相手情報を隠す)」層はまだ無い(隠すべきは`shed`/`seeds`/`farmer_inventory`/`hands_inventory`の4フィールドのみ、他は元々公開情報)。**このまま`State`全体を方策の入力にすると、学習中は相手の情報が丸見えになるため、実際の学習ループを組む前に必ずこの層を作ること**
+- **観測のマスキング**: `State`は内部シミュレータとして両プレイヤーの全情報を平等に保持している。Kaggle提供版は各プレイヤーに相手の`private`(納屋・種・持ち物)を隠した観測を渡すため、方策の入力には`State`をそのまま使わず、[observation.py](observation.py)の`build_observation(state, player)`(1プレイヤー分)/`build_observations(state)`(両プレイヤー分)を使うこと。**`State`全体をそのまま方策の入力にすると、学習中は相手の情報が丸見えになる**
 - **`MAX_HANDS`/`MAX_MARKET_ORDERS`**: 元のルールに存在しない、GPU移植版固有の上限([constants.py](constants.py)参照)。配列のshapeを固定するために導入した
 - **未対応の設定**: `marketParams`(品目ごとの価格曲線の上書き)は未対応。市場価格パラメータは[game_params.py](game_params.py)の固定値のみ
 
@@ -68,6 +68,7 @@ state, reward, done = jitted_step(state, action)
 | [state.py](state.py) | ゲーム状態`State`(NamedTuple)の定義。全フィールド固定shape |
 | [action.py](action.py) | 1ターン分の行動`Action`(NamedTuple)の定義 |
 | [reset.py](reset.py) | 初期状態を作る |
+| [observation.py](observation.py) | `State`から各プレイヤー向けのマスク済み観測を作る |
 | [constants.py](constants.py) | 定数(作物/動物/タイル種類/op番号などのインデックス割り当て) |
 | [game_params.py](game_params.py) | ゲームバランスの数値パラメータ(種代・収穫日数・市場基準価格など) |
 | [board.py](board.py) | 盤面座標の共通ヘルパー(区画・納屋隣接マス) |
