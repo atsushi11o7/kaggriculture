@@ -17,6 +17,8 @@ EmbeddingBagの外側で別途足し込む(ネットワーク本体側の実装�
 
 from dataclasses import dataclass, field
 
+import torch
+
 from kaggriculture.simulator import constants as C
 
 _next_index = 0
@@ -87,6 +89,10 @@ TURN_HOUR = _alloc(1)  # value=正規化した日内ターン
 # 共有した方が、観測と行動の対応関係を学習しやすい)。
 ACTION_FARMER_OP = _alloc(C.N_FARMER_OPS)  # constants.FARMER_OP_NAMESと同じ並び
 ACTION_MARKET_OP = _alloc(C.N_MARKET_OPS)  # constants.MARKET_OP_NAMESと同じ並び
+# 市場注文は0〜MAX_MARKET_ORDERS件の可変長リストで、プレイヤーが「もう注文しない」
+# ことを選べる。デコーダが逐次的に市場注文スロットを埋めていく際、この候補を選ぶと
+# 市場注文の決定を打ち切る(simulator側には対応する概念が無い、デコード専用の候補)。
+ACTION_MARKET_STOP = _alloc(1)
 
 VOCAB_SIZE = _next_index
 
@@ -101,3 +107,26 @@ class SparseVector:
     def add(self, index: int, value: float = 1.0) -> None:
         self.index.append(index)
         self.value.append(value)
+
+
+def collate(vectors: list[SparseVector]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SparseVectorのリストをnn.EmbeddingBag用の(index, value, offset)に平坦化する。
+
+    盤面トークン列(1局面=NUM_WORDS_ENCODER個)にも行動候補列(1スロット=候補数個)
+    にも使える汎用のバッチ化処理(EmbeddingBagは「バッグ」の区切りをoffsetで
+    表現する1次元の平坦なテンソルしか受け付けないため)。
+    """
+    index: list[int] = []
+    value: list[float] = []
+    offset: list[int] = []
+    cursor = 0
+    for sv in vectors:
+        offset.append(cursor)
+        index.extend(sv.index)
+        value.extend(sv.value)
+        cursor += len(sv.index)
+    return (
+        torch.tensor(index, dtype=torch.long),
+        torch.tensor(value, dtype=torch.float32),
+        torch.tensor(offset, dtype=torch.long),
+    )
