@@ -94,21 +94,20 @@ def legal_unit_actions(
     if is_weed:
         candidates.append(_candidate(farmer_op="DIG"))
 
-    # 空の小屋に立っている間、その小屋に対応する動物名のPLACEは(持ち物の有無に
-    # 関わらず)常に動物配置側の判定を専有し、納屋落としにはフォールバックしない
-    # (animal_actions.pyのon_animal_branch参照)。この動物名だけ、下のPLACE
-    # (納屋落とし)候補の対象から除外する。
-    on_animal_branch_item = None
+    # 空の小屋に立っている間、その小屋に対応する動物名(PASTUREはCOW・SHEEPの
+    # 2種類が該当)のPLACEは(持ち物の有無に関わらず)常に動物配置側の判定を専有し、
+    # 納屋落としにはフォールバックしない(animal_actions.pyのon_animal_branch参照。
+    # item_idxごとに独立して構造の一致を見るため、該当する動物名は複数ありうる)。
+    # これらの動物名だけ、下のPLACE(納屋落とし)候補の対象から除外する。
+    on_animal_branch_items = set()
     if is_structure and not has_animal:
         candidates.append(_candidate(farmer_op="DIG"))
-        on_animal_branch_item = next(a for a, s in _ANIMAL_STRUCTURE.items() if s == tile["kind"])
-        if inventory.get(on_animal_branch_item, 0) > 0:
-            candidates.append(
-                _candidate(
-                    farmer_op="PLACE",
-                    item_index=V.TILE_ANIMAL[C.ANIMALS.index(on_animal_branch_item)],
+        on_animal_branch_items = {a for a, s in _ANIMAL_STRUCTURE.items() if s == tile["kind"]}
+        for animal in on_animal_branch_items:
+            if inventory.get(animal, 0) > 0:
+                candidates.append(
+                    _candidate(farmer_op="PLACE", item_index=V.TILE_ANIMAL[C.ANIMALS.index(animal)])
                 )
-            )
 
     if is_empty:
         for crop, n in seeds.items():
@@ -123,7 +122,7 @@ def legal_unit_actions(
         if any(n > 0 for n in inventory.values()):
             candidates.append(_candidate(farmer_op="DROP"))
             for item, n in inventory.items():
-                if n > 0 and item != on_animal_branch_item:
+                if n > 0 and item not in on_animal_branch_items:
                     candidates.append(
                         _candidate(
                             farmer_op="PLACE", item_index=V.SHED_ITEM[C.SHED_ITEMS.index(item)]
@@ -192,6 +191,17 @@ def legal_market_actions(
             )
 
     return candidates
+
+
+def market_stop_candidate() -> V.SparseVector:
+    """市場注文の決定を打ち切る(これ以上注文しない)候補。常に合法。
+
+    legal_market_actionsが返す候補と違い、simulator側に対応する行動は無い
+    (デコーダが可変長の市場注文リストの終わりを決めるための専用候補)。
+    """
+    sv = V.SparseVector()
+    sv.add(V.ACTION_MARKET_STOP[0])
+    return sv
 
 
 def _fib(n: int) -> int:
