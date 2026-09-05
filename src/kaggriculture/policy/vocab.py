@@ -76,6 +76,18 @@ TOWN_SHOP = _alloc(C.N_SHOPS)  # value=出現数
 TURN_DAY = _alloc(1)  # value=正規化した経過日数
 TURN_HOUR = _alloc(1)  # value=正規化した日内ターン
 
+# ============================================================
+# 行動候補(デコーダ側)の語彙
+# ============================================================
+# 「今合法な行動候補だけ」を列挙してデコーダに渡す(全行動空間に対する固定サイズの
+# 出力ではない)。1候補は(op, item)の組で表し、opはfarmer/hand用とmarket用で
+# 別々の埋め込みを持つ。itemは対象(作物・動物・品目)ごとに、盤面側で使っている
+# 埋め込み(TILE_CROP/TILE_ANIMAL/SHED_ITEM/MARKET_PRODUCT)をそのまま再利用する
+# (例: 「MELONを植える」候補と「タイルにMELONが植わっている」事実は同じ埋め込みを
+# 共有した方が、観測と行動の対応関係を学習しやすい)。
+ACTION_FARMER_OP = _alloc(C.N_FARMER_OPS)  # constants.FARMER_OP_NAMESと同じ並び
+ACTION_MARKET_OP = _alloc(C.N_MARKET_OPS)  # constants.MARKET_OP_NAMESと同じ並び
+
 VOCAB_SIZE = _next_index
 
 
