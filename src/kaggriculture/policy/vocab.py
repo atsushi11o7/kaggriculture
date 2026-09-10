@@ -1,23 +1,19 @@
-"""方策ネットが期待する疎特徴量(SparseVector)の語彙定義。
+"""EmbeddingBagで使う疎特徴量の語彙。
 
-方策ネットはnn.EmbeddingBag(mode="sum")で疎特徴量を埋め込む。SparseVectorは
-(index, value)のペアの集まりで、EmbeddingBagは sum(embedding[index[i]] * value[i])
-を計算する。カテゴリ特徴はvalue=1.0、連続値(個数・日数等)はvalue=正規化した値、
-という使い分けにする。
-
-このモジュールは「ネットワークがどの添字をどう解釈するか」という契約だけを持つ。
-生の観測(リプレイJSON、自前シミュレータのState等)からこの語彙のSparseVectorへ
-変換する処理は、データソースごとに別パッケージが担う。
-
-盤面は「自分の100マス+相手の100マス+その他のゾーン(所持金・納屋・種・持ち物・
-市場・街・ターン)」をそれぞれ1トークンとしてエンコードする想定。各トークンの
-owner(誰の情報か)とzone(何の種類の情報か)は局面によらず固定なので、
-EmbeddingBagの外側で別途足し込む(ネットワーク本体側の実装で対応させる)。
+品目識別子は観測ゾーンと行動候補で共有し、文脈はzoneや専用マーカーで表す。
+単独スカラーはLayerNormで大きさを失うため、存在マーカーと量bucketを併用する。
 """
 
 from dataclasses import dataclass, field
 
+import torch
+
 from kaggriculture.simulator import constants as C
+
+BOARD_SIZE = 10
+
+# 方策上の数量上限。BUY_SEED等では理論上これを超える合法手もあり得る。
+MAX_ACTION_QUANTITY = 100
 
 _next_index = 0
 
@@ -30,10 +26,29 @@ def _alloc(n: int) -> range:
     return r
 
 
-# --- タイル特徴 ---
+# log正規化後も低数量を区別できる16段階。
+N_MAGNITUDE_BUCKETS = 16
+
+
+def bucket_index(normalized: float, n_buckets: int = N_MAGNITUDE_BUCKETS) -> int:
+    """[0, 1]付近に正規化した値をバケット添字(0..n_buckets-1)に離散化する。"""
+    return min(max(int(normalized * n_buckets), 0), n_buckets - 1)
+
+
+# --- 実体(作物・動物・生産物)の共有識別子 ---
+ENTITY_ITEM = _alloc(C.N_SHED_ITEMS)  # constants.SHED_ITEMS(=PRODUCTS+ANIMALS)と同じ並び
+# ENTITY_ITEM[i]の個数/価格バケット。添字は entity_idx * N_MAGNITUDE_BUCKETS + bucket。
+ENTITY_MAGNITUDE_BUCKET = _alloc(C.N_SHED_ITEMS * N_MAGNITUDE_BUCKETS)
+
+
+def entity_index(name: str) -> int:
+    """品目名(constants.SHED_ITEMSに含まれるもの)のENTITY_ITEM語彙添字を引く。"""
+    return ENTITY_ITEM[C.SHED_ITEMS.index(name)]
+
+
+# --- タイル特徴(作物・動物の識別自体はENTITY_ITEMを使う) ---
+# タイルの連続値はkind/itemと共存し、LayerNorm後も方向の差が残るためbucket化しない。
 TILE_KIND = _alloc(6)  # constants.TILE_EMPTY..TILE_PASTUREと同じ並び
-TILE_CROP = _alloc(C.N_CROPS)  # PLANT限定: 作物
-TILE_ANIMAL = _alloc(C.N_ANIMALS)  # COOP/PASTURE限定: 動物
 TILE_CARE_DONE_TODAY = _alloc(1)  # 水やり/給餌済みか(PLANT/動物共通の1スロット)
 TILE_CARED_TODAY = _alloc(1)  # 動物限定: 世話済みか
 TILE_FERTILIZED_ACTIVE = _alloc(1)  # PLANT限定: 施肥ボーナス有効中か
@@ -50,27 +65,40 @@ TILE_LIFESPAN_REMAINING = _alloc(1)  # PLANT限定: 一発収穫型のみ。max_
 # 明示的に伝える(yield_units等から間接的に読み取らせるより素直)。
 
 # --- プレイヤー情報(自分・相手共通の1トークン) ---
-PLAYER_MONEY = _alloc(1)  # value=正規化した所持金
+PLAYER_MONEY = _alloc(1)  # 所持金があることの存在マーカー(value=1.0固定)
+PLAYER_MONEY_MAGNITUDE_BUCKET = _alloc(N_MAGNITUDE_BUCKETS)  # 所持金の量バケット(離散)
+PLAYER_MONEY_CONTINUOUS = _alloc(1)  # 所持金(value=正規化値、bucketの離散化損失を補う)
 PLAYER_UNLOCKED_QUADRANT = _alloc(C.N_QUADRANTS)  # 解放済み区画ごとに1スロット
 PLAYER_HIRES_TODAY = _alloc(1)  # value=正規化した今日の雇用人数
 
-# --- 納屋(自分のみ実数値、相手は常にゼロ=空のトークン) ---
-SHED_ITEM = _alloc(C.N_SHED_ITEMS)  # value=品目ごとの個数(正規化)
 
-# --- 残り種(自分のみ) ---
-SEED_CROP = _alloc(C.N_CROPS)  # value=作物ごとの残り種数(正規化)
+def _alloc_counter(n_items: int) -> tuple[range, range, range]:
+    """累積値用に、品目別の存在マーカー・bucket・連続値を確保する。"""
+    return _alloc(n_items), _alloc(n_items * N_MAGNITUDE_BUCKETS), _alloc(n_items)
 
-# --- 持ち物(自分のみ。farmerとhands合算の1トークン) ---
-INVENTORY_ITEM = _alloc(C.N_SHED_ITEMS)  # value=品目ごとの個数(正規化)
 
-# --- 市場(共有) ---
-MARKET_PRODUCT = _alloc(C.N_PRODUCTS)  # value=在庫量(正規化)
-MARKET_PRICE = _alloc(C.N_PRODUCTS)  # value=現在価格(正規化)。在庫から計算できる値だが、
-# 品目ごとに違う非線形カーブ(price関数)をネットワークに逆算させずに済むよう、
-# 価格そのものも直接与える。
+# --- 自分の累積実績 ---
+# produced/soldは確定値。ESTIMATED項目は同時市場処理を再現しない自分視点の見積もりで、
+# reward shapingの確定実績には使わない。
+OWN_PRODUCED, OWN_PRODUCED_MAGNITUDE_BUCKET, OWN_PRODUCED_CONTINUOUS = _alloc_counter(
+    C.N_PRODUCTS
+)  # HARVEST/COLLECT_FERTILIZERでinventoryへ入った累積量(decode_state参照)
+OWN_SOLD, OWN_SOLD_MAGNITUDE_BUCKET, OWN_SOLD_CONTINUOUS = _alloc_counter(C.N_PRODUCTS)
+(
+    OWN_ESTIMATED_BOUGHT_PRODUCT,
+    OWN_ESTIMATED_BOUGHT_PRODUCT_MAGNITUDE_BUCKET,
+    (OWN_ESTIMATED_BOUGHT_PRODUCT_CONTINUOUS),
+) = _alloc_counter(C.N_PRODUCTS)  # BUY_PRODUCTのみ(BUY_SEED/BUY_ANIMALは含まない)
+(
+    OWN_ESTIMATED_REVENUE,
+    OWN_ESTIMATED_REVENUE_MAGNITUDE_BUCKET,
+    (OWN_ESTIMATED_REVENUE_CONTINUOUS),
+) = _alloc_counter(C.N_PRODUCTS)  # SELLで得た累積金額の見積もり
+OWN_HAS_EVER_SOLD = _alloc(C.N_PRODUCTS)  # OWN_SOLD>0から導出可能だが、明示フラグとしても渡す
 
 # --- 街(共有) ---
-TOWN_SHOP = _alloc(C.N_SHOPS)  # value=出現数
+TOWN_SHOP = _alloc(C.N_SHOPS)  # 出現マーカー(value=1.0固定)
+TOWN_SHOP_MAGNITUDE_BUCKET = _alloc(C.N_SHOPS * N_MAGNITUDE_BUCKETS)  # 出現数の量バケット
 
 # --- ターン(共有) ---
 TURN_DAY = _alloc(1)  # value=正規化した経過日数
@@ -79,14 +107,22 @@ TURN_HOUR = _alloc(1)  # value=正規化した日内ターン
 # ============================================================
 # 行動候補(デコーダ側)の語彙
 # ============================================================
-# 「今合法な行動候補だけ」を列挙してデコーダに渡す(全行動空間に対する固定サイズの
-# 出力ではない)。1候補は(op, item)の組で表し、opはfarmer/hand用とmarket用で
-# 別々の埋め込みを持つ。itemは対象(作物・動物・品目)ごとに、盤面側で使っている
-# 埋め込み(TILE_CROP/TILE_ANIMAL/SHED_ITEM/MARKET_PRODUCT)をそのまま再利用する
-# (例: 「MELONを植える」候補と「タイルにMELONが植わっている」事実は同じ埋め込みを
-# 共有した方が、観測と行動の対応関係を学習しやすい)。
+# 合法な(op, item)だけを列挙する。itemは観測と同じENTITY_ITEMを共有する。
 ACTION_FARMER_OP = _alloc(C.N_FARMER_OPS)  # constants.FARMER_OP_NAMESと同じ並び
 ACTION_MARKET_OP = _alloc(C.N_MARKET_OPS)  # constants.MARKET_OP_NAMESと同じ並び
+# 可変長の市場注文を打ち切るデコード専用候補。
+ACTION_MARKET_STOP = _alloc(1)
+# 数量ごとに別のone-hot添字を使い、LayerNorm後も区別可能なcategorical分布にする。
+ACTION_QUANTITY_VALUE = _alloc(MAX_ACTION_QUANTITY)  # 量k(1-indexed) → ACTION_QUANTITY_VALUE[k-1]
+ACTION_QUANTITY_CONTINUOUS = _alloc(1)  # value=正規化log(量)。量ごとの順序関係を補う
+
+# ============================================================
+# デコーダ入力(ユニット固有コンテキスト)の語彙
+# ============================================================
+# unit位置はEncoderと共有する盤面位置埋め込みとしてmodel側で加える。
+#
+# ENTITY_ITEMがunitの持ち物由来であることを、直前の行動対象と区別する。
+UNIT_CONTEXT_INVENTORY = _alloc(1)
 
 VOCAB_SIZE = _next_index
 
@@ -101,3 +137,35 @@ class SparseVector:
     def add(self, index: int, value: float = 1.0) -> None:
         self.index.append(index)
         self.value.append(value)
+
+    def extend(self, other: "SparseVector") -> None:
+        self.index.extend(other.index)
+        self.value.extend(other.value)
+
+
+def collate(
+    vectors: list[SparseVector], device: torch.device | str | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SparseVector列をEmbeddingBag入力へ平坦化する。
+
+    Args:
+        vectors: 疎特徴量。
+        device: 出力先デバイス。
+
+    Returns:
+        index、value、各vectorの開始offset。
+    """
+    index: list[int] = []
+    value: list[float] = []
+    offset: list[int] = []
+    cursor = 0
+    for sv in vectors:
+        offset.append(cursor)
+        index.extend(sv.index)
+        value.extend(sv.value)
+        cursor += len(sv.index)
+    return (
+        torch.tensor(index, dtype=torch.long, device=device),
+        torch.tensor(value, dtype=torch.float32, device=device),
+        torch.tensor(offset, dtype=torch.long, device=device),
+    )

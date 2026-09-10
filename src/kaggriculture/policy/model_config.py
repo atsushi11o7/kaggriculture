@@ -1,0 +1,9 @@
+"""方策ネットワークのハイパーパラメータ。構成引数を1箇所にまとめる。"""
+
+D_MODEL = 128
+NUM_HEADS = 4
+D_FEEDFORWARD = 512
+NUM_LAYERS_ENCODER = 4
+NUM_LAYERS_DECODER = 3
+NUM_LAYERS_CRITIC = 2
+DROPOUT = 0.0
