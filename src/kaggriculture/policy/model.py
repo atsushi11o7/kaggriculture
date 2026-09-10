@@ -1,104 +1,29 @@
-"""方策(policy)・価値(value)・相手shed推定を出力するネットワークの本体。
+"""共有埋め込みとTransformerによる自己回帰型の方策・価値ネットワーク。
 
-エンコーダは盤面全体(自分の100マス+相手の100マス+その他のゾーン)を疎特徴量
-(policy.vocab.SparseVector)としてnn.EmbeddingBagで埋め込み、TransformerEncoderで
-自己注意する。各トークンの owner(誰の情報か)・zone(何の種類の情報か)・
-position(タイルの場合の盤面上の位置)は局面によらず固定なので、埋め込みバッグの
-外側で別途加算する。
-
-デコーダはfarmer→hand1→hand2→…→市場注文1→…の順に決定スロットを並べ、
-「それまでに確定した決定」を1つ右にずらして入力する標準的なTransformerデコーダ
-(因果マスク付き自己注意+エンコーダ出力への交差注意)。各スロットの出力隠れ状態を
-使い、そのスロットで今合法な候補(actions.py参照)だけをスコアリングする
-(score_candidates)。存在しない候補にはそもそもスコアという概念が無いため、
-「合法候補だけから選ぶ」という構造は保証される。
-
-ただしこのクラス自体が保証するのは合法性だけで、複数スロットの同時決定としての
-整合性(farmerとhandが同じタイルを取り合う、同じ品目のshed在庫を奪い合う、等)
-までは保証しない。それはactions.pyへ渡す状態をdecode_state.pyで逐次更新する
-ことで担保する(呼び出し側の責務)。
-
-エンコーダとデコーダは同じ語彙埋め込み(TokenEmbedding)を共有する。「MELONを
-植える」という行動候補と「タイルにMELONが植わっている」という盤面事実が同じ
-埋め込みを使うことで、観測と行動の対応関係を学習しやすくする狙い
-(vocab.pyのACTION_FARMER_OP等のコメント参照)。
+公開盤面をEncoderで符号化し、Decoderがfarmer、hands、市場注文を順に生成する。
+各スロットでは合法候補だけを採点し、選択後の仮状態更新はdistribution.pyが担う。
+品目と盤面位置の埋め込みは観測・行動間で共有する。
 """
 
 import torch
 import torch.nn as nn
 
+from kaggriculture.policy import token_layout as L
 from kaggriculture.policy import vocab as V
 from kaggriculture.policy.model_config import (
     D_FEEDFORWARD,
     D_MODEL,
     DROPOUT,
     NUM_HEADS,
+    NUM_LAYERS_CRITIC,
     NUM_LAYERS_DECODER,
     NUM_LAYERS_ENCODER,
 )
-from kaggriculture.simulator import constants as C
-
-BOARD_SIZE = 10
-N_TILE_TOKENS = 2 * BOARD_SIZE * BOARD_SIZE  # 自分の盤面 + 相手の盤面
-
-# 1ターンの決定スロット数の上限: farmer(1) + hand(最大MAX_HANDS) +
-# 市場注文(最大MAX_MARKET_ORDERS件 + 「もう注文しない」の1候補)。
-MAX_DECODE_LEN = 1 + C.MAX_HANDS + (C.MAX_MARKET_ORDERS + 1)
-
-# --- エンコーダ側トークンのowner/zone/position ---
-# tokenize.get_encoder_inputが返すトークン列の並び順(CLSを先頭に足す前)に対応する
-# (owner, zone)。ここがズレるとエンコーダが誤った文脈を学習するため、
-# tokenize.pyの実装と一致させることが必須(test_model.pyで長さを検証する)。
-_OWNER_SHARED, _OWNER_OWN, _OWNER_OPP = 0, 1, 2
-N_OWNERS = 3
-
-(
-    _ZONE_CLS,
-    _ZONE_TILE,
-    _ZONE_PLAYER_INFO,
-    _ZONE_SHED,
-    _ZONE_SEEDS,
-    _ZONE_INVENTORY,
-    _ZONE_MARKET,
-    _ZONE_TOWN,
-    _ZONE_TURN,
-) = range(9)
-N_ZONES = 9
-
-# tileトークンのみ意味を持つ位置(盤面上のy*board_size+x)。tile以外のトークンは
-# この専用の埋め込み次元を使わないという意味で、有効なタイル位置の数(=1個余分な
-# 添字)を「該当なし」に割り当てる。
-_NO_POSITION = N_TILE_TOKENS // 2
-N_POSITIONS = _NO_POSITION + 1
-
-# tokenize.get_encoder_inputの並び順そのまま: 自分の盤面100 + 相手の盤面100 +
-# player_info(自分・相手)+ shed(自分・相手)+ seeds + inventory + market + town + turn
-_TOKEN_OWNER_ZONE_POSITION = (
-    [(_OWNER_OWN, _ZONE_TILE, i) for i in range(_NO_POSITION)]
-    + [(_OWNER_OPP, _ZONE_TILE, i) for i in range(_NO_POSITION)]
-    + [
-        (_OWNER_OWN, _ZONE_PLAYER_INFO, _NO_POSITION),
-        (_OWNER_OPP, _ZONE_PLAYER_INFO, _NO_POSITION),
-        (_OWNER_OWN, _ZONE_SHED, _NO_POSITION),
-        (_OWNER_OPP, _ZONE_SHED, _NO_POSITION),
-        (_OWNER_OWN, _ZONE_SEEDS, _NO_POSITION),
-        (_OWNER_OWN, _ZONE_INVENTORY, _NO_POSITION),
-        (_OWNER_SHARED, _ZONE_MARKET, _NO_POSITION),
-        (_OWNER_SHARED, _ZONE_TOWN, _NO_POSITION),
-        (_OWNER_SHARED, _ZONE_TURN, _NO_POSITION),
-    ]
-)
-NUM_WORDS_ENCODER = len(_TOKEN_OWNER_ZONE_POSITION)  # tokenize.get_encoder_inputの出力トークン数
-
-# CLSトークン(先頭に追加)の分を足した(owner, zone, position)の並び
-_TOKEN_OWNER_ZONE_POSITION_WITH_CLS = [
-    (_OWNER_SHARED, _ZONE_CLS, _NO_POSITION)
-] + _TOKEN_OWNER_ZONE_POSITION
 
 
 def _causal_mask(size: int, device: torch.device | None = None) -> torch.Tensor:
-    """位置iがi以下しか参照できない加算マスク(未来位置は-inf)。"""
-    return torch.triu(torch.full((size, size), float("-inf"), device=device), diagonal=1)
+    """Trueを未来位置に置くbool因果マスク。"""
+    return torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
 
 
 class TokenEmbedding(nn.Module):
@@ -112,12 +37,30 @@ class TokenEmbedding(nn.Module):
     def forward(
         self, index: torch.Tensor, value: torch.Tensor, offset: torch.Tensor
     ) -> torch.Tensor:
-        """SparseVectorをvocab.collateで平坦化した(index, value, offset)を埋め込む。
+        """collate済みの疎特徴量を埋め込む。
+
+        Args:
+            index: 語彙index。
+            value: indexごとの重み。
+            offset: 各SparseVectorの開始位置。
 
         Returns:
-            torch.Tensor: 形状(len(offset), d_model)。
+            形状(len(offset), d_model)の埋め込み。
         """
         return self.norm(self.bag(index, offset, value))
+
+    def embed(self, vectors: list[V.SparseVector]) -> torch.Tensor:
+        """SparseVector列をモデルと同じデバイスで埋め込む。
+
+        Args:
+            vectors: 埋め込む疎特徴量。
+
+        Returns:
+            形状(len(vectors), d_model)の埋め込み。
+        """
+        device = self.bag.weight.device
+        index, value, offset = V.collate(vectors, device=device)
+        return self(index, value, offset)
 
 
 class Encoder(nn.Module):
@@ -126,6 +69,7 @@ class Encoder(nn.Module):
     def __init__(
         self,
         token_embedding: TokenEmbedding,
+        board_position_embedding: nn.Embedding,
         d_model: int = D_MODEL,
         num_heads: int = NUM_HEADS,
         d_feedforward: int = D_FEEDFORWARD,
@@ -137,16 +81,16 @@ class Encoder(nn.Module):
         self.d_model = d_model
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        owner_ids, zone_ids, position_ids = zip(*_TOKEN_OWNER_ZONE_POSITION_WITH_CLS, strict=True)
+        owner_ids, zone_ids, position_ids = zip(*L.TOKEN_OWNER_ZONE_POSITION_WITH_CLS, strict=True)
         self.register_buffer("_owner_ids", torch.tensor(owner_ids, dtype=torch.long))
         self.register_buffer("_zone_ids", torch.tensor(zone_ids, dtype=torch.long))
         self.register_buffer("_position_ids", torch.tensor(position_ids, dtype=torch.long))
-        self.owner_embedding = nn.Embedding(N_OWNERS, d_model)
-        self.zone_embedding = nn.Embedding(N_ZONES, d_model)
-        self.position_embedding = nn.Embedding(N_POSITIONS, d_model)
-        # owner/zone/positionは正規化済みトークンへの加算なので、内容を覆い隠さない
-        # 程度に小さく初期化する(参考にしたPolicyValueNetと同じ考え方)。
-        for embedding in (self.owner_embedding, self.zone_embedding, self.position_embedding):
+        self.owner_embedding = nn.Embedding(L.N_OWNERS, d_model)
+        self.zone_embedding = nn.Embedding(L.N_ZONES, d_model)
+        # Decoderと同じ盤面位置埋め込みを共有する。
+        self.position_embedding = board_position_embedding
+        # 正規化済みの内容表現を覆わないよう小さく初期化する。
+        for embedding in (self.owner_embedding, self.zone_embedding):
             nn.init.normal_(embedding.weight, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -163,14 +107,14 @@ class Encoder(nn.Module):
 
         Args:
             index, value, offset: vocab.collate(全局面分のトークンを連結したもの)の出力。
-                offsetの長さはbatch_size * NUM_WORDS_ENCODER。
+                offsetの長さはbatch_size * L.NUM_WORDS_ENCODER。
 
         Returns:
-            torch.Tensor: 形状(batch, NUM_WORDS_ENCODER + 1, d_model)。
+            torch.Tensor: 形状(batch, L.NUM_WORDS_ENCODER + 1, d_model)。
             [:, 0]がCLSトークンの出力(局面全体の集約表現)。
         """
         x = self.token_embedding(index, value, offset)
-        x = x.reshape(-1, NUM_WORDS_ENCODER, self.d_model)
+        x = x.reshape(-1, L.NUM_WORDS_ENCODER, self.d_model)
         batch_size = x.size(0)
 
         cls = self.cls_token.expand(batch_size, 1, -1)
@@ -183,18 +127,15 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """farmer→hands→市場注文の順に、決定スロットの隠れ状態を作る。
+    """farmer→hands→市場注文を因果的に符号化するTransformer Decoder。
 
-    標準的なTransformerデコーダのteacher forcing形式: それまでに確定した決定
-    (教師強制時は正解、推論時はサンプリング済みの候補)を1つ右にずらして入力し、
-    因果マスク付き自己注意+エンコーダ出力への交差注意で、次のスロットを判断する
-    ための隠れ状態を出す。候補の集合はスロットごとに大きさが異なるため、
-    このクラス自体は候補を知らない(スコアリングはscore_candidatesで別途行う)。
+    入力は直前の決定と現在スロットのユニット情報。可変な合法候補は別途採点する。
     """
 
     def __init__(
         self,
         token_embedding: TokenEmbedding,
+        board_position_embedding: nn.Embedding,
         d_model: int = D_MODEL,
         num_heads: int = NUM_HEADS,
         d_feedforward: int = D_FEEDFORWARD,
@@ -204,11 +145,11 @@ class Decoder(nn.Module):
         super().__init__()
         self.token_embedding = token_embedding
         self.d_model = d_model
-        self.start_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        # 位置0が<START>(farmerスロットの判断に使う)、位置iがスロットi-1確定後
-        # (=スロットiの判断に使う)の隠れ状態に対応する。
-        self.position_embedding = nn.Embedding(MAX_DECODE_LEN + 1, d_model)
+        # 決定順ではなく、スロット種別ごとに固定した位置ID。
+        self.position_embedding = nn.Embedding(L.MAX_DECODE_LEN, d_model)
         nn.init.normal_(self.position_embedding.weight, std=0.02)
+        # Encoderのタイルと同じ盤面位置埋め込みを共有する。
+        self.board_position_embedding = board_position_embedding
         self.policy_proj = nn.Linear(d_model, d_model)
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -219,76 +160,162 @@ class Decoder(nn.Module):
     def forward(
         self,
         memory: torch.Tensor,
-        decision_index: torch.Tensor,
-        decision_value: torch.Tensor,
-        decision_offset: torch.Tensor,
-        num_slots: int,
-        decision_padding_mask: torch.Tensor | None = None,
+        tgt_index: torch.Tensor,
+        tgt_value: torch.Tensor,
+        tgt_offset: torch.Tensor,
+        position_ids: torch.Tensor,
+        board_position_ids: torch.Tensor,
+        tgt_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """確定済み決定列(教師強制)からスロットごとの判断用隠れ状態を計算する。
+        """決定トークン列から各スロットの隠れ状態を計算する。
 
         Args:
-            memory: 形状(batch, S_enc, d_model)。Encoder.forwardの出力。
-            decision_index, decision_value, decision_offset: vocab.collateの出力
-                (バッチ全体でnum_slots個ずつの決定トークンを連結したもの)。
-                パディング位置は空のSparseVector(index=[], value=[])にする。
-            num_slots: このバッチの決定スロット数(<START>を含まない、バッチ内最大)。
-            decision_padding_mask: 形状(batch, num_slots)、Trueがパディング位置。
-                Noneならパディング無し(全example同じスロット数)。
+            memory: 形状(batch, encoder_len, d_model)のEncoder出力。
+            tgt_index: 決定トークンの語彙index。
+            tgt_value: indexごとの重み。
+            tgt_offset: 各決定トークンの開始位置。
+            position_ids: 形状(batch, seq_len)の固定スロット位置。
+            board_position_ids: 形状(batch, seq_len)のunit盤面位置。
+            tgt_key_padding_mask: Trueがpaddingのmask。
 
         Returns:
-            torch.Tensor: 形状(batch, num_slots + 1, d_model)。位置iの出力が
-            「スロットi(0-indexed、0=farmer)の候補をスコアリングするための隠れ状態」。
+            形状(batch, seq_len, d_model)の隠れ状態。
         """
-        batch_size = memory.size(0)
-        dec_tokens = self.token_embedding(decision_index, decision_value, decision_offset)
-        dec_tokens = dec_tokens.reshape(batch_size, num_slots, self.d_model)
+        batch_size, seq_len = position_ids.shape
+        tgt = self.token_embedding(tgt_index, tgt_value, tgt_offset)
+        tgt = tgt.reshape(batch_size, seq_len, self.d_model)
+        tgt = tgt + self.position_embedding(position_ids.to(tgt.device))
+        tgt = tgt + self.board_position_embedding(board_position_ids.to(tgt.device))
 
-        start = self.start_token.expand(batch_size, 1, -1)
-        tgt = torch.cat([start, dec_tokens], dim=1)
-        position_ids = torch.arange(num_slots + 1, device=tgt.device)
-        tgt = tgt + self.position_embedding(position_ids)
-
-        tgt_key_padding_mask = None
-        if decision_padding_mask is not None:
-            start_pad = torch.zeros(batch_size, 1, dtype=torch.bool, device=tgt.device)
-            tgt_key_padding_mask = torch.cat([start_pad, decision_padding_mask], dim=1)
-
-        out = self.transformer(
+        return self.transformer(
             tgt,
             memory,
-            tgt_mask=_causal_mask(num_slots + 1, device=tgt.device),
+            tgt_mask=_causal_mask(seq_len, device=tgt.device),
             tgt_key_padding_mask=tgt_key_padding_mask,
         )
-        return out
 
     def score_candidates(
         self, hidden: torch.Tensor, candidates: list[V.SparseVector]
     ) -> torch.Tensor:
-        """1スロット分の隠れ状態から、今合法な候補それぞれのスコアを計算する。
+        """1スロットの合法候補を採点する。
 
         Args:
-            hidden: 形状(d_model,)。forwardの出力のうち、このスロットに対応する1点。
-            candidates: このスロットで今合法な候補(actions.py参照)。候補数は
-                スロットごとに異なるため、バッチ化はしない(呼び出し側でスロット
-                ごとにこの関数を呼ぶ)。
+            hidden: 形状(d_model,)のスロット表現。
+            candidates: 合法候補。
 
         Returns:
-            torch.Tensor: 形状(len(candidates),)。候補ごとの生スコア(logit)。
-            呼び出し側でsoftmax/cross_entropyする。
+            候補ごとのlogit。
         """
-        index, value, offset = V.collate(candidates)
-        index, value, offset = (
-            index.to(hidden.device),
-            value.to(hidden.device),
-            offset.to(hidden.device),
+        cand_emb = self.token_embedding.embed(candidates)  # (len(candidates), d_model)
+        # LayerNorm後の内積が過大にならないようattentionと同じ尺度にする。
+        return (cand_emb @ self.policy_proj(hidden)) / (self.d_model**0.5)
+
+    def score_candidates_batch(
+        self, hidden: torch.Tensor, candidates_per_row: list[list[V.SparseVector]]
+    ) -> torch.Tensor:
+        """複数スロットの可変数候補をまとめて採点する。
+
+        Args:
+            hidden: 形状(batch, d_model)のスロット表現。
+            candidates_per_row: 行ごとの合法候補。
+
+        Returns:
+            padding列が-infの候補logit。
+        """
+        n = hidden.shape[0]
+        max_cands = max(len(c) for c in candidates_per_row)
+        flat_cands: list[V.SparseVector] = []
+        valid_counts = []
+        for cands in candidates_per_row:
+            flat_cands.extend(cands)
+            flat_cands.extend(V.SparseVector() for _ in range(max_cands - len(cands)))
+            valid_counts.append(len(cands))
+
+        cand_emb = self.token_embedding.embed(flat_cands).view(n, max_cands, self.d_model)
+        proj = self.policy_proj(hidden).unsqueeze(-1)  # (n, d_model, 1)
+        scores = torch.bmm(cand_emb, proj).squeeze(-1) / (self.d_model**0.5)  # (n, max_cands)
+        col_idx = torch.arange(max_cands, device=hidden.device).unsqueeze(0)
+        counts = torch.tensor(valid_counts, device=hidden.device).unsqueeze(1)
+        return scores.masked_fill(col_idx >= counts, float("-inf"))
+
+
+class PrivilegedEncoder(nn.Module):
+    """両者の非公開状態を非対称critic用の小さな系列として符号化する。
+
+    unit inventoryには公開位置を加え、誰がどこで何を持つかを保持する。
+    """
+
+    def __init__(
+        self,
+        token_embedding: TokenEmbedding,
+        board_position_embedding: nn.Embedding,
+        d_model: int = D_MODEL,
+        num_heads: int = NUM_HEADS,
+        d_feedforward: int = D_FEEDFORWARD,
+        num_layers: int = NUM_LAYERS_CRITIC,
+        dropout: float = DROPOUT,
+    ) -> None:
+        super().__init__()
+        self.token_embedding = token_embedding
+        self.position_embedding = board_position_embedding
+        self.d_model = d_model
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        owner_ids, zone_ids = zip(*L.PRIVILEGED_OWNER_ZONE_WITH_CLS, strict=True)
+        self.register_buffer("_owner_ids", torch.tensor(owner_ids, dtype=torch.long))
+        self.register_buffer("_zone_ids", torch.tensor(zone_ids, dtype=torch.long))
+        self.owner_embedding = nn.Embedding(L.N_OWNERS, d_model)
+        self.zone_embedding = nn.Embedding(L.N_ZONES, d_model)
+        for embedding in (self.owner_embedding, self.zone_embedding):
+            nn.init.normal_(embedding.weight, std=0.02)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model, num_heads, d_feedforward, dropout, batch_first=True
         )
-        cand_emb = self.token_embedding(index, value, offset)  # (len(candidates), d_model)
-        return cand_emb @ self.policy_proj(hidden)
+        self.transformer = nn.TransformerEncoder(layer, num_layers, enable_nested_tensor=False)
+
+    def forward(
+        self,
+        index: torch.Tensor,
+        value: torch.Tensor,
+        offset: torch.Tensor,
+        position_ids: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """非公開token列を符号化する。
+
+        Args:
+            index: 語彙index。
+            value: indexごとの重み。
+            offset: 各tokenの開始位置。
+            position_ids: unitの盤面位置。
+            key_padding_mask: 存在しないhandのmask。
+
+        Returns:
+            CLSを含む非公開Encoder出力。
+        """
+        batch_size = position_ids.size(0)
+        x = self.token_embedding(index, value, offset)
+        x = x.reshape(batch_size, L.NUM_PRIVILEGED_TOKENS, self.d_model)
+        cls = self.cls_token.expand(batch_size, 1, -1)
+        x = torch.cat([cls, x], dim=1)
+
+        cls_position = torch.full(
+            (batch_size, 1), L.NO_POSITION, dtype=torch.long, device=position_ids.device
+        )
+        all_positions = torch.cat([cls_position, position_ids], dim=1)
+        x = x + self.owner_embedding(self._owner_ids)
+        x = x + self.zone_embedding(self._zone_ids)
+        x = x + self.position_embedding(all_positions)
+
+        cls_padding = torch.zeros((batch_size, 1), dtype=torch.bool, device=key_padding_mask.device)
+        all_padding = torch.cat([cls_padding, key_padding_mask], dim=1)
+        return self.transformer(x, src_key_padding_mask=all_padding)
 
 
 class PolicyValueNet(nn.Module):
-    """方策・価値・相手shed推定・市場注文個数を出力するネットワーク。"""
+    """方策・価値を出力するネットワーク。数量もscore_candidatesでスコアリングする
+    候補の1種として方策に含まれる(専用ヘッドは持たない)。"""
 
     def __init__(
         self,
@@ -298,76 +325,135 @@ class PolicyValueNet(nn.Module):
         num_layers_encoder: int = NUM_LAYERS_ENCODER,
         num_layers_decoder: int = NUM_LAYERS_DECODER,
         dropout: float = DROPOUT,
+        use_episode_history: bool = False,
+        use_asymmetric_critic: bool = False,
+        num_layers_critic: int = NUM_LAYERS_CRITIC,
     ) -> None:
+        """ネットワークを構築する。
+
+        Args:
+            d_model: 埋め込み次元。
+            num_heads: attention head数。
+            d_feedforward: feed-forward層の中間次元。
+            num_layers_encoder: 公開Encoderの層数。
+            num_layers_decoder: Decoderの層数。
+            dropout: Transformerのdropout率。
+            use_episode_history: 累積実績をactor入力に含める。Trueなら各APIで
+                countersが必須。
+            use_asymmetric_critic: critic専用の非公開情報Encoderを追加する。actorの
+                推論には使われないが、共有埋め込みと公開Encoderにはvalue lossも流れる。
+            num_layers_critic: 非公開情報Encoderの層数。
+        """
         super().__init__()
+        self.uses_episode_history = use_episode_history
+        self.uses_asymmetric_critic = use_asymmetric_critic
         self.token_embedding = TokenEmbedding(d_model)
+        # EncoderのタイルとDecoderのunit位置で共有する。
+        self.board_position_embedding = nn.Embedding(L.N_POSITIONS, d_model)
+        nn.init.normal_(self.board_position_embedding.weight, std=0.02)
         self.encoder = Encoder(
-            self.token_embedding, d_model, num_heads, d_feedforward, num_layers_encoder, dropout
+            self.token_embedding,
+            self.board_position_embedding,
+            d_model,
+            num_heads,
+            d_feedforward,
+            num_layers_encoder,
+            dropout,
         )
         self.decoder = Decoder(
-            self.token_embedding, d_model, num_heads, d_feedforward, num_layers_decoder, dropout
+            self.token_embedding,
+            self.board_position_embedding,
+            d_model,
+            num_heads,
+            d_feedforward,
+            num_layers_decoder,
+            dropout,
         )
 
+        if use_asymmetric_critic:
+            self.privileged_encoder = PrivilegedEncoder(
+                self.token_embedding,
+                self.board_position_embedding,
+                d_model,
+                num_heads,
+                d_feedforward,
+                num_layers_critic,
+                dropout,
+            )
+            value_input_dim = d_model * 2
+        else:
+            self.privileged_encoder = None
+            value_input_dim = d_model
+
         self.value_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1)
-        )
-        # 相手の納屋(SHED_ITEM語彙と同じN_SHED_ITEMS品目)ごとの分布。何個かの離散
-        # バケットに分けたカテゴリ分布として出す(点推定ではなくサンプリング可能に
-        # するため。詳細はbucketの設計を別途詰める)。
-        n_shed_items = len(V.SHED_ITEM)
-        self.n_shed_buckets = 16
-        self.shed_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(value_input_dim, value_input_dim // 2),
             nn.ReLU(),
-            nn.Linear(d_model, n_shed_items * self.n_shed_buckets),
+            nn.Linear(value_input_dim // 2, 1),
         )
-        # 市場注文の個数(n)を予測するヘッド。選んだ(op, item)候補が決まってから、
-        # そのスロットの隠れ状態+選んだ候補の埋め込みを材料に、正規化した個数
-        # ([0, 1]、呼び出し側で「買える/売れる最大数」等にスケールし直す想定)を
-        # 回帰する。farmer/handの候補には個数の概念が無いため、このヘッドは
-        # item_indexを持つ市場注文候補(BUY_SEED/BUY_ANIMAL/BUY_PRODUCT/SELL)
-        # にのみ使う。
-        self.quantity_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model), nn.ReLU(), nn.Linear(d_model, 1)
-        )
+        # 数量も合法なcategorical候補として扱い、log_probへ含める。
 
     def encode(
         self, index: torch.Tensor, value: torch.Tensor, offset: torch.Tensor
     ) -> torch.Tensor:
-        """盤面トークン列からエンコーダ出力([CLS]込み)を計算する。"""
-        return self.encoder(index, value, offset)
-
-    def value_and_shed(self, encoder_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """エンコーダ出力から価値と相手shed推定を計算する。
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: (value, shed_logits)。
-                value: 形状(batch, 1)。
-                shed_logits: 形状(batch, N_SHED_ITEMS, n_shed_buckets)の生ロジット
-                    (呼び出し側でsoftmax/cross_entropyする前提)。
-        """
-        cls_out = encoder_out[:, 0]
-        value_out = self.value_head(cls_out)
-        shed_logits = self.shed_head(cls_out).reshape(-1, len(V.SHED_ITEM), self.n_shed_buckets)
-        return value_out, shed_logits
-
-    def predict_quantity(
-        self, hidden: torch.Tensor, chosen_candidate: V.SparseVector
-    ) -> torch.Tensor:
-        """選んだ市場注文候補の個数(正規化済み、[0, 1]目安)を予測する。
+        """公開盤面を符号化する。
 
         Args:
-            hidden: 形状(d_model,)。そのスロットのDecoder隠れ状態。
-            chosen_candidate: そのスロットで実際に選んだ候補(item_indexを持つもの)。
+            index: 語彙index。
+            value: indexごとの重み。
+            offset: 各tokenの開始位置。
 
         Returns:
-            torch.Tensor: 形状(1,)。sigmoidをかける前の生の値(呼び出し側でsigmoid)。
+            CLSを含む公開Encoder出力。
         """
-        index, value, offset = V.collate([chosen_candidate])
-        index, value, offset = (
-            index.to(hidden.device),
-            value.to(hidden.device),
-            offset.to(hidden.device),
-        )
-        cand_emb = self.token_embedding(index, value, offset)[0]  # (d_model,)
-        return self.quantity_head(torch.cat([hidden, cand_emb], dim=-1))
+        return self.encoder(index, value, offset)
+
+    def encode_privileged(
+        self,
+        index: torch.Tensor,
+        value: torch.Tensor,
+        offset: torch.Tensor,
+        position_ids: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """非対称critic用の非公開情報を符号化する。
+
+        Args:
+            index: 語彙index。
+            value: indexごとの重み。
+            offset: 各tokenの開始位置。
+            position_ids: unitの盤面位置。
+            key_padding_mask: 存在しないhandのmask。
+
+        Returns:
+            CLSを含む非公開Encoder出力。
+
+        Raises:
+            ValueError: 非対称criticが無効な場合。
+        """
+        if self.privileged_encoder is None:
+            raise ValueError("use_asymmetric_critic=False")
+        return self.privileged_encoder(index, value, offset, position_ids, key_padding_mask)
+
+    def value(
+        self, encoder_out: torch.Tensor, privileged_out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """公開CLSと、設定時は非公開CLSから価値を計算する。
+
+        Args:
+            encoder_out: 公開Encoder出力。
+            privileged_out: 非対称criticの非公開Encoder出力。
+
+        Returns:
+            形状(batch, 1)の価値。
+
+        Raises:
+            ValueError: critic設定とprivileged_outの有無が合わない場合。
+        """
+        cls_out = encoder_out[:, 0]
+        if self.uses_asymmetric_critic:
+            if privileged_out is None:
+                raise ValueError("use_asymmetric_critic=True requires privileged_out")
+            cls_out = torch.cat([cls_out, privileged_out[:, 0]], dim=-1)
+        elif privileged_out is not None:
+            raise ValueError("use_asymmetric_critic=False but privileged_out was given")
+        return self.value_head(cls_out)

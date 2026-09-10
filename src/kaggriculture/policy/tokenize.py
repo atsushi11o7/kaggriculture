@@ -1,13 +1,12 @@
-"""kaggle-environmentsの生observation(1ターン・1プレイヤー視点)を、
-policy.vocabの語彙(トークン構成はvocab.py参照)に沿ったSparseVectorの列に変換する。
+"""生のobservationを方策用SparseVector列へ変換する。
 
-相手の非公開情報(shed/seeds/inventories)は元々observationに含まれない
-(kaggle-environments側で既にマスクされている)ため、相手のshedトークンは
-常に空になる。
+actorには公開情報と自分のprivateだけを渡す。非対称critic用の両者のprivateは
+get_privileged_critic_inputで別系列にする。
 """
 
 import math
 
+from kaggriculture.policy import token_layout as L
 from kaggriculture.policy import vocab as V
 from kaggriculture.simulator import constants as C
 
@@ -40,7 +39,7 @@ def _encode_tile(tile, day: int, step: int, is_farmer: bool, hand_count: int) ->
         sv.add(V.TILE_KIND[C.TILE_WEED])
     elif tile["kind"] == "PLANT":
         sv.add(V.TILE_KIND[C.TILE_PLANT])
-        sv.add(V.TILE_CROP[C.CROPS.index(tile["crop"])])
+        sv.add(V.entity_index(tile["crop"]))
         if tile["watered_today"]:
             sv.add(V.TILE_CARE_DONE_TODAY[0])
         if tile["fertilized_until_day"] >= day:
@@ -57,7 +56,7 @@ def _encode_tile(tile, day: int, step: int, is_farmer: bool, hand_count: int) ->
         kind_idx = C.TILE_COOP if tile["kind"] == "COOP" else C.TILE_PASTURE
         sv.add(V.TILE_KIND[kind_idx])
         if tile.get("animal") is not None:
-            sv.add(V.TILE_ANIMAL[C.ANIMALS.index(tile["animal"])])
+            sv.add(V.entity_index(tile["animal"]))
             if tile["fed_today"]:
                 sv.add(V.TILE_CARE_DONE_TODAY[0])
             if tile["cared_today"]:
@@ -96,26 +95,58 @@ def _encode_board(farm, day: int, step: int) -> list[V.SparseVector]:
 
 def _encode_player_info(farm) -> V.SparseVector:
     sv = V.SparseVector()
-    sv.add(V.PLAYER_MONEY[0], _norm_log(farm["money"], cap=200_000))
+    sv.add(V.PLAYER_MONEY[0])
+    money_norm = _norm_log(farm["money"], cap=200_000)
+    # bucketの離散化誤差を連続値で補い、criticが終盤の金額差を読めるようにする。
+    sv.add(V.PLAYER_MONEY_MAGNITUDE_BUCKET[V.bucket_index(money_norm)])
+    sv.add(V.PLAYER_MONEY_CONTINUOUS[0], money_norm)
     for q in farm["unlocked_quadrants"]:
         sv.add(V.PLAYER_UNLOCKED_QUADRANT[C.QUADRANTS.index(q)])
     sv.add(V.PLAYER_HIRES_TODAY[0], _norm_clip(farm["hires_today"], window=16))
     return sv
 
 
-def _add_counts(sv: V.SparseVector, items: dict, order: tuple, index_table, normalize) -> None:
-    """{名前: 個数} 形式の辞書のうち、値が正のものだけをsvに追加する共通処理。
+def _add_counts(
+    sv: V.SparseVector,
+    items: dict,
+    order: tuple,
+    index_table,
+    magnitude_table,
+    normalize,
+    continuous_table=None,
+) -> None:
+    """正の個数を存在マーカー、量bucket、任意の連続値として追加する。
 
     Args:
-        sv: 追加先のSparseVector。
-        items: {名前: 個数}。
-        order: indexへの変換に使う並び順(constants.CROPS等)。
-        index_table: orderのインデックスに対応する語彙添字の範囲。
-        normalize: 個数を[0, 1]付近に正規化する関数。
+        sv: 追加先。
+        items: 名前から個数への辞書。
+        order: 名前の正規順序。
+        index_table: 存在マーカーの語彙範囲。
+        magnitude_table: 量bucketの語彙範囲。
+        normalize: 数量の正規化関数。
+        continuous_table: 品目別の連続値語彙範囲。
     """
     for name, n in items.items():
         if n > 0:
-            sv.add(index_table[order.index(name)], normalize(n))
+            idx = order.index(name)
+            sv.add(index_table[idx])
+            norm = normalize(n)
+            bucket = V.bucket_index(norm)
+            sv.add(magnitude_table[idx * V.N_MAGNITUDE_BUCKETS + bucket])
+            if continuous_table is not None:
+                sv.add(continuous_table[idx], norm)
+
+
+def _add_shed_item_counts(sv: V.SparseVector, items: dict, cap: float = 100) -> None:
+    """{品目名: 個数}をENTITY_ITEM語彙で追加する(shed/持ち物で共通)。"""
+    _add_counts(
+        sv,
+        items,
+        C.SHED_ITEMS,
+        V.ENTITY_ITEM,
+        V.ENTITY_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=cap),
+    )
 
 
 def _encode_inventory_sum(inventories: list[dict]) -> V.SparseVector:
@@ -125,15 +156,34 @@ def _encode_inventory_sum(inventories: list[dict]) -> V.SparseVector:
         for item, n in inv.items():
             totals[item] = totals.get(item, 0) + n
     sv = V.SparseVector()
-    _add_counts(sv, totals, C.SHED_ITEMS, V.INVENTORY_ITEM, lambda n: _norm(n, 100))
+    _add_shed_item_counts(sv, totals)
     return sv
 
 
-def _encode_market(market: dict) -> V.SparseVector:
+def _encode_market_inventory(market: dict) -> V.SparseVector:
     sv = V.SparseVector()
-    _add_counts(sv, market["inventory"], C.PRODUCTS, V.MARKET_PRODUCT, lambda n: _norm(n, 12_000))
+    _add_counts(
+        sv,
+        market["inventory"],
+        C.PRODUCTS,
+        V.ENTITY_ITEM,
+        V.ENTITY_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=12_000),
+    )
+    return sv
+
+
+def _encode_market_price(market: dict) -> V.SparseVector:
+    sv = V.SparseVector()
     # hinge型の価格曲線は品薄時に急騰しうる(線形正規化だと外れ値に弱い)ためlogで圧縮する。
-    _add_counts(sv, market["prices"], C.PRODUCTS, V.MARKET_PRICE, lambda p: _norm_log(p, cap=2000))
+    _add_counts(
+        sv,
+        market["prices"],
+        C.PRODUCTS,
+        V.ENTITY_ITEM,
+        V.ENTITY_MAGNITUDE_BUCKET,
+        lambda p: _norm_log(p, cap=2000),
+    )
     return sv
 
 
@@ -142,7 +192,9 @@ def _encode_town(town: dict) -> V.SparseVector:
     for shop in town["unlocked_shops"]:
         counts[shop] = counts.get(shop, 0) + 1
     sv = V.SparseVector()
-    _add_counts(sv, counts, C.SHOPS, V.TOWN_SHOP, lambda n: _norm(n, 8))
+    _add_counts(
+        sv, counts, C.SHOPS, V.TOWN_SHOP, V.TOWN_SHOP_MAGNITUDE_BUCKET, lambda n: _norm(n, 8)
+    )
     return sv
 
 
@@ -153,17 +205,96 @@ def _encode_turn(day: int, hour: int) -> V.SparseVector:
     return sv
 
 
-def get_encoder_input(obs: dict, turns_per_day: int = 24) -> list[V.SparseVector]:
-    """1ターン分の観測(obs["player"]視点)から、盤面トークン列全体を作る。
+def encode_unit_context(inventory: dict) -> V.SparseVector:
+    """現在のunitが持つ品目をDecoder入力へ加える。
 
     Args:
-        obs: kaggle-environmentsの生observation(このプレイヤー視点。privateは
-            自分の分だけが実数値、相手の分はそもそも含まれない)。
-        turns_per_day: 通しステップ数の計算に使う(configurationのturnsPerDay)。
+        inventory: unitの持ち物。
 
     Returns:
-        トークン列。自分の盤面100+相手の盤面100+player_info×2+shed×2
-        (相手は常に空)+seeds+inventory+market+town+turnの順。
+        unit固有のSparseVector。位置はmodel側で別途加える。
+    """
+    sv = V.SparseVector()
+    sv.add(V.UNIT_CONTEXT_INVENTORY[0])  # ENTITY_ITEMが持ち物由来であることを示すマーカー
+    _add_shed_item_counts(sv, inventory)
+    return sv
+
+
+def _encode_own_counters(counters: dict) -> V.SparseVector:
+    """呼び出し側が保持する、自分のエピソード累積実績を符号化する。
+
+    estimated項目の制約はepisode_history.pyを参照。
+    """
+    sv = V.SparseVector()
+    _add_counts(
+        sv,
+        counters.get("produced", {}),
+        C.PRODUCTS,
+        V.OWN_PRODUCED,
+        V.OWN_PRODUCED_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=1000),
+        continuous_table=V.OWN_PRODUCED_CONTINUOUS,
+    )
+    _add_counts(
+        sv,
+        counters.get("sold", {}),
+        C.PRODUCTS,
+        V.OWN_SOLD,
+        V.OWN_SOLD_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=1000),
+        continuous_table=V.OWN_SOLD_CONTINUOUS,
+    )
+    _add_counts(
+        sv,
+        counters.get("estimated_bought_product", {}),
+        C.PRODUCTS,
+        V.OWN_ESTIMATED_BOUGHT_PRODUCT,
+        V.OWN_ESTIMATED_BOUGHT_PRODUCT_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=1000),
+        continuous_table=V.OWN_ESTIMATED_BOUGHT_PRODUCT_CONTINUOUS,
+    )
+    _add_counts(
+        sv,
+        counters.get("estimated_revenue", {}),
+        C.PRODUCTS,
+        V.OWN_ESTIMATED_REVENUE,
+        V.OWN_ESTIMATED_REVENUE_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=500_000),
+        continuous_table=V.OWN_ESTIMATED_REVENUE_CONTINUOUS,
+    )
+    for item, sold in counters.get("has_ever_sold", {}).items():
+        if sold:
+            sv.add(V.OWN_HAS_EVER_SOLD[C.PRODUCTS.index(item)])
+    return sv
+
+
+def _encode_seeds(seeds: dict) -> V.SparseVector:
+    sv = V.SparseVector()
+    _add_counts(
+        sv,
+        seeds,
+        C.CROPS,
+        V.ENTITY_ITEM,
+        V.ENTITY_MAGNITUDE_BUCKET,
+        lambda n: _norm_log(n, cap=100),
+    )
+    return sv
+
+
+def get_encoder_input(
+    obs: dict,
+    turns_per_day: int = 24,
+    counters: dict | None = None,
+) -> list[V.SparseVector]:
+    """player視点の観測を固定長token列へ符号化する。
+
+    Args:
+        obs: 生のobservation。
+        turns_per_day: 1日当たりのターン数。
+        counters: 自分のエピソード累積実績。
+
+    Returns:
+        公開情報、自分のprivate、履歴からなるtoken列。
     """
     player = obs["player"]
     opponent = 1 - player
@@ -178,17 +309,73 @@ def get_encoder_input(obs: dict, turns_per_day: int = 24) -> list[V.SparseVector
 
     private = obs["private"]
     own_shed = V.SparseVector()
-    _add_counts(own_shed, private["shed"], C.SHED_ITEMS, V.SHED_ITEM, lambda n: _norm(n, 100))
+    _add_shed_item_counts(own_shed, private["shed"])
     tokens.append(own_shed)
-    tokens.append(V.SparseVector())  # 相手のshedは常に不明
 
-    own_seeds = V.SparseVector()
-    _add_counts(own_seeds, private["seeds"], C.CROPS, V.SEED_CROP, lambda n: _norm_log(n, cap=100))
-    tokens.append(own_seeds)
+    tokens.append(_encode_seeds(private["seeds"]))
 
     tokens.append(_encode_inventory_sum(private["inventories"]))
-    tokens.append(_encode_market(obs["market"]))
+
+    tokens.append(_encode_market_inventory(obs["market"]))
+    tokens.append(_encode_market_price(obs["market"]))
     tokens.append(_encode_town(obs["town"]))
     tokens.append(_encode_turn(day, obs["hour"]))
+    tokens.append(_encode_own_counters(counters or {}))
 
     return tokens
+
+
+def get_privileged_critic_input(
+    obs: dict, opponent_private: dict
+) -> tuple[list[V.SparseVector], list[int], list[bool]]:
+    """両者のprivateを非対称critic用の固定長系列へ符号化する。
+
+    Args:
+        obs: player視点の観測。
+        opponent_private: 相手の非公開状態。
+
+    Returns:
+        token列、unit位置ID、存在しないhandのpadding mask。
+
+    Raises:
+        ValueError: inventory数と公開unit数が一致しない場合。
+    """
+    player = obs["player"]
+    farms = (obs["farms"][player], obs["farms"][1 - player])
+    privates = (obs["private"], opponent_private)
+    tokens: list[V.SparseVector] = []
+    position_ids: list[int] = []
+    padding_mask: list[bool] = []
+
+    for farm, private in zip(farms, privates, strict=True):
+        expected_inventories = 1 + len(farm["hands"])
+        if len(private["inventories"]) != expected_inventories:
+            raise ValueError(
+                "private inventories must contain farmer followed by every active hand: "
+                f"expected {expected_inventories}, got {len(private['inventories'])}"
+            )
+        if len(farm["hands"]) > C.MAX_HANDS:
+            raise ValueError(f"farm has more than MAX_HANDS={C.MAX_HANDS}")
+
+        shed = V.SparseVector()
+        _add_shed_item_counts(shed, private["shed"])
+        tokens.extend([shed, _encode_seeds(private["seeds"])])
+        position_ids.extend([L.NO_POSITION, L.NO_POSITION])
+        padding_mask.extend([False, False])
+
+        unit_positions = [farm["farmer"], *farm["hands"]]
+        for inventory, (x, y) in zip(private["inventories"], unit_positions, strict=True):
+            unit_inventory = V.SparseVector()
+            _add_shed_item_counts(unit_inventory, inventory)
+            tokens.append(unit_inventory)
+            position_ids.append(y * V.BOARD_SIZE + x)
+            padding_mask.append(False)
+
+        missing_hands = C.MAX_HANDS - len(farm["hands"])
+        tokens.extend(V.SparseVector() for _ in range(missing_hands))
+        position_ids.extend([L.NO_POSITION] * missing_hands)
+        padding_mask.extend([True] * missing_hands)
+
+    if len(tokens) != L.NUM_PRIVILEGED_TOKENS:
+        raise AssertionError("privileged critic token layout mismatch")
+    return tokens, position_ids, padding_mask
