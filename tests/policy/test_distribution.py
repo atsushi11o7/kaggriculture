@@ -8,6 +8,7 @@ data/replays/を使った実データ回帰テストはtest_replay_regression.py
 import pytest
 import torch
 
+from kaggriculture.policy import actions as A
 from kaggriculture.policy import distribution as D
 from kaggriculture.policy import vocab as V
 from kaggriculture.simulator import constants as C
@@ -58,6 +59,44 @@ def test_act_evaluate_consistency(net, fresh_obs):
     assert torch.allclose(value, value2, atol=1e-4)
     assert torch.allclose(log_prob, log_prob2, atol=1e-4)
     assert torch.allclose(entropy, entropy2, atol=1e-4)
+
+
+def test_market_wait_consumes_slot_and_continues(net, fresh_obs):
+    """市場WAITは数量スロットを作らず、次の市場opスロットへ進む。"""
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [list(A.MARKET_WAIT_ACTION)],
+    }
+
+    log_prob, entropy, num_decisions = D.evaluate_policy(net, fresh_obs, action)
+
+    assert torch.isfinite(log_prob)
+    assert torch.isfinite(entropy)
+    assert num_decisions == 3  # farmer PASS、market WAIT、market STOP
+
+
+def test_market_wait_serializes_as_zero_quantity_order(fresh_obs):
+    """内部WAIT候補はKaggle環境で1スロットだけ消費する数量0注文へ変換する。"""
+    env = D._envs_from_observations([fresh_obs], 24, 100, 1, C.MAX_MARKET_ORDERS)[0]
+    gen = D._decode_turn_gen(env)
+
+    unit_cands, *_ = next(gen)
+    pass_token = V.ACTION_FARMER_OP[C.FARMER_OP_NAMES.index("PASS")]
+    pass_idx = next(i for i, cand in enumerate(unit_cands) if pass_token in cand.index)
+
+    market_cands, *_ = gen.send(pass_idx)
+    wait_idx = next(
+        i for i, cand in enumerate(market_cands) if V.ACTION_MARKET_WAIT[0] in cand.index
+    )
+    next_market_cands, *_ = gen.send(wait_idx)
+    stop_idx = next(
+        i for i, cand in enumerate(next_market_cands) if V.ACTION_MARKET_STOP[0] in cand.index
+    )
+
+    with pytest.raises(StopIteration) as done:
+        gen.send(stop_idx)
+    assert done.value.value["market"] == [list(A.MARKET_WAIT_ACTION)]
 
 
 def test_batch_matches_single(net, fresh_obs):
