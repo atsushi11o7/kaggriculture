@@ -112,6 +112,8 @@ ACTION_FARMER_OP = _alloc(C.N_FARMER_OPS)  # constants.FARMER_OP_NAMESと同じ�
 ACTION_MARKET_OP = _alloc(C.N_MARKET_OPS)  # constants.MARKET_OP_NAMESと同じ並び
 # 可変長の市場注文を打ち切るデコード専用候補。
 ACTION_MARKET_STOP = _alloc(1)
+# 市場キューを1スロット進め、後続注文の生成を続けるデコード専用候補。
+ACTION_MARKET_WAIT = _alloc(1)
 # 数量ごとに別のone-hot添字を使い、LayerNorm後も区別可能なcategorical分布にする。
 ACTION_QUANTITY_VALUE = _alloc(MAX_ACTION_QUANTITY)  # 量k(1-indexed) → ACTION_QUANTITY_VALUE[k-1]
 ACTION_QUANTITY_CONTINUOUS = _alloc(1)  # value=正規化log(量)。量ごとの順序関係を補う

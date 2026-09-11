@@ -3,7 +3,7 @@
 Kaggle環境`kaggriculture`のobservation(dict)を受け取り、Transformerベースの
 方策・価値ネットワークで1ターン分の行動(farmer→hands→市場注文)を生成・評価する
 パッケージ。固定サイズの行動空間全体にスコアを付けるのではなく、その局面で
-実際に合法な候補だけを都度列挙してスコアリングする(`actions.py`)。
+実行可能な候補と市場WAIT/STOPだけを都度列挙してスコアリングする(`actions.py`)。
 
 ## モジュール一覧
 
@@ -12,7 +12,7 @@ Kaggle環境`kaggriculture`のobservation(dict)を受け取り、Transformerベ�
 | `vocab.py` | EmbeddingBag用の疎特徴量(`SparseVector`)の語彙定義。品目・数量・累積実績などの添字を集中管理する |
 | `tokenize.py` | 生observation → `SparseVector`列への変換(`get_encoder_input`/`get_privileged_critic_input`) |
 | `token_layout.py` | トークン列の並び順・owner/zone/position契約。`tokenize.py`の出力順と必ず一致させる |
-| `actions.py` | 今合法な(op, item)候補だけを列挙する(`legal_unit_actions`/`legal_market_actions`等) |
+| `actions.py` | 実行可能な(op, item)候補と市場WAIT/STOPを列挙する(`legal_unit_actions`/`legal_market_actions`等) |
 | `decode_state.py` | 自己回帰デコード中、確定した1決定をfarm/shed/seeds/marketの仮状態へ反映する |
 | `model.py` | ネットワーク本体(`TokenEmbedding`/`Encoder`/`Decoder`/`PrivilegedEncoder`/`PolicyValueNet`) |
 | `distribution.py` | `model.py`と学習・推論をつなぐ公開API(`act`/`evaluate_actions`/`predict_action`/`evaluate_policy`等) |
@@ -21,8 +21,8 @@ Kaggle環境`kaggriculture`のobservation(dict)を受け取り、Transformerベ�
 ## データフロー
 
 観測1つが固定長トークン列(`token_layout.NUM_WORDS_ENCODER`本、現在210)に変換され、
-Encoder内で先頭にCLSを加えて公開情報を符号化する。行動は、決定スロットごとに合法候補
-だけをDecoderでスコアリングして自己回帰的に生成される。
+Encoder内で先頭にCLSを加えて公開情報を符号化する。行動は、決定スロットごとの候補を
+Decoderでスコアリングして自己回帰的に生成される。
 
 ```mermaid
 flowchart TD
@@ -37,7 +37,7 @@ flowchart TD
 
     subgraph DECODE["自己回帰デコード (distribution._decode_turn_gen)"]
         direction TB
-        LEGAL["actions.legal_unit_actions /\nlegal_market_actions\n(今合法な候補だけ列挙)"]
+        LEGAL["actions.py\n(実行可能な候補 + 市場WAIT/STOP)"]
         DEC["model.Decoder\n(causal self-attn + memoryへのcross-attn)"]
         SCORE["Decoder.score_candidates\n(候補embeddingとの内積)"]
         SAMPLE["カテゴリカル分布からsample\n(act)または保存済み行動と\n一致する候補を選ぶ(evaluate)"]
@@ -100,7 +100,7 @@ flowchart TB
     ENC -->|"公開CLS"| VH
     PENC -->|"非公開CLS concat"| VH
 
-    ACTIONOUT["合法候補の logit\n(そのままsoftmax/samplingへ)"]
+    ACTIONOUT["候補ごとのlogit\n(そのままsoftmax/samplingへ)"]
     SCAND --> ACTIONOUT
     VH --> VALUEOUT["value (batch, 1)"]
 ```
@@ -141,10 +141,16 @@ sequenceDiagram
     end
 
     loop 市場注文(STOPを選ぶまで、最大max_market_orders件)
-        Gen->>Act: legal_market_actions(更新済み状態) + STOP候補
-        Act-->>Gen: 合法候補
+        Gen->>Act: legal_market_actions + WAIT + STOP
+        Act-->>Gen: 候補
         Gen->>Net: score_candidates → sample / teacher-force
-        Gen->>DS: commit_market_action(市場注文の決定)
+        alt 通常注文
+            Gen->>DS: commit_market_action
+        else WAIT
+            Gen->>Gen: 状態を変えず次のスロットへ
+        else STOP
+            Gen->>Gen: 注文生成を終了
+        end
     end
 
     Gen-->>Gen: {"farmer": ..., "hands": [...], "market": [...]}
@@ -187,21 +193,20 @@ sequenceDiagram
 
 ## BC用リプレイの入力契約
 
-`evaluate_policy`系は、expert行動を各スロットの合法候補から教師強制できることを前提とする。
-一方、Kaggleの生リプレイには在庫0へのSELL、数量0、上限を大きく超える数量など、実行時に
-no-opまたはクランプされる注文が含まれる。このような行動は現在の合法候補だけでは表現できず、
-`evaluate_policy`は`ValueError`にする。
+`evaluate_policy`系は、expert行動を各スロットの候補から教師強制できることを前提とする。
+Kaggleの生リプレイには在庫0へのSELL、数量0、上限を大きく超える数量など、実行時にno-opまたは
+クランプされる注文も含まれる。効果のないunit行動は`PASS`へ正規化する。
 
-BCデータセット作成時は、シミュレータで行動の成立可否を再生する。効果のないunit行動は、
-常に合法な`PASS`へ正規化できる。一方、無効な市場注文を単純に削除すると、両プレイヤーを同じindexで
-処理する市場キューの後続注文が前へずれる。市場の待機スロットとして意図的に使われた可能性もあるため、
-そのサンプルを除外するか、市場WAITを行動空間へ追加してから利用する。
+市場注文はindexを保つ必要がある。正規形のWAITである`["SELL", "WHEAT", 0]`はそのまま教師強制
+できるが、それ以外の無効注文は前処理でWAITへ正規化する。無効注文を削除すると後続注文が前へずれ、
+両プレイヤーを同じindexで処理する市場キューの結果が変わり得る。数量が実行可能上限を超える通常注文も、
+シミュレータ上の成立量へ正規化するか、そのサンプルを除外する。
 
 ## 既知の限界
 
-- unitは常に`PASS`を選べるが、市場には「1スロット待ってから後続注文を続ける」WAITがない。
-  `STOP`は注文列自体を終了するためWAITとは異なる。相手注文との位置調整が有利だと確認できた場合は、
-  任意の無効注文を学ばせず、数量0の注文へ変換する専用WAIT候補を追加する。
+- 市場WAITは方策内部だけの候補で、Kaggle actionでは`["SELL", "WHEAT", 0]`へ変換する。
+  固定している`kaggle-environments`では状態を変えず1スロットを消費する。環境バージョンを更新する際は、
+  数量0の解析仕様とJAXシミュレータとの一致を再検証する。
 - 自己回帰中の`decode_state`は、自分の市場注文だけで仮状態を更新する。実環境では両プレイヤーの
   同じindexのSELL/BUY_PRODUCTをlockstepで処理するため、相手注文によって市場在庫・価格・購入可能量が
   変わり、後続市場注文の候補計算と実際の決済結果がずれることがある。

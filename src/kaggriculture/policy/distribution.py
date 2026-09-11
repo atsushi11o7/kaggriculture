@@ -55,7 +55,7 @@ def _item_name(sv: V.SparseVector) -> str | None:
 
 
 def _op_name(sv: V.SparseVector, op_table: range, op_names: tuple) -> str | None:
-    """候補SparseVectorからop名を取り出す(市場注文のSTOP候補ならNone)。"""
+    """候補SparseVectorからop名を取り出す(市場のWAIT/STOP候補ならNone)。"""
     for idx in sv.index:
         if op_table.start <= idx < op_table.stop:
             return op_names[idx - op_table.start]
@@ -100,11 +100,16 @@ class _TeacherForceChooser:
             return len(cands) - 1
         entry = self._market[self._market_cursor]
         self._market_cursor += 1
+        if entry == list(A.MARKET_WAIT_ACTION):
+            return next(i for i, cand in enumerate(cands) if V.ACTION_MARKET_WAIT[0] in cand.index)
         target_op = entry[0]
         target_item = entry[1] if len(entry) > 1 else None
         self._pending_quantity = entry[2] if len(entry) > 2 else 1
         for i, cand in enumerate(cands):
-            if cand.index and cand.index[0] == V.ACTION_MARKET_STOP[0]:
+            if any(
+                special in cand.index
+                for special in (V.ACTION_MARKET_WAIT[0], V.ACTION_MARKET_STOP[0])
+            ):
                 continue
             if (
                 _op_name(cand, V.ACTION_MARKET_OP, C.MARKET_OP_NAMES) == target_op
@@ -211,12 +216,20 @@ def _decode_turn_gen(env: _DecodeEnv):
     m = 0
     while True:
         cands = A.legal_market_actions(farm, shed, market, hire_mult, shed_capacity) + [
-            A.market_stop_candidate()
+            A.market_wait_candidate(),
+            A.market_stop_candidate(),
         ]
         idx = yield (cands, "market_op", L.market_position(m), L.NO_POSITION, None)
         chosen = cands[idx]
-        if idx == len(cands) - 1:
+        if V.ACTION_MARKET_STOP[0] in chosen.index:
             break
+
+        if V.ACTION_MARKET_WAIT[0] in chosen.index:
+            market_entries.append(list(A.MARKET_WAIT_ACTION))
+            m += 1
+            if m >= max_market_orders:
+                break
+            continue
 
         op_name = _op_name(chosen, V.ACTION_MARKET_OP, C.MARKET_OP_NAMES)
         item_name = _item_name(chosen)

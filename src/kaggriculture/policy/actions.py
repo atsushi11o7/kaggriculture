@@ -19,6 +19,9 @@ _MOVE_DELTA = dict(
 )
 _ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
 
+# Kaggle環境では数量0の注文は状態を変えないが、キューの1スロットを占める。
+MARKET_WAIT_ACTION = ("SELL", "WHEAT", 0)
+
 
 def _is_shed_adjacent(pos: tuple[int, int], board_size: int) -> bool:
     half = board_size // 2
@@ -227,6 +230,13 @@ def market_stop_candidate() -> V.SparseVector:
     """
     sv = V.SparseVector()
     sv.add(V.ACTION_MARKET_STOP[0])
+    return sv
+
+
+def market_wait_candidate() -> V.SparseVector:
+    """市場状態を変えず、次の市場注文スロットへ進む候補。"""
+    sv = V.SparseVector()
+    sv.add(V.ACTION_MARKET_WAIT[0])
     return sv
 
 
