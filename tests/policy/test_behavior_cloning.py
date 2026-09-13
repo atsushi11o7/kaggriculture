@@ -2,7 +2,7 @@
 
 import torch
 
-from kaggriculture.policy import distribution as D
+from kaggriculture.policy.torch import distribution as D
 from kaggriculture.training.bc import mean_token_nll
 
 

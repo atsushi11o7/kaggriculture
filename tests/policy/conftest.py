@@ -6,13 +6,34 @@ data/はgitignore対象(AGENTS.md参照)のため、リポジトリには実際�
 act()/evaluate_actions()系のテストが完結するようにする。
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
-from kaggriculture.policy import model as M
+from kaggriculture.policy.common.config import ModelConfig
+from kaggriculture.policy.torch import model as M
 from kaggriculture.simulator import constants as C
 
 BOARD_SIZE = 10
+
+
+DEFAULT_MODEL_CONFIG = ModelConfig(
+    d_model=128,
+    num_heads=4,
+    d_feedforward=512,
+    num_layers_encoder=4,
+    num_layers_decoder=3,
+    dropout=0.0,
+    use_episode_history=False,
+    use_asymmetric_critic=False,
+    num_layers_critic=2,
+)
+
+
+def test_model_config(**changes) -> ModelConfig:
+    """テスト用の標準モデル構成を一部だけ上書きする。"""
+    return replace(DEFAULT_MODEL_CONFIG, **changes)
 
 
 def _fresh_farm() -> dict:
@@ -71,19 +92,19 @@ def fresh_private() -> dict:
 @pytest.fixture
 def net() -> M.PolicyValueNet:
     torch.manual_seed(0)
-    return M.PolicyValueNet()
+    return M.PolicyValueNet(DEFAULT_MODEL_CONFIG)
 
 
 @pytest.fixture
 def net_with_history() -> M.PolicyValueNet:
     torch.manual_seed(0)
-    return M.PolicyValueNet(use_episode_history=True)
+    return M.PolicyValueNet(test_model_config(use_episode_history=True))
 
 
 @pytest.fixture
 def net_with_asymmetric_critic() -> M.PolicyValueNet:
     torch.manual_seed(0)
-    return M.PolicyValueNet(use_asymmetric_critic=True)
+    return M.PolicyValueNet(test_model_config(use_asymmetric_critic=True))
 
 
 @pytest.fixture

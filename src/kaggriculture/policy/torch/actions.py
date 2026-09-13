@@ -8,9 +8,9 @@ import math
 
 import numpy as np
 
-from kaggriculture.policy import vocab as V
-from kaggriculture.simulator import constants as C
-from kaggriculture.simulator import game_params as P
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
 
 _FARMER_OP = {name: i for i, name in enumerate(C.FARMER_OP_NAMES)}
 _MARKET_OP = {name: i for i, name in enumerate(C.MARKET_OP_NAMES)}
@@ -128,7 +128,7 @@ def legal_unit_actions(
     # 2種類が該当)のPLACEは常に動物配置側の意味になり、納屋落としにはならない
     # (animal_actions.pyのon_animal_branch参照)。これらの動物名は、下の
     # PLACE(納屋落とし)候補の対象から除外する。
-    on_animal_branch_items = {a for a in C.ANIMALS if is_animal_placement(a, tile)}
+    on_animal_branch_items = tuple(a for a in C.ANIMALS if is_animal_placement(a, tile))
     if is_structure and not has_animal:
         candidates.append(_candidate(farmer_op="DIG"))
     for animal in on_animal_branch_items:
@@ -136,8 +136,8 @@ def legal_unit_actions(
             candidates.append(_candidate(farmer_op="PLACE", item_index=V.entity_index(animal)))
 
     if is_empty:
-        for crop, n in seeds.items():
-            if n > 0:
+        for crop in C.CROPS:
+            if seeds.get(crop, 0) > 0:
                 candidates.append(_candidate(farmer_op="PLANT", item_index=V.entity_index(crop)))
         candidates.append(_candidate(farmer_op="BUILD_COOP"))
         candidates.append(_candidate(farmer_op="BUILD_PASTURE"))
@@ -149,8 +149,8 @@ def legal_unit_actions(
         if has_inventory and sum(shed.values()) < shed_capacity:
             candidates.append(_candidate(farmer_op="DROP"))
         if has_inventory:
-            for item, n in inventory.items():
-                if n > 0 and item not in on_animal_branch_items:
+            for item in C.SHED_ITEMS:
+                if inventory.get(item, 0) > 0 and item not in on_animal_branch_items:
                     # 納屋が満杯だとPLACE(納屋落とし)は0個しか置けない(=数量スロットが
                     # 空になり自己回帰が行き止まる)ため、置ける時だけ候補に出す。
                     placeable = max_executable_quantity(
@@ -160,8 +160,8 @@ def legal_unit_actions(
                         candidates.append(
                             _candidate(farmer_op="PLACE", item_index=V.entity_index(item))
                         )
-        for item, n in shed.items():
-            if n > 0:
+        for item in C.SHED_ITEMS:
+            if shed.get(item, 0) > 0:
                 candidates.append(_candidate(farmer_op="PICKUP", item_index=V.entity_index(item)))
 
     return candidates
@@ -200,11 +200,11 @@ def legal_market_actions(
         candidates.append(_candidate(market_op="BUY_LAND"))
 
     for i, crop in enumerate(C.CROPS):
-        if max_executable_quantity("BUY_SEED", crop, farm, shed, market, shed_capacity) > 0:
+        if has_executable_quantity("BUY_SEED", crop, farm, shed, market, shed_capacity):
             candidates.append(_candidate(market_op="BUY_SEED", item_index=V.ENTITY_ITEM[i]))
 
     for i, animal in enumerate(C.ANIMALS):
-        if max_executable_quantity("BUY_ANIMAL", animal, farm, shed, market, shed_capacity) > 0:
+        if has_executable_quantity("BUY_ANIMAL", animal, farm, shed, market, shed_capacity):
             candidates.append(
                 _candidate(market_op="BUY_ANIMAL", item_index=V.ENTITY_ITEM[C.N_PRODUCTS + i])
             )
@@ -212,11 +212,11 @@ def legal_market_actions(
         # 表示価格(現在庫基準)ではなく、実際に1個買う時の価格(在庫-1基準、
         # market_lockstep._quote_and_commit参照)で判定する。表示価格だけで
         # 判定すると、実際は買えないのに候補に出て数量スロットが空になりうる。
-        if max_executable_quantity("BUY_PRODUCT", item, farm, shed, market, shed_capacity) > 0:
+        if has_executable_quantity("BUY_PRODUCT", item, farm, shed, market, shed_capacity):
             candidates.append(_candidate(market_op="BUY_PRODUCT", item_index=V.entity_index(item)))
 
-    for item in shed:
-        if item in C.PRODUCTS and max_executable_quantity("SELL", item, farm, shed, market) > 0:
+    for item in C.PRODUCTS:
+        if has_executable_quantity("SELL", item, farm, shed, market):
             candidates.append(_candidate(market_op="SELL", item_index=V.entity_index(item)))
 
     return candidates
@@ -444,6 +444,48 @@ def max_executable_quantity(
         return actual
 
     return 0
+
+
+def has_executable_quantity(
+    op_name: str,
+    item_name: str | None,
+    farm: dict,
+    shed: dict,
+    market: dict | None,
+    shed_capacity: int = 100,
+    inventory: dict | None = None,
+) -> bool:
+    """数量付き行動が1個以上成立するかを定数時間で判定する。
+
+    合法な(op, item)候補の列挙では最大数量は不要である。特に市場価格を1個ずつ
+    再計算する`max_executable_quantity`を候補ごとに呼ばないための軽量経路。
+    """
+    if item_name is None:
+        return False
+
+    if op_name in ("PICKUP", "SELL"):
+        return shed.get(item_name, 0) > 0
+
+    if op_name == "PLACE":
+        return (inventory or {}).get(item_name, 0) > 0 and sum(shed.values()) < shed_capacity
+
+    if op_name == "BUY_SEED":
+        cost = P.CROP_SEED_COST[C.CROPS.index(item_name)]
+        return farm["money"] >= cost
+
+    if op_name == "BUY_ANIMAL":
+        cost = P.ANIMAL_COST[C.ANIMALS.index(item_name)]
+        return farm["money"] >= cost and sum(shed.values()) < shed_capacity
+
+    if op_name == "BUY_PRODUCT":
+        if market is None or sum(shed.values()) >= shed_capacity:
+            return False
+        item_idx = C.PRODUCTS.index(item_name)
+        inventory_value = market["inventory"][item_name]
+        price = _market_price_one(item_idx, inventory_value - 1)
+        return farm["money"] >= price
+
+    return False
 
 
 def _fib(n: int) -> int:

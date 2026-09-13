@@ -7,10 +7,10 @@ import copy
 
 import torch
 
-from kaggriculture.policy import distribution as D
-from kaggriculture.policy import token_layout as L
-from kaggriculture.policy import tokenize
-from kaggriculture.policy import vocab as V
+from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.policy.torch import distribution as D
+from kaggriculture.policy.torch import tokenize
 
 
 def test_opponent_private_none_is_rejected(net_with_asymmetric_critic, fresh_obs):

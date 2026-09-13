@@ -6,18 +6,18 @@
 """
 
 import contextlib
-import copy
 from dataclasses import dataclass
 
 import torch
 
-from kaggriculture.policy import actions as A
-from kaggriculture.policy import decode_state as DS
-from kaggriculture.policy import model as M
-from kaggriculture.policy import token_layout as L
-from kaggriculture.policy import tokenize
-from kaggriculture.policy import vocab as V
-from kaggriculture.simulator import constants as C
+from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.policy.torch import actions as A
+from kaggriculture.policy.torch import decode as DS
+from kaggriculture.policy.torch import features as F
+from kaggriculture.policy.torch import model as M
+from kaggriculture.policy.torch import tokenize
+from kaggriculture.rules import constants as C
 
 
 @contextlib.contextmanager
@@ -126,6 +126,161 @@ class _TeacherForceChooser:
             entry = self._hands[self._hand_cursor - 1]
         self._hand_cursor += 1
         return entry
+
+
+class _NormalizingChooser:
+    """保存済み行動を、無効なエントリを代替候補へ正規化しながらたどる。
+
+    _TeacherForceChooserと同じ巡回順序・照合ロジックだが、候補に一致しない場合に
+    ValueErrorを出す代わりに常に有効な代替候補を選ぶ(normalize_expert_action参照):
+    unit行動はPASS、実行不可能な市場注文はMARKET_WAIT(STOPにすると後続の有効な
+    注文まで失われるため)、実行可能上限を超える数量は上限にクランプする。
+    PASS/MARKET_WAITは常に候補として存在するため、choose()は失敗しない。
+    """
+
+    def __init__(self, action: dict):
+        self._farmer = list(action["farmer"])
+        self._hands = [list(h) for h in action["hands"]]
+        self._market = [list(m) for m in action["market"]]
+        self._hand_cursor = 0
+        self._market_cursor = 0
+        self._pending_quantity: int | None = None
+
+    def choose(self, cands: list, slot_kind: str) -> int:
+        if slot_kind == "quantity":
+            n = self._pending_quantity
+            self._pending_quantity = None
+            return min(n, len(cands)) - 1
+
+        if slot_kind == "unit_op":
+            entry = self._unit_entry_for_current()
+            target_op = entry[0]
+            target_item = entry[1] if len(entry) > 1 else None
+            self._pending_quantity = entry[2] if len(entry) > 2 else 1
+            for i, cand in enumerate(cands):
+                if (
+                    _op_name(cand, V.ACTION_FARMER_OP, C.FARMER_OP_NAMES) == target_op
+                    and _item_name(cand) == target_item
+                ):
+                    return i
+            self._pending_quantity = None
+            return next(
+                i
+                for i, cand in enumerate(cands)
+                if _op_name(cand, V.ACTION_FARMER_OP, C.FARMER_OP_NAMES) == "PASS"
+            )
+
+        # slot_kind == "market_op"
+        if self._market_cursor >= len(self._market):
+            return len(cands) - 1  # STOP
+        entry = self._market[self._market_cursor]
+        self._market_cursor += 1
+        if entry == list(A.MARKET_WAIT_ACTION):
+            return next(i for i, cand in enumerate(cands) if V.ACTION_MARKET_WAIT[0] in cand.index)
+        target_op = entry[0]
+        target_item = entry[1] if len(entry) > 1 else None
+        self._pending_quantity = entry[2] if len(entry) > 2 else 1
+        for i, cand in enumerate(cands):
+            if any(
+                special in cand.index
+                for special in (V.ACTION_MARKET_WAIT[0], V.ACTION_MARKET_STOP[0])
+            ):
+                continue
+            if (
+                _op_name(cand, V.ACTION_MARKET_OP, C.MARKET_OP_NAMES) == target_op
+                and _item_name(cand) == target_item
+            ):
+                return i
+        self._pending_quantity = None
+        return next(i for i, cand in enumerate(cands) if V.ACTION_MARKET_WAIT[0] in cand.index)
+
+    def _unit_entry_for_current(self):
+        if self._hand_cursor == 0:
+            entry = self._farmer
+        else:
+            entry = self._hands[self._hand_cursor - 1]
+        self._hand_cursor += 1
+        return entry
+
+
+def _canonicalize_expert_noops(obs: dict, action: dict) -> dict:
+    """環境がno-opにする入力とatomic PLANT失敗を明示的な行動へ変換する。"""
+    if not isinstance(action, dict):
+        action = {}
+
+    player = obs["player"]
+    farm = obs["farms"][player]
+    positions = [farm["farmer"], *farm["hands"]]
+
+    farmer = action.get("farmer", ["PASS"])
+    raw_hands = action.get("hands", [])
+    if not isinstance(raw_hands, list):
+        raw_hands = []
+    unit_entries = [farmer, *raw_hands[: len(farm["hands"])]]
+    unit_entries.extend([["PASS"]] * (len(positions) - len(unit_entries)))
+
+    normalized_units = []
+    for entry, pos in zip(unit_entries, positions, strict=True):
+        if not isinstance(entry, list) or not entry:
+            normalized_units.append(["PASS"])
+            continue
+
+        entry = list(entry)
+        op_name = entry[0]
+        item_name = entry[1] if len(entry) > 1 else None
+        x, y = pos
+        tile = farm["tiles"][y][x]
+        if len(entry) >= 3 and DS.requires_quantity(op_name, item_name, tile):
+            try:
+                entry[2] = int(entry[2])
+            except (TypeError, ValueError):
+                entry = ["PASS"]
+            else:
+                if entry[2] <= 0:
+                    entry = ["PASS"]
+        normalized_units.append(entry)
+
+    # 元環境は、作物ごとのPLANT要求が種数を超えるとその作物の要求を全て捨てる。
+    demand: dict[str, int] = {}
+    for entry in normalized_units:
+        if len(entry) >= 2 and entry[0] == "PLANT":
+            demand[entry[1]] = demand.get(entry[1], 0) + 1
+    seeds = obs["private"]["seeds"]
+    blocked = {crop for crop, n in demand.items() if n > seeds.get(crop, 0)}
+    normalized_units = [
+        ["PASS"] if len(entry) >= 2 and entry[0] == "PLANT" and entry[1] in blocked else entry
+        for entry in normalized_units
+    ]
+
+    raw_market = action.get("market", [])
+    if not isinstance(raw_market, list):
+        raw_market = []
+    market = []
+    quantity_ops = {"BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL"}
+    for entry in raw_market:
+        if not isinstance(entry, list) or not entry:
+            market.append(list(A.MARKET_WAIT_ACTION))
+            continue
+        entry = list(entry)
+        if entry[0] in quantity_ops:
+            if len(entry) < 3:
+                market.append(list(A.MARKET_WAIT_ACTION))
+                continue
+            try:
+                entry[2] = int(entry[2])
+            except (TypeError, ValueError):
+                market.append(list(A.MARKET_WAIT_ACTION))
+                continue
+            if entry[2] <= 0:
+                market.append(list(A.MARKET_WAIT_ACTION))
+                continue
+        market.append(entry)
+
+    return {
+        "farmer": normalized_units[0],
+        "hands": normalized_units[1:],
+        "market": market,
+    }
 
 
 @dataclass(slots=True)
@@ -346,7 +501,7 @@ def _pad_and_collate(
         batch_bpid.append(bpids + [L.NO_POSITION] * pad_n)
         batch_padmask.append([False] * len(tokens) + [True] * pad_n)
 
-    d_index, d_value, d_offset = V.collate(flat_tokens, device=device)
+    d_index, d_value, d_offset = F.collate(flat_tokens, device=device)
     pid_t = torch.tensor(batch_pid, dtype=torch.long, device=device)
     bpid_t = torch.tensor(batch_bpid, dtype=torch.long, device=device)
     padmask_t = torch.tensor(batch_padmask, dtype=torch.bool, device=device)
@@ -444,6 +599,52 @@ def _decode_turn_batch(
     return results, total_log_prob, total_entropy, num_decisions
 
 
+def _teacher_force_trace(
+    env: _DecodeEnv, action: dict
+) -> tuple[list[V.SparseVector], list[int], list[int], list[tuple[list, str, int]]]:
+    """ネットワークを使わず、1環境分の教師強制列を再構築する。
+
+    _decode_turn_gen()を_TeacherForceChooserだけで完走させ、決定トークン列と
+    各スロットの(候補, スロット種別, 選択index)を求める。Encoder/Decoderも
+    テンソルも一切使わない、合法候補列挙とdecode_stateの仮状態更新だけの処理。
+
+    Returns:
+        (tokens, position_ids, board_position_ids, slots)。
+
+    Raises:
+        ValueError: actionのどれかのエントリが、その時点の合法候補に無い場合
+        (_TeacherForceChooser.choose参照)。
+    """
+    gen = _decode_turn_gen(env)
+    chooser = _TeacherForceChooser(action)
+    tokens: list[V.SparseVector] = []
+    position_ids: list[int] = []
+    board_position_ids: list[int] = []
+    slots: list[tuple[list, str, int]] = []
+    next_token = V.SparseVector()
+
+    try:
+        step = next(gen)
+        while True:
+            cands, slot_kind, position_id, board_position_id, unit_context = step
+            if unit_context is not None:
+                next_token.extend(unit_context)
+            tokens.append(next_token)
+            position_ids.append(position_id)
+            board_position_ids.append(board_position_id)
+            next_token = V.SparseVector()
+
+            idx = chooser.choose(cands, slot_kind)
+            slots.append((cands, slot_kind, idx))
+            next_token.extend(cands[idx])
+
+            step = gen.send(idx)
+    except StopIteration:
+        pass
+
+    return tokens, position_ids, board_position_ids, slots
+
+
 def _decode_turn_teacher_force(
     net: M.PolicyValueNet, memory_batch: torch.Tensor, envs: list[_DecodeEnv], actions: list[dict]
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
@@ -470,33 +671,7 @@ def _decode_turn_teacher_force(
     slots_per_env: list[list[tuple[list, str, int]]] = []  # (candidates, slot_kind, chosen_idx)
 
     for env, action in zip(envs, actions, strict=True):
-        gen = _decode_turn_gen(env)
-        chooser = _TeacherForceChooser(action)
-        tokens: list[V.SparseVector] = []
-        position_ids: list[int] = []
-        board_position_ids: list[int] = []
-        slots: list[tuple[list, str, int]] = []
-        next_token = V.SparseVector()
-
-        try:
-            step = next(gen)
-            while True:
-                cands, slot_kind, position_id, board_position_id, unit_context = step
-                if unit_context is not None:
-                    next_token.extend(unit_context)
-                tokens.append(next_token)
-                position_ids.append(position_id)
-                board_position_ids.append(board_position_id)
-                next_token = V.SparseVector()
-
-                idx = chooser.choose(cands, slot_kind)
-                slots.append((cands, slot_kind, idx))
-                next_token.extend(cands[idx])
-
-                step = gen.send(idx)
-        except StopIteration:
-            pass
-
+        tokens, position_ids, board_position_ids, slots = _teacher_force_trace(env, action)
         tokens_per_env.append(tokens)
         position_ids_per_env.append(position_ids)
         board_position_ids_per_env.append(board_position_ids)
@@ -547,6 +722,23 @@ def _envs_from_observations(
 ) -> list[_DecodeEnv]:
     """観測を破壊的に更新可能なデコード用状態へコピーする。
 
+    汎用のcopy.deepcopyは使わず、decode_state.commit_unit_action/commit_market_action
+    が実際に書き換える範囲だけを手動でコピーする(プロファイリングの結果、
+    copy.deepcopyがBC学習の総実行時間の1〜2割を占めていた)。安全性の根拠:
+
+    - farm["tiles"]: セル丸ごとの置換(PLANT/DIG等)とセル内フィールドの書き換え
+      (WATER等)の両方が起きるため、行ごと・dict型セルごとに複製が必要
+    - farm["farmer"]/["hands"]/["unlocked_quadrants"]: 参照を直接書き換えることは
+      無く、常に新しいlistで再代入される(commit_market_action参照)ため、
+      トップレベルの浅いコピーだけで安全(元のlistを共有していても再代入時に
+      上書きされるだけで元は壊れない)
+    - shed/seeds/market["inventory"]/market["prices"]: 全てキー単位の再代入のみ
+      (ネストした書き換えは無い)ため、1階層の浅いコピーで十分
+    - private["inventories"](各ユニットの持ち物): commit_unit_actionは読み取る
+      だけで一切書き換えない(=deepcopyの再帰コピーは不要)が、呼び出し側が
+      観測と参照を共有しないことに依存し得るため、各ユニット分の辞書だけは
+      浅くコピーする
+
     Args:
         observations: ターン開始時点の観測。
         turns_per_day: 1日当たりのターン数。
@@ -568,15 +760,26 @@ def _envs_from_observations(
     envs = []
     for obs in observations:
         player = obs["player"]
-        farm = copy.deepcopy(obs["farms"][player])
+        farm_src = obs["farms"][player]
+        farm = {
+            **farm_src,
+            "tiles": [
+                [dict(cell) if isinstance(cell, dict) else cell for cell in row]
+                for row in farm_src["tiles"]
+            ],
+        }
         private = obs["private"]
+        market_src = obs["market"]
         envs.append(
             _DecodeEnv(
                 farm=farm,
                 shed=dict(private["shed"]),
                 seeds=dict(private["seeds"]),
-                market=copy.deepcopy(obs["market"]),
-                inventories=copy.deepcopy(private["inventories"]),
+                market={
+                    "inventory": dict(market_src["inventory"]),
+                    "prices": dict(market_src["prices"]),
+                },
+                inventories=[dict(inv) for inv in private["inventories"]],
                 day=obs["day"],
                 turns_per_day=turns_per_day,
                 shed_capacity=shed_capacity,
@@ -628,7 +831,7 @@ def _encode_observations(
     all_tokens = []
     for obs, c in zip(observations, counters_list, strict=True):
         all_tokens.extend(tokenize.get_encoder_input(obs, turns_per_day, c))
-    index, value_t, offset = V.collate(all_tokens, device=device)
+    index, value_t, offset = F.collate(all_tokens, device=device)
     return net.encode(index, value_t, offset)
 
 
@@ -672,7 +875,7 @@ def _evaluate_values(
         position_ids.append(positions)
         padding_masks.append(padding)
 
-    index, value, offset = V.collate(tokens, device=device)
+    index, value, offset = F.collate(tokens, device=device)
     positions = torch.tensor(position_ids, dtype=torch.long, device=device)
     padding = torch.tensor(padding_masks, dtype=torch.bool, device=device)
     privileged_memory = net.encode_privileged(index, value, offset, positions, padding)
@@ -960,6 +1163,95 @@ def evaluate_policy(
         [counters] if counters is not None else None,
     )
     return log_probs[0], entropies[0], num_decisions[0]
+
+
+def validate_policy_action(
+    obs: dict,
+    action: dict,
+    *,
+    turns_per_day: int = 24,
+    shed_capacity: int = 100,
+    hire_mult: float = 1,
+    max_market_orders: int = C.MAX_MARKET_ORDERS,
+) -> None:
+    """actionが、この観測時点の合法候補列から教師強制で再構築できるか検証する。
+
+    Encoder/Decoderもテンソルも一切使わない(_teacher_force_trace参照。合法候補
+    列挙とdecode_stateの仮状態更新だけを行う)ため、evaluate_policy/
+    evaluate_actionsよりずっと安価。BCデータセット構築時、バッチ化・モデル実行の
+    前に無効なexpert行動(README.mdの「BC用リプレイの入力契約」参照)を弾くのに使う。
+
+    evaluate_policy_batch/evaluate_actions_batch自体は無効なactionを黙って
+    スキップしたりはしない(事前検証済みのはずのバッチに無効な行動が混入した場合、
+    それはデータパイプライン側のバグなので、従来通りValueErrorのままにする)。
+
+    Args:
+        obs: player視点の観測。
+        action: 検証するaction。
+        turns_per_day: 1日当たりのターン数。
+        shed_capacity: 納屋容量。
+        hire_mult: 雇用費倍率。
+        max_market_orders: 1ターンの市場注文上限。
+
+    Raises:
+        ValueError: actionのどれかのエントリが、その時点の合法候補に無い場合
+        (_TeacherForceChooser.choose参照。理由はメッセージに含まれる)。
+    """
+    env = _envs_from_observations(
+        [obs], turns_per_day, shed_capacity, hire_mult, max_market_orders
+    )[0]
+    _teacher_force_trace(env, action)
+
+
+def normalize_expert_action(
+    obs: dict,
+    action: dict,
+    *,
+    turns_per_day: int = 24,
+    shed_capacity: int = 100,
+    hire_mult: float = 1,
+    max_market_orders: int = C.MAX_MARKET_ORDERS,
+) -> dict:
+    """生のexpert行動を、この観測時点で方策が表現できる形へ正規化する。
+
+    生リプレイには、シミュレータ側で黙ってno-opまたはクランプされる無効な注文が
+    含まれる(README.mdの「BC用リプレイの入力契約」参照)。以下の規則で
+    正規化する:
+      - 候補に無いunit行動 → PASS
+      - 候補に無い市場注文 → MARKET_WAIT(STOPにすると後続の有効な注文まで
+        失われるため、キュー位置だけ消費して次のスロットへ進む)
+      - 数量0以下のunit行動 → PASS、数量不正の市場注文 → MARKET_WAIT
+      - 同一作物のPLANT要求が種数を超える場合 → その作物の全PLANTをPASS
+      - 実行可能上限を超える正の数量 → 上限にクランプ
+    PASS/MARKET_WAITは常にその時点の候補として存在するため、この関数自体は
+    ValueErrorを出さない。ただし正規化ロジックとvalidate_policy_actionの定義が
+    ずれていないか確認するため、呼び出し側で返り値をvalidate_policy_actionに
+    通すことを推奨する。
+
+    Args:
+        obs: player視点の観測。
+        action: 正規化対象のexpert行動。
+        turns_per_day: 1日当たりのターン数。
+        shed_capacity: 納屋容量。
+        hire_mult: 雇用費倍率。
+        max_market_orders: 1ターンの市場注文上限。
+
+    Returns:
+        dict: kaggle-environments形式の正規化済みaction。
+    """
+    env = _envs_from_observations(
+        [obs], turns_per_day, shed_capacity, hire_mult, max_market_orders
+    )[0]
+    gen = _decode_turn_gen(env)
+    chooser = _NormalizingChooser(_canonicalize_expert_noops(obs, action))
+    try:
+        step = next(gen)
+        while True:
+            cands, slot_kind, *_ = step
+            idx = chooser.choose(cands, slot_kind)
+            step = gen.send(idx)
+    except StopIteration as e:
+        return e.value
 
 
 def evaluate_actions(

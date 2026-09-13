@@ -7,7 +7,7 @@
 # requires_quantity/max_executable_quantityは合法候補の生成(legal_market_actions)と
 # 数量の上限計算を同じ場所にまとめるため、actions.pyに定義されている
 # (このモジュールはcommit_*_actionでも同じ上限計算が必要なので使う)。
-from kaggriculture.policy.actions import (
+from kaggriculture.policy.torch.actions import (
     _fib,
     _market_price_one,
     _simulate_market_units,
@@ -15,8 +15,8 @@ from kaggriculture.policy.actions import (
     max_executable_quantity,
     requires_quantity,
 )
-from kaggriculture.simulator import constants as C
-from kaggriculture.simulator import game_params as P
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
 
 __all__ = [
     "commit_market_action",

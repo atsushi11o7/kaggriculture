@@ -1,4 +1,4 @@
-"""EmbeddingBagで使う疎特徴量の語彙。
+"""観測と行動候補で共有する疎特徴量の語彙。
 
 品目識別子は観測ゾーンと行動候補で共有し、文脈はzoneや専用マーカーで表す。
 単独スカラーはLayerNormで大きさを失うため、存在マーカーと量bucketを併用する。
@@ -6,9 +6,7 @@
 
 from dataclasses import dataclass, field
 
-import torch
-
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 
 BOARD_SIZE = 10
 
@@ -143,31 +141,3 @@ class SparseVector:
     def extend(self, other: "SparseVector") -> None:
         self.index.extend(other.index)
         self.value.extend(other.value)
-
-
-def collate(
-    vectors: list[SparseVector], device: torch.device | str | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """SparseVector列をEmbeddingBag入力へ平坦化する。
-
-    Args:
-        vectors: 疎特徴量。
-        device: 出力先デバイス。
-
-    Returns:
-        index、value、各vectorの開始offset。
-    """
-    index: list[int] = []
-    value: list[float] = []
-    offset: list[int] = []
-    cursor = 0
-    for sv in vectors:
-        offset.append(cursor)
-        index.extend(sv.index)
-        value.extend(sv.value)
-        cursor += len(sv.index)
-    return (
-        torch.tensor(index, dtype=torch.long, device=device),
-        torch.tensor(value, dtype=torch.float32, device=device),
-        torch.tensor(offset, dtype=torch.long, device=device),
-    )

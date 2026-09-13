@@ -6,9 +6,9 @@ get_privileged_critic_inputで別系列にする。
 
 import math
 
-from kaggriculture.policy import token_layout as L
-from kaggriculture.policy import vocab as V
-from kaggriculture.simulator import constants as C
+from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.rules import constants as C
 
 
 def _norm(n: float, scale: float) -> float:
@@ -220,52 +220,57 @@ def encode_unit_context(inventory: dict) -> V.SparseVector:
     return sv
 
 
-def _encode_own_counters(counters: dict) -> V.SparseVector:
-    """呼び出し側が保持する、自分のエピソード累積実績を符号化する。
-
-    estimated項目の制約はepisode_history.pyを参照。
-    """
-    sv = V.SparseVector()
-    _add_counts(
-        sv,
-        counters.get("produced", {}),
-        C.PRODUCTS,
-        V.OWN_PRODUCED,
-        V.OWN_PRODUCED_MAGNITUDE_BUCKET,
-        lambda n: _norm_log(n, cap=1000),
-        continuous_table=V.OWN_PRODUCED_CONTINUOUS,
+def _encode_own_counters(counters: dict) -> list[V.SparseVector]:
+    """累積実績をカテゴリ別の5トークンへ符号化する。"""
+    specs = (
+        (
+            "produced",
+            V.OWN_PRODUCED,
+            V.OWN_PRODUCED_MAGNITUDE_BUCKET,
+            V.OWN_PRODUCED_CONTINUOUS,
+            1_000,
+        ),
+        (
+            "sold",
+            V.OWN_SOLD,
+            V.OWN_SOLD_MAGNITUDE_BUCKET,
+            V.OWN_SOLD_CONTINUOUS,
+            1_000,
+        ),
+        (
+            "estimated_bought_product",
+            V.OWN_ESTIMATED_BOUGHT_PRODUCT,
+            V.OWN_ESTIMATED_BOUGHT_PRODUCT_MAGNITUDE_BUCKET,
+            V.OWN_ESTIMATED_BOUGHT_PRODUCT_CONTINUOUS,
+            1_000,
+        ),
+        (
+            "estimated_revenue",
+            V.OWN_ESTIMATED_REVENUE,
+            V.OWN_ESTIMATED_REVENUE_MAGNITUDE_BUCKET,
+            V.OWN_ESTIMATED_REVENUE_CONTINUOUS,
+            500_000,
+        ),
     )
-    _add_counts(
-        sv,
-        counters.get("sold", {}),
-        C.PRODUCTS,
-        V.OWN_SOLD,
-        V.OWN_SOLD_MAGNITUDE_BUCKET,
-        lambda n: _norm_log(n, cap=1000),
-        continuous_table=V.OWN_SOLD_CONTINUOUS,
-    )
-    _add_counts(
-        sv,
-        counters.get("estimated_bought_product", {}),
-        C.PRODUCTS,
-        V.OWN_ESTIMATED_BOUGHT_PRODUCT,
-        V.OWN_ESTIMATED_BOUGHT_PRODUCT_MAGNITUDE_BUCKET,
-        lambda n: _norm_log(n, cap=1000),
-        continuous_table=V.OWN_ESTIMATED_BOUGHT_PRODUCT_CONTINUOUS,
-    )
-    _add_counts(
-        sv,
-        counters.get("estimated_revenue", {}),
-        C.PRODUCTS,
-        V.OWN_ESTIMATED_REVENUE,
-        V.OWN_ESTIMATED_REVENUE_MAGNITUDE_BUCKET,
-        lambda n: _norm_log(n, cap=500_000),
-        continuous_table=V.OWN_ESTIMATED_REVENUE_CONTINUOUS,
-    )
+    tokens = []
+    for name, entity, magnitude, continuous, cap in specs:
+        token = V.SparseVector()
+        _add_counts(
+            token,
+            counters.get(name, {}),
+            C.PRODUCTS,
+            entity,
+            magnitude,
+            lambda n, cap=cap: _norm_log(n, cap),
+            continuous_table=continuous,
+        )
+        tokens.append(token)
+    sold_token = V.SparseVector()
     for item, sold in counters.get("has_ever_sold", {}).items():
         if sold:
-            sv.add(V.OWN_HAS_EVER_SOLD[C.PRODUCTS.index(item)])
-    return sv
+            sold_token.add(V.OWN_HAS_EVER_SOLD[C.PRODUCTS.index(item)])
+    tokens.append(sold_token)
+    return tokens
 
 
 def _encode_seeds(seeds: dict) -> V.SparseVector:
@@ -320,7 +325,7 @@ def get_encoder_input(
     tokens.append(_encode_market_price(obs["market"]))
     tokens.append(_encode_town(obs["town"]))
     tokens.append(_encode_turn(day, obs["hour"]))
-    tokens.append(_encode_own_counters(counters or {}))
+    tokens.extend(_encode_own_counters(counters or {}))
 
     return tokens
 
