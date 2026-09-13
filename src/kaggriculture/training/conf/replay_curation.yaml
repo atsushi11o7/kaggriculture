@@ -1,0 +1,32 @@
+experiment:
+  name: broad_winners
+
+hydra:
+  job:
+    name: replay_curation
+    chdir: true
+  run:
+    dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+data:
+  replay_dir: data/replays
+  rating_manifest_dir: data/replays/manifests
+  num_episodes: null
+
+selection:
+  winner_only: true
+  include_ties: false
+  min_terminal_cash: 0
+  min_margin: 0
+  min_avg_agent_score: null
+  min_agent_score: null
+  max_per_strategy: null
+  max_total: null
+
+split:
+  validation_fraction: 0.1
+  test_fraction: 0.05
+
+output_dir: data/training_sets/${experiment.name}
+seed: 0
+log_interval: 100

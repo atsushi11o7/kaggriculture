@@ -1,7 +1,7 @@
 """PyTorch方策の軽量候補判定テスト。"""
 
 from kaggriculture.policy.torch import actions as A
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 
 
 def test_has_executable_quantity_matches_maximum() -> None:

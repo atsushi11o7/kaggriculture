@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,7 +19,7 @@ from kaggriculture.policy.common import vocab as V
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.state import State
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 3
 _STATE_PREFIX = "state__"
 _ITEM_UNIT_OPS = {
     C.FARMER_OP_PICKUP,
@@ -59,6 +61,42 @@ class CacheRules:
     hire_mult: float = 1.0
     max_market_orders: int = C.MAX_MARKET_ORDERS
     min_player_reward: float | None = None
+
+
+@dataclass
+class CacheStats:
+    """BC cache変換の成功数と破棄理由。"""
+
+    accepted: int = 0
+    discarded: int = 0
+    reasons: Counter[str] = field(default_factory=Counter)
+
+    def add(self, other: CacheStats) -> None:
+        self.accepted += other.accepted
+        self.discarded += other.discarded
+        self.reasons.update(other.reasons)
+
+    def to_dict(self) -> dict:
+        return {
+            "accepted": self.accepted,
+            "discarded": self.discarded,
+            "reasons": dict(sorted(self.reasons.items())),
+        }
+
+
+def _discard_reason(error: Exception) -> str:
+    if isinstance(error, KeyError):
+        return "missing_field"
+    if isinstance(error, TypeError):
+        return "malformed_type"
+    message = str(error)
+    if "quantity" in message:
+        return "invalid_quantity"
+    if "not found among" in message:
+        return "illegal_candidate"
+    if "MAX_HANDS" in message:
+        return "too_many_hands"
+    return "invalid_value"
 
 
 class BCBatch(NamedTuple):
@@ -191,98 +229,114 @@ def observation_to_state(
 
 
 def _trace_choices(obs: dict, action: dict, rules: CacheRules) -> tuple[np.ndarray, np.ndarray]:
-    """正規化済み行動をJAX固定候補表のindex列へ変換する。"""
-    from kaggriculture.policy.torch import distribution as distribution
+    """expert行動を公開候補API経由でJAX固定候補表のindex列へ変換する。"""
+    from kaggriculture.policy.torch.candidate_api import (
+        candidate_action_names,
+        trace_expert_candidates,
+    )
 
-    env = distribution._envs_from_observations(
-        [obs],
-        rules.turns_per_day,
-        rules.shed_capacity,
-        rules.hire_mult,
-        rules.max_market_orders,
-    )[0]
-    _, _, _, slots = distribution._teacher_force_trace(env, action)
     choices = np.zeros(L.MAX_DECODE_LEN, dtype=np.int32)
     mask = np.zeros(L.MAX_DECODE_LEN, dtype=np.bool_)
-    for step, (candidates, slot_kind, selected) in enumerate(slots):
-        candidate = candidates[selected]
-        if slot_kind == "quantity":
+
+    def visit(decision, selected: int) -> None:
+        step = int(mask.sum())
+        candidate = decision.candidates[selected]
+        if decision.kind == "quantity":
             choice = selected
-        elif slot_kind == "unit_op":
-            op_name = distribution._op_name(candidate, V.ACTION_FARMER_OP, C.FARMER_OP_NAMES)
-            item_name = distribution._item_name(candidate)
-            op = C.FARMER_OP_NAMES.index(op_name)
-            if op == C.FARMER_OP_PLANT:
-                arg = C.CROPS.index(item_name)
-            elif op in (C.FARMER_OP_PICKUP, C.FARMER_OP_PLACE):
-                arg = C.SHED_ITEMS.index(item_name)
-            else:
-                arg = -1
-            choice = _UNIT_CHOICE[(op, arg)]
-        elif V.ACTION_MARKET_WAIT.start in candidate.index:
-            choice = _MARKET_CHOICE[(C.N_MARKET_OPS, -1)]
-        elif V.ACTION_MARKET_STOP.start in candidate.index:
-            choice = _MARKET_CHOICE[(C.N_MARKET_OPS + 1, -1)]
         else:
-            op_name = distribution._op_name(candidate, V.ACTION_MARKET_OP, C.MARKET_OP_NAMES)
-            item_name = distribution._item_name(candidate)
-            op = C.MARKET_OP_NAMES.index(op_name)
-            if op == C.MARKET_OP_BUY_SEED:
-                arg = C.CROPS.index(item_name)
-            elif op == C.MARKET_OP_BUY_ANIMAL:
-                arg = C.ANIMALS.index(item_name)
-            elif op in (C.MARKET_OP_BUY_PRODUCT, C.MARKET_OP_SELL):
-                arg = C.PRODUCTS.index(item_name)
+            op_name, item_name = candidate_action_names(candidate, decision.kind)
+            if decision.kind == "unit_op":
+                op = C.FARMER_OP_NAMES.index(op_name)
+                if op == C.FARMER_OP_PLANT:
+                    arg = C.CROPS.index(item_name)
+                elif op in (C.FARMER_OP_PICKUP, C.FARMER_OP_PLACE):
+                    arg = C.SHED_ITEMS.index(item_name)
+                else:
+                    arg = -1
+                choice = _UNIT_CHOICE[(op, arg)]
+            elif op_name == "WAIT":
+                choice = _MARKET_CHOICE[(C.N_MARKET_OPS, -1)]
+            elif op_name == "STOP":
+                choice = _MARKET_CHOICE[(C.N_MARKET_OPS + 1, -1)]
             else:
-                arg = -1
-            choice = _MARKET_CHOICE[(op, arg)]
+                op = C.MARKET_OP_NAMES.index(op_name)
+                if op == C.MARKET_OP_BUY_SEED:
+                    arg = C.CROPS.index(item_name)
+                elif op == C.MARKET_OP_BUY_ANIMAL:
+                    arg = C.ANIMALS.index(item_name)
+                elif op in (C.MARKET_OP_BUY_PRODUCT, C.MARKET_OP_SELL):
+                    arg = C.PRODUCTS.index(item_name)
+                else:
+                    arg = -1
+                choice = _MARKET_CHOICE[(op, arg)]
         choices[step] = choice
         mask[step] = True
+
+    trace_expert_candidates(
+        obs,
+        action,
+        visit,
+        turns_per_day=rules.turns_per_day,
+        shed_capacity=rules.shed_capacity,
+        hire_mult=rules.hire_mult,
+        max_market_orders=rules.max_market_orders,
+    )
     return choices, mask
 
 
-def _cache_path(source: Path, cache_dir: Path, rules: CacheRules) -> Path:
+def _cache_path(
+    source: Path,
+    cache_dir: Path,
+    rules: CacheRules,
+    selected_players: tuple[int, ...] | None = None,
+) -> Path:
     stat = source.stat()
     identity = (
         str(source.resolve()),
         stat.st_size,
         stat.st_mtime_ns,
         rules,
+        selected_players,
         _CACHE_VERSION,
     )
     digest = hashlib.sha256(repr(identity).encode()).hexdigest()
     return cache_dir / f"{digest}.npz"
 
 
-def prepare_episode(source: Path, cache_dir: Path, rules: CacheRules) -> Path | None:
-    """1 episodeを変換する。既存の同一cacheは再利用する。"""
-    destination = _cache_path(source, cache_dir, rules)
+def prepare_episode(
+    source: Path,
+    cache_dir: Path,
+    rules: CacheRules,
+    selected_players: tuple[int, ...] | None = None,
+) -> Path | None:
+    """1 episodeの指定プレイヤーを変換する。既存の同一cacheは再利用する。"""
+    destination = _cache_path(source, cache_dir, rules, selected_players)
     if destination.exists():
         return destination
 
-    from kaggriculture.policy.torch import distribution as distribution
-    from kaggriculture.training.bc.dataset import iter_replay_samples
+    from kaggriculture.training.replays.io import iter_replay_samples
 
     states = []
     players = []
+    stats = CacheStats()
     choices = []
     masks = []
-    kwargs = {
-        "turns_per_day": rules.turns_per_day,
-        "shed_capacity": rules.shed_capacity,
-        "hire_mult": rules.hire_mult,
-        "max_market_orders": rules.max_market_orders,
-    }
-    for obs, action in iter_replay_samples(source, rules.min_player_reward):
+    for obs, action in iter_replay_samples(
+        source, rules.min_player_reward, set(selected_players) if selected_players else None
+    ):
         try:
-            normalized = distribution.normalize_expert_action(obs, action, **kwargs)
-            choice, mask = _trace_choices(obs, normalized, rules)
+            choice, mask = _trace_choices(obs, action, rules)
             states.append(observation_to_state(obs, turns_per_day=rules.turns_per_day))
             players.append(obs["player"])
             choices.append(choice)
             masks.append(mask)
-        except (KeyError, TypeError, ValueError):
-            continue
+            stats.accepted += 1
+        except (KeyError, TypeError, ValueError) as error:
+            stats.discarded += 1
+            stats.reasons[_discard_reason(error)] += 1
+    stats_path = destination.with_suffix(".stats.json")
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_path.write_text(json.dumps(stats.to_dict(), sort_keys=True), encoding="utf-8")
     if not states:
         return None
 
@@ -294,6 +348,7 @@ def prepare_episode(source: Path, cache_dir: Path, rules: CacheRules) -> Path | 
         player=np.asarray(players, dtype=np.int8),
         choices=np.stack(choices).astype(np.int16),
         decision_mask=np.stack(masks),
+        cache_stats=np.asarray(json.dumps(stats.to_dict(), sort_keys=True)),
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f".tmp-{os.getpid()}")
@@ -307,20 +362,37 @@ def prepare_episode(source: Path, cache_dir: Path, rules: CacheRules) -> Path | 
     return destination
 
 
+def _load_cache_stats(path: Path) -> CacheStats:
+    stats_path = path.with_suffix(".stats.json")
+    if stats_path.exists():
+        value = json.loads(stats_path.read_text(encoding="utf-8"))
+    else:
+        with np.load(path, allow_pickle=False) as arrays:
+            value = json.loads(str(arrays["cache_stats"]))
+    return CacheStats(value["accepted"], value["discarded"], Counter(value["reasons"]))
+
+
 def prepare_episodes(
-    sources: Sequence[Path], cache_dir: Path, rules: CacheRules
-) -> tuple[list[Path], int]:
-    """episode群を変換し、cache pathと新規作成数を返す。"""
+    sources: Sequence[Path | tuple[Path, tuple[int, ...]]], cache_dir: Path, rules: CacheRules
+) -> tuple[list[Path], int, CacheStats]:
+    """episode群を変換し、cache path、新規作成数、変換統計を返す。"""
     paths = []
     created = 0
-    for source in sources:
-        expected = _cache_path(source, cache_dir, rules)
+    stats = CacheStats()
+    for item in sources:
+        source, selected_players = item if isinstance(item, tuple) else (item, None)
+        expected = _cache_path(source, cache_dir, rules, selected_players)
         existed = expected.exists()
-        path = prepare_episode(source, cache_dir, rules)
+        path = prepare_episode(source, cache_dir, rules, selected_players)
+        stats_path = expected.with_suffix(".stats.json")
         if path is not None:
             paths.append(path)
             created += not existed
-    return paths, created
+            stats.add(_load_cache_stats(path))
+        elif stats_path.exists():
+            value = json.loads(stats_path.read_text(encoding="utf-8"))
+            stats.add(CacheStats(value["accepted"], value["discarded"], Counter(value["reasons"])))
+    return paths, created, stats
 
 
 def load_shard(path: Path) -> BCBatch:

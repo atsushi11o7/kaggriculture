@@ -68,18 +68,28 @@ def _validate_config(cfg: DictConfig) -> None:
         raise ValueError("init_checkpoint and init_weights are mutually exclusive")
 
 
-def _episode_files(cfg: DictConfig) -> tuple[list[Path], list[Path]]:
+def _episode_files(cfg: DictConfig) -> tuple[list, list]:
+    if cfg.data.selection_dir is not None:
+        from kaggriculture.training.replays import load_selected_sources
+
+        directory = Path(to_absolute_path(cfg.data.selection_dir))
+        train = load_selected_sources(directory, "train")
+        validation = load_selected_sources(directory, "validation")
+        if not train:
+            raise ValueError("selection manifest contains no training entries")
+        return train, validation
+
     # このimportはcache作成前のCPU処理だけで使い、学習step内には入らない。
-    from kaggriculture.training.bc.dataset import (
+    from kaggriculture.training.replays import (
         filter_episodes_by_agent_score,
         list_episode_files,
-        load_manifest,
+        load_rating_manifest,
         split_episode_files,
     )
 
     files = list_episode_files(Path(to_absolute_path(cfg.data.data_dir)))
     if cfg.data.manifest_dir is not None:
-        manifest = load_manifest(Path(to_absolute_path(cfg.data.manifest_dir)))
+        manifest = load_rating_manifest(Path(to_absolute_path(cfg.data.manifest_dir)))
         files = filter_episodes_by_agent_score(
             files, manifest, cfg.data.min_avg_agent_score, cfg.data.min_agent_score
         )
@@ -104,14 +114,24 @@ def _prepare_cache(cfg: DictConfig) -> tuple[list[Path], list[Path]]:
         max_market_orders=cfg.data.max_market_orders,
         min_player_reward=cfg.data.min_player_reward,
     )
-    train, train_created = prepare_episodes(train_sources, cache_dir, rules)
-    validation, validation_created = prepare_episodes(validation_sources, cache_dir, rules)
+    train, train_created, train_stats = prepare_episodes(train_sources, cache_dir, rules)
+    validation, validation_created, validation_stats = prepare_episodes(
+        validation_sources, cache_dir, rules
+    )
     logger.info(
         "cache shards: train=%d (%d new), validation=%d (%d new)",
         len(train),
         train_created,
         len(validation),
         validation_created,
+    )
+    Path("data_summary.json").write_text(
+        json.dumps(
+            {"train": train_stats.to_dict(), "validation": validation_stats.to_dict()},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     if not train:
         raise ValueError("no representable training samples were cached")
@@ -137,6 +157,7 @@ def _save(
     model_config: ModelConfig,
     bc_config: jax_core.BCConfig,
     resolved_config: dict,
+    best_validation: float,
 ) -> None:
     save_checkpoint(
         directory,
@@ -146,6 +167,7 @@ def _save(
             "step": step,
             "epoch": epoch,
             "batch_index": batch_index,
+            "best_validation": best_validation,
             "model_config": asdict(model_config),
             "bc_config": asdict(bc_config),
             "config": resolved_config,
@@ -202,6 +224,7 @@ def main(cfg: DictConfig) -> None:
     step = 0
     start_epoch = 0
     start_batch_index = 0
+    best_validation = float("inf")
 
     if cfg.train.init_checkpoint is not None:
         path = Path(to_absolute_path(cfg.train.init_checkpoint))
@@ -209,6 +232,7 @@ def main(cfg: DictConfig) -> None:
         step = int(metadata["step"])
         start_epoch = int(metadata["epoch"])
         start_batch_index = int(metadata.get("batch_index", 0))
+        best_validation = float(metadata.get("best_validation", float("inf")))
         logger.info("resumed checkpoint %s at step %d", path, step)
     elif cfg.train.init_weights is not None:
         path = Path(to_absolute_path(cfg.train.init_weights))
@@ -218,7 +242,6 @@ def main(cfg: DictConfig) -> None:
     checkpoint_root = Path("checkpoints")
     resolved = OmegaConf.to_container(cfg, resolve=True)
     metrics_path = Path("metrics.jsonl")
-    best_validation = float("inf")
     cursor_epoch = start_epoch
     cursor_batch_index = start_batch_index
 
@@ -277,6 +300,7 @@ def main(cfg: DictConfig) -> None:
                             model_config,
                             bc_config,
                             resolved,
+                            best_validation,
                         )
             if step % cfg.train.checkpoint_interval == 0:
                 _save(
@@ -288,6 +312,7 @@ def main(cfg: DictConfig) -> None:
                     model_config,
                     bc_config,
                     resolved,
+                    best_validation,
                 )
                 _prune_checkpoints(checkpoint_root, cfg.train.keep_last_checkpoints)
         if cfg.train.max_steps > 0 and step >= cfg.train.max_steps:
@@ -300,6 +325,7 @@ def main(cfg: DictConfig) -> None:
     if validation_paths:
         validation = _validate(model, train_state.params, validation_paths, cfg, bc_config)
         if validation is not None and validation < best_validation:
+            best_validation = validation
             _save(
                 checkpoint_root / "best",
                 train_state,
@@ -309,6 +335,7 @@ def main(cfg: DictConfig) -> None:
                 model_config,
                 bc_config,
                 resolved,
+                best_validation,
             )
     if step % cfg.train.checkpoint_interval:
         _save(
@@ -320,6 +347,7 @@ def main(cfg: DictConfig) -> None:
             model_config,
             bc_config,
             resolved,
+            best_validation,
         )
 
 

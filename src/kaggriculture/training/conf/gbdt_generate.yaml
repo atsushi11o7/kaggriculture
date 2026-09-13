@@ -1,0 +1,34 @@
+defaults:
+  - rules: default
+  - _self_
+
+hydra:
+  job:
+    name: gbdt_generate
+    chdir: true
+  run:
+    dir: outputs/${hydra.job.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+model:
+  checkpoint: ???
+
+output_dir: data/replays/gbdt-generated
+num_games: 100
+temperature: 0.15
+seed: 0
+log_interval: 10
+debug: false
+overwrite: false
+
+environment:
+  episodeSteps: ${rules.episode_steps}
+  boardSize: ${rules.board_size}
+  startingMoney: ${rules.starting_money}
+  maxMarketOrdersPerTurn: ${rules.max_market_orders}
+  turnsPerDay: ${rules.turns_per_day}
+  shedCapacity: ${rules.shed_capacity}
+  weedSpawnChance: ${rules.weed_chance}
+  townShopUnlockInterval: ${rules.shop_unlock_interval}
+  townShopSellInterval: ${rules.shop_sell_interval}
+  townCenterSellInterval: ${rules.center_sell_interval}
+  farmHandCostMult: ${rules.hire_mult}

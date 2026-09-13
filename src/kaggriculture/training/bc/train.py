@@ -1,4 +1,4 @@
-"""BC(Behavior Cloning)学習ループ。
+"""代替PyTorch BC(Behavior Cloning)学習ループ。
 
 `uv run python -m kaggriculture.training.bc.train`で起動する。設定は
 `training/conf/bc.yaml`(Hydra)。ログ・checkpointはHydraのrun dir(`outputs/`配下、
@@ -20,14 +20,14 @@ from kaggriculture.policy.common.config import ModelConfig
 from kaggriculture.policy.torch import distribution as D
 from kaggriculture.policy.torch import model as M
 from kaggriculture.rules import constants as C
-from kaggriculture.training.bc.dataset import (
-    ReplayActionDataset,
+from kaggriculture.training.bc.dataset import ReplayActionDataset
+from kaggriculture.training.bc.objective import mean_token_nll
+from kaggriculture.training.replays import (
     filter_episodes_by_agent_score,
     list_episode_files,
-    load_manifest,
+    load_rating_manifest,
     split_episode_files,
 )
-from kaggriculture.training.bc.objective import mean_token_nll
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +235,7 @@ def main(cfg: DictConfig) -> None:
     episode_files = list_episode_files(data_dir)
     if cfg.data.manifest_dir is not None:
         manifest_dir = Path(to_absolute_path(cfg.data.manifest_dir))
-        manifest = load_manifest(manifest_dir)
+        manifest = load_rating_manifest(manifest_dir)
         before = len(episode_files)
         episode_files = filter_episodes_by_agent_score(
             episode_files, manifest, cfg.data.min_avg_agent_score, cfg.data.min_agent_score

@@ -1,5 +1,6 @@
 defaults:
   - model: default
+  - rules: default
   - _self_
 
 experiment:
@@ -18,13 +19,15 @@ hydra:
 data:
   # 全日付からseed固定で抽出。全件学習時はnum_episodes=nullを指定する。
   data_dir: data/replays
+  # replay_curation出力を使う場合に指定。data_dir以下の自動分割より優先する。
+  selection_dir: null
   num_episodes: 256
   val_fraction: 0.1
   split_seed: 0
-  turns_per_day: 24
-  shed_capacity: 100
-  hire_mult: 1
-  max_market_orders: 10
+  turns_per_day: ${rules.turns_per_day}
+  shed_capacity: ${rules.shed_capacity}
+  hire_mult: ${rules.hire_mult}
+  max_market_orders: ${rules.max_market_orders}
   manifest_dir: null
   min_avg_agent_score: null
   min_agent_score: null
