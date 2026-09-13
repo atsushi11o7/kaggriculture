@@ -183,9 +183,12 @@ sequenceDiagram
 | `evaluate_policy` | BCの教師強制評価 |
 | `normalize_expert_action` | リプレイのno-op・上限超過を表現可能な教師へ正規化 |
 | `validate_policy_action` | model実行なしで教師行動を合法候補と照合 |
+| `candidate_api.decode_with_candidates` | GBDT等の外部候補採点器で1ターン生成 |
+| `candidate_api.trace_expert_candidates` | 教師行動の候補表と正解indexを列挙 |
 
-旧PyTorch BCのbatch評価は既知の行動列を一括Decoder passへまとめます。互換用に
-残していますが、新規学習はJAX BCを使います。固定shape cacheの詳細は`training/bc/README.md`を参照。
+PyTorch BCは比較・既存checkpointの再開・JAX経路の切り分けに使える代替経路です。
+既知の行動列をbatch評価では一括Decoder passへまとめます。大量データの通常学習には
+JAX BCを推奨します。固定shape cacheの詳細は`training/bc/README.md`を参照してください。
 
 ### JAX (`policy.jax.distribution`)
 
@@ -199,8 +202,9 @@ sequenceDiagram
 `training.ppo.rollout.collect_rollout`は生成と`step_batch_lockstep`を外側の`lax.scan`で
 接続します。PPOは既定で各decisionの条件付きratioをclipする`ratio_mode=token`を使い、
 長い複合行動の積でclipが飽和するのを抑えます。複合行動全体を1 actionとして扱う理論上の
-`ratio_mode=joint`も比較用に残しています。`training.ppo.evaluation.evaluate_closed_loop`は
-教師行動を使わず終端まで自走し、勝率と終端所持金を返します。
+`ratio_mode=joint`も比較用に残しています。PPO評価は教師行動を使わず終端まで自走し、
+候補方策を両席へ置いて勝率と終端所持金を返します。開始時方策に加え、Hydra設定の
+`ppo.eval_opponent_checkpoints`で複数の固定checkpointを評価相手にできます。
 
 ## 学習・提出
 
@@ -233,6 +237,9 @@ uv run python -m kaggriculture.training.ppo.train \
 uv run python -m kaggriculture.training.ppo.train -m \
   experiment.name=model_size model.d_model=64,128 ppo.learning_rate=1e-4,3e-4
 ```
+
+PPO checkpointには重み・optimizerに加えて、環境状態、累積履歴、乱数key、開始時の
+固定評価相手を保存します。`resume_checkpoint`からは同じrollout系列を継続できます。
 
 rollout sample数は`env.batch_size * ppo.rollout_horizon * 2`で、`ppo.minibatch_size`は
 これを割り切る必要があります。`MAX_HANDS=32`はJAX配列の安全上限であり、リプレイ最大15
