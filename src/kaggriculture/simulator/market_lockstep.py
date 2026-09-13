@@ -16,7 +16,8 @@ SELL/BUY_PRODUCTは価格が市場在庫に応じて売買のたびに動くた�
 import jax
 import jax.numpy as jnp
 
-from . import constants as C
+from kaggriculture.rules import constants as C
+
 from .market import market_price_one
 
 _WHEAT_IDX = C.PRODUCTS.index("WHEAT")

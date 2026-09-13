@@ -12,7 +12,7 @@ state.State.rng_keyはエピソード開始時に決まる不変のベースキ�
 import jax
 import jax.numpy as jnp
 
-from . import constants as C
+from kaggriculture.rules import constants as C
 
 
 def daily_rng_keys(rng_key, day):

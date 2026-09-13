@@ -9,9 +9,10 @@ HIRE/BUY_LANDは元コードの_do_hire/_do_buy_landに対応し、キュー内�
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
+
 from . import board
-from . import constants as C
-from . import game_params as P
 
 
 def _build_fib_table(length):

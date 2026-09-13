@@ -6,8 +6,9 @@ farmer/hands全員の持ち物を納屋へ払い出し、位置・雇用状態�
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.rules import constants as C
+
 from . import board
-from . import constants as C
 from .inventory_actions import dump_inventory
 
 

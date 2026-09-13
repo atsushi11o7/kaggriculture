@@ -10,7 +10,8 @@ inventory_actions.py(PICKUP/DROP)に分かれている。このモジュール�
 
 import jax.numpy as jnp
 
-from . import constants as C
+from kaggriculture.rules import constants as C
+
 from .animal_actions import (
     apply_build,
     apply_care,

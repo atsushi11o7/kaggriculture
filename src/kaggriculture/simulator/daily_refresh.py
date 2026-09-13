@@ -6,13 +6,14 @@
 
 import jax.numpy as jnp
 
-from . import constants as C
-from . import game_params as P
-from .constants import is_animal_structure as _is_animal_structure
-from .constants import is_plant as _is_plant
-from .game_params import CROP_FIRST_YIELD_DAY_JAX as _CROP_FIRST_YIELD_DAY
-from .game_params import CROP_IS_ONGOING_JAX as _CROP_IS_ONGOING
-from .game_params import CROP_MAX_YIELD_JAX as _CROP_MAX_YIELD
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
+from kaggriculture.rules.constants import is_animal_structure as _is_animal_structure
+from kaggriculture.rules.constants import is_plant as _is_plant
+
+from .game_params_jax import CROP_FIRST_YIELD_DAY_JAX as _CROP_FIRST_YIELD_DAY
+from .game_params_jax import CROP_IS_ONGOING_JAX as _CROP_IS_ONGOING
+from .game_params_jax import CROP_MAX_YIELD_JAX as _CROP_MAX_YIELD
 
 _CROP_INTERVAL = jnp.array(P.CROP_INTERVAL, dtype=jnp.int32)
 

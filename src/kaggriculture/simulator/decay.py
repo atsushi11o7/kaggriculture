@@ -6,8 +6,8 @@
 
 import jax.numpy as jnp
 
-from . import constants as C
-from .constants import is_plant as _is_plant
+from kaggriculture.rules import constants as C
+from kaggriculture.rules.constants import is_plant as _is_plant
 
 
 def apply_decay(tile_kind, tile_crop_or_animal, tile_max_lifespan_step, tile_yield_units, step):
