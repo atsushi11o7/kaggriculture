@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.policy import distribution as D
+from kaggriculture.policy.torch import distribution as D
 
 REPLAY_DIR = (
     Path(__file__).resolve().parents[2] / "data" / "replays" / "kaggriculture-episodes-2026-08-30"

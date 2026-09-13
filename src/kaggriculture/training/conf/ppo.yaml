@@ -1,0 +1,64 @@
+defaults:
+  - model: default
+  - _self_
+
+experiment:
+  name: baseline
+
+hydra:
+  job:
+    name: ppo
+    chdir: true
+  run:
+    dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/${hydra.job.name}/${experiment.name}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# Actor構造はmodel/default.yamlと共有し、PPOだけcriticを追加する。
+model:
+  use_asymmetric_critic: true
+
+env:
+  batch_size: 64
+  board_size: 10
+  turns_per_day: 24
+  shed_capacity: 100
+  weed_chance: 0.005
+  shop_unlock_interval: 3
+  shop_sell_interval: 4
+  center_sell_interval: 24
+  hire_mult: 1
+  max_shop_instances: 8
+  episode_steps: 720
+  starting_money: 3000.0
+
+ppo:
+  total_updates: 1000
+  rollout_horizon: 128
+  update_epochs: 4
+  minibatch_size: 256
+  # BCからfine-tuningする初期値。スクラッチ学習では別途比較する。
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  gamma: 0.999
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_clip_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 1.0
+  temperature: 0.8
+  # "token"は長い複合行動でclip飽和しにくい。理論上のjoint比率も選択可能。
+  ratio_mode: token
+  seed: 0
+  log_interval: 10
+  checkpoint_interval: 50
+  keep_last_checkpoints: 5
+  # 更新開始時の固定方策を相手に、教師なしで終端まで自走評価する。0なら無効。
+  eval_interval: 50
+  eval_episodes: 32
+  # JAX BC directoryまたは旧PyTorch BC fileからactorだけを初期化する。
+  init_bc_checkpoint: null
+  # JAX PPO checkpointからoptimizerを含めて再開する。init_bc_checkpointとは排他。
+  resume_checkpoint: null

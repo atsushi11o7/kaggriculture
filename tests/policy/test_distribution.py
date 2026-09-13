@@ -5,12 +5,14 @@ data/replays/を使った実データ回帰テストはtest_replay_regression.py
 (data/がgitignore対象のため、存在する環境でのみ実行される)。
 """
 
+import copy
+
 import pytest
 import torch
 
-from kaggriculture.policy import actions as A
-from kaggriculture.policy import distribution as D
-from kaggriculture.policy import vocab as V
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.policy.torch import actions as A
+from kaggriculture.policy.torch import distribution as D
 from kaggriculture.simulator import constants as C
 
 
@@ -32,6 +34,184 @@ def test_decode_state_does_not_share_observation_inventories(fresh_obs):
     inventories[0]["WHEAT"] = 1
 
     assert "WHEAT" not in fresh_obs["private"]["inventories"][0]
+
+
+def test_validate_policy_action_accepts_representable_action(fresh_obs):
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
+    D.validate_policy_action(fresh_obs, action)  # 例外が出ないことを確認
+
+
+def test_validate_policy_action_rejects_unrepresentable_action(fresh_obs):
+    """farmerは空きタイルにいるのでHARVESTは候補に無い。"""
+    action = {"farmer": ["HARVEST"], "hands": [], "market": []}
+    with pytest.raises(ValueError):
+        D.validate_policy_action(fresh_obs, action)
+
+
+def test_validate_policy_action_agrees_with_evaluate_policy(net, fresh_obs):
+    """事前検証(ネットワーク不使用)の合否が、実際にevaluate_policyを呼んだ場合の
+    合否(ValueErrorになるかどうか)と一致することを確認する。
+    """
+    valid_action = {"farmer": ["PASS"], "hands": [], "market": []}
+    invalid_action = {"farmer": ["HARVEST"], "hands": [], "market": []}
+
+    D.validate_policy_action(fresh_obs, valid_action)
+    D.evaluate_policy(net, fresh_obs, valid_action)  # どちらも例外を出さない
+
+    with pytest.raises(ValueError):
+        D.validate_policy_action(fresh_obs, invalid_action)
+    with pytest.raises(ValueError):
+        D.evaluate_policy(net, fresh_obs, invalid_action)
+
+
+def test_normalize_expert_action_leaves_valid_action_unchanged(fresh_obs):
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
+    assert D.normalize_expert_action(fresh_obs, action) == action
+
+
+def test_normalize_expert_action_maps_nonpositive_unit_quantity_to_pass(fresh_obs):
+    obs = copy.deepcopy(fresh_obs)
+    obs["private"]["shed"]["WHEAT"] = 1
+    action = {"farmer": ["PICKUP", "WHEAT", 0], "hands": [], "market": []}
+
+    normalized = D.normalize_expert_action(obs, action)
+
+    assert normalized["farmer"] == ["PASS"]
+    D.validate_policy_action(obs, normalized)
+
+
+def test_normalize_expert_action_maps_invalid_market_quantity_to_wait(fresh_obs):
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [["BUY_SEED", "WHEAT", 0], ["BUY_SEED", "WHEAT"]],
+    }
+
+    normalized = D.normalize_expert_action(fresh_obs, action)
+
+    assert normalized["market"] == [
+        list(A.MARKET_WAIT_ACTION),
+        list(A.MARKET_WAIT_ACTION),
+    ]
+    D.validate_policy_action(fresh_obs, normalized)
+
+
+def test_normalize_expert_action_applies_atomic_plant_failure(fresh_obs):
+    obs = copy.deepcopy(fresh_obs)
+    obs["farms"][0]["farmer"] = [0, 0]
+    obs["farms"][0]["hands"] = [[1, 0]]
+    obs["private"]["inventories"] = [{}, {}]
+    obs["private"]["seeds"]["STRAWBERRY"] = 1
+    action = {
+        "farmer": ["PLANT", "STRAWBERRY"],
+        "hands": [["PLANT", "STRAWBERRY"]],
+        "market": [],
+    }
+
+    normalized = D.normalize_expert_action(obs, action)
+
+    assert normalized["farmer"] == ["PASS"]
+    assert normalized["hands"] == [["PASS"]]
+    D.validate_policy_action(obs, normalized)
+
+
+def test_normalize_expert_action_keeps_animal_place_with_zero_quantity(fresh_obs):
+    obs = copy.deepcopy(fresh_obs)
+    x, y = obs["farms"][0]["farmer"]
+    obs["farms"][0]["tiles"][y][x] = {"kind": "COOP"}
+    obs["private"]["inventories"][0]["GOOSE"] = 1
+    action = {"farmer": ["PLACE", "GOOSE", 0], "hands": [], "market": []}
+
+    normalized = D.normalize_expert_action(obs, action)
+
+    assert normalized["farmer"] == ["PLACE", "GOOSE"]
+    D.validate_policy_action(obs, normalized)
+
+
+def test_normalize_expert_action_maps_invalid_unit_action_to_pass(fresh_obs):
+    """farmerは空きタイルにいるのでHARVESTは候補に無い→PASSへ正規化する。"""
+    action = {"farmer": ["HARVEST"], "hands": [], "market": []}
+    normalized = D.normalize_expert_action(fresh_obs, action)
+    assert normalized["farmer"] == ["PASS"]
+    D.validate_policy_action(fresh_obs, normalized)
+
+
+def test_normalize_expert_action_maps_invalid_market_order_to_wait(fresh_obs):
+    """shed空のday0局面でSELL WHEATは候補に無い→後続の有効な注文の位置を保つ
+    ため、STOPではなくWAITへ正規化する。"""
+    action = {
+        "farmer": ["PASS"],
+        "hands": [],
+        "market": [["SELL", "WHEAT", 1], ["BUY_LAND"]],
+    }
+    normalized = D.normalize_expert_action(fresh_obs, action)
+    assert normalized["market"][0] == list(A.MARKET_WAIT_ACTION)
+    assert normalized["market"][1] == ["BUY_LAND"]  # 後続の有効な注文は保たれる
+    D.validate_policy_action(fresh_obs, normalized)
+
+
+def test_normalize_expert_action_clamps_over_limit_quantity(fresh_obs):
+    """(op, item)自体は合法だが、要求数量がshed在庫を超える場合は上限にクランプする
+    (候補に無い扱いにしてWAITへは正規化しない)。"""
+    obs = copy.deepcopy(fresh_obs)
+    obs["private"]["shed"]["WHEAT"] = 5
+    action = {"farmer": ["PASS"], "hands": [], "market": [["SELL", "WHEAT", 999]]}
+
+    normalized = D.normalize_expert_action(obs, action)
+
+    assert normalized["market"] == [["SELL", "WHEAT", 5]]
+    D.validate_policy_action(obs, normalized)
+
+
+def test_normalize_expert_action_never_raises_on_real_replay_mismatches():
+    """このセッションで確認済みの、正規化前は無効だった実リプレイの1ターンでも
+    正規化後は必ず表現可能になることを確認する(_NormalizingChooserは常に
+    PASS/MARKET_WAIT/クランプ済み数量のいずれかを選ぶため失敗しない)。
+    """
+    obs = {
+        "day": 5,
+        "hour": 4,
+        "player": 0,
+        "farms": [
+            {
+                "farmer": [4, 4],
+                "hands": [],
+                "hires_today": 0,
+                "money": 100.0,
+                "tiles": [[None] * 10 for _ in range(10)],
+                "unlocked_quadrants": ["NW"],
+            },
+            {
+                "farmer": [4, 4],
+                "hands": [],
+                "hires_today": 0,
+                "money": 100.0,
+                "tiles": [[None] * 10 for _ in range(10)],
+                "unlocked_quadrants": ["NW"],
+            },
+        ],
+        "private": {
+            "inventories": [{}],
+            "seeds": dict.fromkeys(C.CROPS, 0),
+            "shed": dict.fromkeys(C.SHED_ITEMS, 0),
+        },
+        "market": {
+            "inventory": dict.fromkeys(C.PRODUCTS, 10_000),
+            "prices": dict.fromkeys(C.PRODUCTS, 100),
+        },
+        "town": {"unlocked_shops": []},
+        "remainingOverageTime": 60,
+    }
+    # 所持金不足でBUY_SEED不可、shed空でSELL不可という、明らかに無効な要求だけの行動。
+    action = {
+        "farmer": ["HARVEST"],
+        "hands": [],
+        "market": [["BUY_SEED", "MELON", 100], ["SELL", "WHEAT", 50]],
+    }
+
+    normalized = D.normalize_expert_action(obs, action)
+
+    D.validate_policy_action(obs, normalized)
 
 
 def test_act_batch_value_is_1d(net, fresh_obs):

@@ -8,17 +8,10 @@
 import torch
 import torch.nn as nn
 
-from kaggriculture.policy import token_layout as L
-from kaggriculture.policy import vocab as V
-from kaggriculture.policy.model_config import (
-    D_FEEDFORWARD,
-    D_MODEL,
-    DROPOUT,
-    NUM_HEADS,
-    NUM_LAYERS_CRITIC,
-    NUM_LAYERS_DECODER,
-    NUM_LAYERS_ENCODER,
-)
+from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common import vocab as V
+from kaggriculture.policy.common.config import ModelConfig
+from kaggriculture.policy.torch import features as F
 
 
 def _causal_mask(size: int, device: torch.device | None = None) -> torch.Tensor:
@@ -27,9 +20,9 @@ def _causal_mask(size: int, device: torch.device | None = None) -> torch.Tensor:
 
 
 class TokenEmbedding(nn.Module):
-    """語彙全体(policy.vocab)を共有する埋め込み。盤面トークンにも行動候補にも使う。"""
+    """語彙全体(policy.common.vocab)を共有する埋め込み。盤面トークンにも行動候補にも使う。"""
 
-    def __init__(self, d_model: int = D_MODEL) -> None:
+    def __init__(self, d_model: int) -> None:
         super().__init__()
         self.bag = nn.EmbeddingBag(V.VOCAB_SIZE, d_model, mode="sum")
         self.norm = nn.LayerNorm(d_model)
@@ -59,7 +52,7 @@ class TokenEmbedding(nn.Module):
             形状(len(vectors), d_model)の埋め込み。
         """
         device = self.bag.weight.device
-        index, value, offset = V.collate(vectors, device=device)
+        index, value, offset = F.collate(vectors, device=device)
         return self(index, value, offset)
 
 
@@ -70,11 +63,11 @@ class Encoder(nn.Module):
         self,
         token_embedding: TokenEmbedding,
         board_position_embedding: nn.Embedding,
-        d_model: int = D_MODEL,
-        num_heads: int = NUM_HEADS,
-        d_feedforward: int = D_FEEDFORWARD,
-        num_layers: int = NUM_LAYERS_ENCODER,
-        dropout: float = DROPOUT,
+        d_model: int,
+        num_heads: int,
+        d_feedforward: int,
+        num_layers: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.token_embedding = token_embedding
@@ -136,11 +129,11 @@ class Decoder(nn.Module):
         self,
         token_embedding: TokenEmbedding,
         board_position_embedding: nn.Embedding,
-        d_model: int = D_MODEL,
-        num_heads: int = NUM_HEADS,
-        d_feedforward: int = D_FEEDFORWARD,
-        num_layers: int = NUM_LAYERS_DECODER,
-        dropout: float = DROPOUT,
+        d_model: int,
+        num_heads: int,
+        d_feedforward: int,
+        num_layers: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.token_embedding = token_embedding
@@ -249,11 +242,11 @@ class PrivilegedEncoder(nn.Module):
         self,
         token_embedding: TokenEmbedding,
         board_position_embedding: nn.Embedding,
-        d_model: int = D_MODEL,
-        num_heads: int = NUM_HEADS,
-        d_feedforward: int = D_FEEDFORWARD,
-        num_layers: int = NUM_LAYERS_CRITIC,
-        dropout: float = DROPOUT,
+        d_model: int,
+        num_heads: int,
+        d_feedforward: int,
+        num_layers: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.token_embedding = token_embedding
@@ -317,34 +310,23 @@ class PolicyValueNet(nn.Module):
     """方策・価値を出力するネットワーク。数量もscore_candidatesでスコアリングする
     候補の1種として方策に含まれる(専用ヘッドは持たない)。"""
 
-    def __init__(
-        self,
-        d_model: int = D_MODEL,
-        num_heads: int = NUM_HEADS,
-        d_feedforward: int = D_FEEDFORWARD,
-        num_layers_encoder: int = NUM_LAYERS_ENCODER,
-        num_layers_decoder: int = NUM_LAYERS_DECODER,
-        dropout: float = DROPOUT,
-        use_episode_history: bool = False,
-        use_asymmetric_critic: bool = False,
-        num_layers_critic: int = NUM_LAYERS_CRITIC,
-    ) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         """ネットワークを構築する。
 
         Args:
-            d_model: 埋め込み次元。
-            num_heads: attention head数。
-            d_feedforward: feed-forward層の中間次元。
-            num_layers_encoder: 公開Encoderの層数。
-            num_layers_decoder: Decoderの層数。
-            dropout: Transformerのdropout率。
-            use_episode_history: 累積実績をactor入力に含める。Trueなら各APIで
-                countersが必須。
-            use_asymmetric_critic: critic専用の非公開情報Encoderを追加する。actorの
-                推論には使われないが、共有埋め込みと公開Encoderにはvalue lossも流れる。
-            num_layers_critic: 非公開情報Encoderの層数。
+            config: Hydra設定またはcheckpointから復元したモデル構成。
         """
         super().__init__()
+        self.config = config
+        d_model = config.d_model
+        num_heads = config.num_heads
+        d_feedforward = config.d_feedforward
+        num_layers_encoder = config.num_layers_encoder
+        num_layers_decoder = config.num_layers_decoder
+        dropout = config.dropout
+        use_episode_history = config.use_episode_history
+        use_asymmetric_critic = config.use_asymmetric_critic
+        num_layers_critic = config.num_layers_critic
         self.uses_episode_history = use_episode_history
         self.uses_asymmetric_critic = use_asymmetric_critic
         self.token_embedding = TokenEmbedding(d_model)

@@ -6,8 +6,8 @@ import copy
 
 import torch
 
-from kaggriculture.policy import distribution as D
-from kaggriculture.policy import episode_history as EH
+from kaggriculture.policy.torch import distribution as D
+from kaggriculture.policy.torch import history as EH
 
 
 def _env_args(obs, turns_per_day=24, shed_capacity=100, hire_mult=1, max_market_orders=10):

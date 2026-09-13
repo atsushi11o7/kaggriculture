@@ -6,8 +6,9 @@
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.rules import constants as C
+
 from . import board
-from . import constants as C
 
 
 def shed_room(shed, shed_capacity):

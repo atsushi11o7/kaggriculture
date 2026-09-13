@@ -14,7 +14,8 @@
 import jax
 import jax.numpy as jnp
 
-from . import constants as C
+from kaggriculture.rules import constants as C
+
 from .crop_actions import compute_plant_block
 from .unit_actions import apply_unit_action
 

@@ -6,10 +6,11 @@
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
+from kaggriculture.rules.constants import is_animal_structure as _is_animal_structure
+
 from . import board
-from . import constants as C
-from . import game_params as P
-from .constants import is_animal_structure as _is_animal_structure
 from .inventory_actions import shed_room
 
 _FERTILIZER_IDX = C.SHED_ITEMS.index("FERTILIZER")

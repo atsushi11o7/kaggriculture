@@ -2,8 +2,8 @@
 
 import jax.numpy as jnp
 
-from . import constants as C
-from . import game_params as P
+from kaggriculture.rules import constants as C
+from kaggriculture.rules import game_params as P
 
 _BASE = jnp.array(P.MARKET_BASE_PRICE, dtype=jnp.float32)
 _T = jnp.array(P.MARKET_T, dtype=jnp.float32)

@@ -2,7 +2,7 @@
 
 import jax.numpy as jnp
 
-from . import game_params as P
+from kaggriculture.rules import game_params as P
 
 _SHOP_DEMAND = jnp.array(P.SHOP_DEMAND, dtype=jnp.int32)  # [N_SHOPS, N_PRODUCTS]
 _TOWN_CENTER_PRODUCTS = jnp.array(P.TOWN_CENTER_PRODUCTS, dtype=jnp.int32)  # [N_PRODUCTS]

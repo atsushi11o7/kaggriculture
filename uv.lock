@@ -1396,8 +1396,10 @@ dev = [
     { name = "ruff" },
 ]
 rl = [
+    { name = "flax" },
     { name = "gymnasium" },
     { name = "hydra-core" },
+    { name = "optax" },
     { name = "sb3-contrib" },
     { name = "stable-baselines3" },
     { name = "tensorboard" },
@@ -1425,8 +1427,10 @@ dev = [
     { name = "ruff", specifier = ">=0.6" },
 ]
 rl = [
+    { name = "flax", specifier = ">=0.12.9" },
     { name = "gymnasium", specifier = ">=1.0" },
     { name = "hydra-core", specifier = ">=1.3" },
+    { name = "optax", specifier = ">=0.2.8" },
     { name = "sb3-contrib", specifier = ">=2.4" },
     { name = "stable-baselines3", specifier = ">=2.4" },
     { name = "tensorboard", specifier = ">=2.18" },

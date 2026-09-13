@@ -6,7 +6,7 @@ produced/soldは確定値だが、市場の同時処理を単独再生できな�
 
 import copy
 
-from kaggriculture.policy import decode_state as DS
+from kaggriculture.policy.torch import decode as DS
 
 _CATEGORIES = ("produced", "sold", "estimated_bought_product", "estimated_revenue")
 
