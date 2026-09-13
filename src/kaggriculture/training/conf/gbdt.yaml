@@ -1,0 +1,47 @@
+defaults:
+  - rules: default
+  - _self_
+
+experiment:
+  name: baseline
+
+hydra:
+  job:
+    name: gbdt
+    chdir: true
+  run:
+    dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+data:
+  data_dir: data/replays
+  # replay_curation出力を使う場合に指定。data_dirからの自動分割より優先する。
+  selection_dir: null
+  # GBDTは候補ごとに行を作るため、まず少数で性能とメモリを確認する。
+  num_episodes: 32
+  seed: 0
+  val_fraction: 0.1
+  manifest_dir: null
+  min_avg_agent_score: null
+  min_agent_score: null
+  min_player_reward: null
+  cache_dir: data/cache/gbdt
+  rebuild_cache: false
+
+decode_rules:
+  turns_per_day: ${rules.turns_per_day}
+  shed_capacity: ${rules.shed_capacity}
+  hire_mult: ${rules.hire_mult}
+  max_market_orders: ${rules.max_market_orders}
+  episode_steps: ${rules.episode_steps}
+
+model:
+  n_estimators: 500
+  learning_rate: 0.05
+  num_leaves: 31
+  min_child_samples: 40
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  # 木の学習だけに使う。全コア占有を避け、前処理やOSへ余裕を残す。
+  n_jobs: 4
+  early_stopping_rounds: 50
