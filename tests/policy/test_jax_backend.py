@@ -17,7 +17,7 @@ from kaggriculture.policy.torch import distribution as TD
 from kaggriculture.policy.torch import features as TF
 from kaggriculture.policy.torch import model as TM
 from kaggriculture.policy.torch import tokenize
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 from kaggriculture.simulator import market
 from kaggriculture.training.weight_bridge import jax_to_torch, torch_to_jax
 from scripts.trace_codec import build_state

@@ -11,7 +11,7 @@ import jax.numpy as jnp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
 from kaggriculture.simulator.state import State
 

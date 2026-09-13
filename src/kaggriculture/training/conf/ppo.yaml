@@ -1,5 +1,6 @@
 defaults:
   - model: default
+  - rules: default
   - _self_
 
 experiment:
@@ -21,17 +22,17 @@ model:
 
 env:
   batch_size: 64
-  board_size: 10
-  turns_per_day: 24
-  shed_capacity: 100
-  weed_chance: 0.005
-  shop_unlock_interval: 3
-  shop_sell_interval: 4
-  center_sell_interval: 24
-  hire_mult: 1
-  max_shop_instances: 8
-  episode_steps: 720
-  starting_money: 3000.0
+  board_size: ${rules.board_size}
+  turns_per_day: ${rules.turns_per_day}
+  shed_capacity: ${rules.shed_capacity}
+  weed_chance: ${rules.weed_chance}
+  shop_unlock_interval: ${rules.shop_unlock_interval}
+  shop_sell_interval: ${rules.shop_sell_interval}
+  center_sell_interval: ${rules.center_sell_interval}
+  hire_mult: ${rules.hire_mult}
+  max_shop_instances: ${rules.max_shop_instances}
+  episode_steps: ${rules.episode_steps}
+  starting_money: ${rules.starting_money}
 
 ppo:
   total_updates: 1000
@@ -57,7 +58,10 @@ ppo:
   keep_last_checkpoints: 5
   # 更新開始時の固定方策を相手に、教師なしで終端まで自走評価する。0なら無効。
   eval_interval: 50
+  # 各相手について両席でこの局数ずつ評価する。
   eval_episodes: 32
+  # 追加のJAX PPO checkpoint。開始時の固定方策は常に評価相手へ含まれる。
+  eval_opponent_checkpoints: []
   # JAX BC directoryまたは旧PyTorch BC fileからactorだけを初期化する。
   init_bc_checkpoint: null
   # JAX PPO checkpointからoptimizerを含めて再開する。init_bc_checkpointとは排他。

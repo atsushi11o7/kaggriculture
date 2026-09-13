@@ -1,0 +1,13 @@
+# Kaggle既定環境。各trainerは必要な項目を補間して使う。
+board_size: 10
+turns_per_day: 24
+shed_capacity: 100
+max_market_orders: 10
+episode_steps: 720
+starting_money: 3000.0
+weed_chance: 0.005
+shop_unlock_interval: 3
+shop_sell_interval: 4
+center_sell_interval: 24
+hire_mult: 1
+max_shop_instances: 8

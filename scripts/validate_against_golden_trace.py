@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trace_codec import build_action, build_state  # noqa: E402
 
-from kaggriculture.simulator import constants as C  # noqa: E402
+from kaggriculture.rules import constants as C  # noqa: E402
 from kaggriculture.simulator.state import State  # noqa: E402
 from kaggriculture.simulator.step import step  # noqa: E402
 

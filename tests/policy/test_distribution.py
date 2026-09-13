@@ -13,7 +13,7 @@ import torch
 from kaggriculture.policy.common import vocab as V
 from kaggriculture.policy.torch import actions as A
 from kaggriculture.policy.torch import distribution as D
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 
 
 @pytest.mark.parametrize("max_market_orders", [0, -1, C.MAX_MARKET_ORDERS + 1])

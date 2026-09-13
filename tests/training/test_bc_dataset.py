@@ -12,13 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from kaggriculture.simulator import constants as C
-from kaggriculture.training.bc.dataset import (
-    ReplayActionDataset,
+from kaggriculture.rules import constants as C
+from kaggriculture.training.bc.dataset import ReplayActionDataset
+from kaggriculture.training.replays import (
     filter_episodes_by_agent_score,
     iter_replay_samples,
     list_episode_files,
-    load_manifest,
+    load_rating_manifest,
     split_episode_files,
 )
 
@@ -153,7 +153,7 @@ def test_load_manifest_merges_multiple_csv_files(tmp_path):
         ],
     )
 
-    manifest = load_manifest(tmp_path)
+    manifest = load_rating_manifest(tmp_path)
 
     assert set(manifest.keys()) == {"1", "2"}
     assert manifest["1"]["avg_score"] == "100"
@@ -183,7 +183,7 @@ def test_filter_episodes_by_agent_score_excludes_low_score_and_unlisted_episodes
             },
         ],
     )
-    manifest = load_manifest(tmp_path)
+    manifest = load_rating_manifest(tmp_path)
     files = [tmp_path / "high.json", tmp_path / "low.json", tmp_path / "unknown.json"]
 
     kept = filter_episodes_by_agent_score(files, manifest, min_avg_agent_score=1000)
@@ -215,7 +215,7 @@ def test_filter_episodes_by_agent_score_uses_worst_player_score(tmp_path):
             },
         ],
     )
-    manifest = load_manifest(tmp_path)
+    manifest = load_rating_manifest(tmp_path)
     files = [tmp_path / "balanced.json", tmp_path / "unbalanced.json"]
 
     kept = filter_episodes_by_agent_score(files, manifest, min_agent_score=1000)
@@ -240,6 +240,34 @@ def test_iter_replay_samples_yields_both_players_skipping_none_actions(tmp_path)
     obs, action = pairs[0]
     assert obs == obs0
     assert action == action_pass
+
+
+def test_iter_replay_samples_filters_selected_player(tmp_path):
+    obs0 = _fresh_observation(player=0)
+    obs1 = _fresh_observation(player=1)
+    action_pass = {"farmer": ["PASS"], "hands": [], "market": []}
+    path = tmp_path / "ep.json"
+    path.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    [
+                        {"observation": obs0, "action": None},
+                        {"observation": obs1, "action": None},
+                    ],
+                    [
+                        {"observation": obs0, "action": action_pass},
+                        {"observation": obs1, "action": action_pass},
+                    ],
+                ]
+            }
+        )
+    )
+
+    pairs = list(iter_replay_samples(path, selected_players={1}))
+
+    assert len(pairs) == 1
+    assert pairs[0][0]["player"] == 1
 
 
 def test_iter_replay_samples_filters_each_player_by_terminal_reward(tmp_path):

@@ -24,10 +24,12 @@ from kaggriculture.training.bc.jax_cache import (
     _UNIT_CHOICE,
     BCBatch,
     CacheRules,
+    _load_cache_stats,
     _trace_choices,
     load_shard,
     observation_to_state,
     prepare_episode,
+    prepare_episodes,
 )
 from tests.policy.conftest import make_fresh_observation
 
@@ -128,6 +130,69 @@ def test_episode_cache_round_trip(tmp_path: Path) -> None:
     assert batch.choices.shape == (1, L.MAX_DECODE_LEN)
     assert int(batch.decision_mask.sum()) == 2
     assert prepare_episode(episode, tmp_path / "cache", CacheRules()) == path
+    stats = _load_cache_stats(path)
+    assert stats.accepted == 1
+    assert stats.discarded == 0
+
+
+def test_episode_cache_can_select_one_player(tmp_path: Path) -> None:
+    observations = [_observation(0), _observation(1)]
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
+    episode = tmp_path / "episode.json"
+    episode.write_text(
+        json.dumps(
+            {
+                "rewards": [10.0, 20.0],
+                "steps": [
+                    [
+                        {"observation": observations[0], "action": None},
+                        {"observation": observations[1], "action": None},
+                    ],
+                    [
+                        {"observation": observations[0], "action": action},
+                        {"observation": observations[1], "action": action},
+                    ],
+                ],
+            }
+        )
+    )
+
+    path = prepare_episode(episode, tmp_path / "cache", CacheRules(), (1,))
+    batch = load_shard(path)
+
+    assert batch.players.tolist() == [1]
+
+
+def test_episode_cache_reports_discarded_samples(tmp_path: Path) -> None:
+    obs = _observation()
+    episode = tmp_path / "episode.json"
+    episode.write_text(
+        json.dumps(
+            {
+                "rewards": [1.0],
+                "steps": [
+                    [{"observation": {"player": 0}, "action": None}],
+                    [
+                        {
+                            "observation": obs,
+                            "action": {"farmer": ["PASS"], "hands": [], "market": []},
+                        }
+                    ],
+                ],
+            }
+        )
+    )
+
+    paths, created, stats = prepare_episodes([episode], tmp_path / "cache", CacheRules())
+
+    assert paths == []
+    assert created == 0
+    assert stats.accepted == 0
+    assert stats.discarded == 1
+    assert sum(stats.reasons.values()) == 1
+    sidecar = next((tmp_path / "cache").glob("*.stats.json"))
+    persisted = json.loads(sidecar.read_text())
+    assert persisted["discarded"] == 1
 
 
 def test_jax_bc_update_changes_actor_parameters() -> None:

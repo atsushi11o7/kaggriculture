@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from kaggriculture.policy.jax import history as H
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
 from kaggriculture.simulator.reset import reset
 

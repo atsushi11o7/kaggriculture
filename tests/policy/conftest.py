@@ -13,7 +13,7 @@ import torch
 
 from kaggriculture.policy.common.config import ModelConfig
 from kaggriculture.policy.torch import model as M
-from kaggriculture.simulator import constants as C
+from kaggriculture.rules import constants as C
 
 BOARD_SIZE = 10
 

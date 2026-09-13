@@ -1,5 +1,6 @@
 defaults:
   - model: default
+  - rules: default
   - _self_
 
 experiment:
@@ -24,10 +25,10 @@ data:
   num_episodes: null
   val_fraction: 0.1
   split_seed: 0
-  turns_per_day: 24
-  shed_capacity: 100
-  hire_mult: 1
-  max_market_orders: 10
+  turns_per_day: ${rules.turns_per_day}
+  shed_capacity: ${rules.shed_capacity}
+  hire_mult: ${rules.hire_mult}
+  max_market_orders: ${rules.max_market_orders}
   # manifestのscoreはエージェントのSkill Ratingで、終端所持金ではない。
   # 強いエージェント同士の対局へ絞る場合に指定する。
   manifest_dir: null
