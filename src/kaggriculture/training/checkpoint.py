@@ -39,3 +39,33 @@ def load_checkpoint(directory: Path, target: TrainState) -> tuple[TrainState, di
     )
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     return restored, metadata
+
+
+def _is_prng_key(value) -> bool:
+    return hasattr(value, "dtype") and jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key)
+
+
+def _encode_keys(value):
+    return jax.tree.map(
+        lambda leaf: jax.random.key_data(leaf) if _is_prng_key(leaf) else leaf, value
+    )
+
+
+def save_pytree(path: Path, value) -> None:
+    """JAX pytreeをatomicに保存する。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(serialization.to_bytes(_encode_keys(value)))
+    temporary.replace(path)
+
+
+def load_pytree(path: Path, target):
+    """保存済みpytreeをtargetの構造へ復元し、device配列へ変換する。"""
+    restored = serialization.from_bytes(_encode_keys(target), path.read_bytes())
+    return jax.tree.map(
+        lambda value, template: (
+            jax.random.wrap_key_data(value) if _is_prng_key(template) else jnp.asarray(value)
+        ),
+        restored,
+        target,
+    )

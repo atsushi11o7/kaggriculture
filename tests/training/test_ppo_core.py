@@ -11,6 +11,7 @@ from kaggriculture.policy.jax import model as JM
 from kaggriculture.policy.torch import model as TM
 from kaggriculture.simulator.reset import reset
 from kaggriculture.training.ppo import core
+from kaggriculture.training.ppo.evaluation import EvaluationResult, _combine_seats
 from kaggriculture.training.weight_bridge import torch_to_jax
 
 
@@ -84,3 +85,23 @@ def test_update_minibatch_changes_finite_parameters() -> None:
         for before, after in zip(leaves_before, leaves_after, strict=True)
     )
     assert bool(jnp.isfinite(metrics.loss))
+
+
+def test_both_seat_results_are_normalized_to_actor_perspective() -> None:
+    as_player0 = EvaluationResult(
+        cash=jnp.asarray([[100.0, 20.0]]),
+        outcome=jnp.asarray([1.0]),
+        win_rate=jnp.asarray(1.0),
+    )
+    # In this run the candidate actor is player 1 and wins 80 to 30.
+    as_player1 = EvaluationResult(
+        cash=jnp.asarray([[30.0, 80.0]]),
+        outcome=jnp.asarray([-1.0]),
+        win_rate=jnp.asarray(0.0),
+    )
+
+    combined = _combine_seats(as_player0, as_player1)
+
+    np.testing.assert_array_equal(combined.cash, [[100.0, 20.0], [80.0, 30.0]])
+    np.testing.assert_array_equal(combined.outcome, [1.0, 1.0])
+    assert combined.win_rate == 1.0

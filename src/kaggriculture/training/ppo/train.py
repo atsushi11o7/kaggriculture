@@ -20,9 +20,14 @@ from kaggriculture.policy.jax import distribution as D
 from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import model as JM
 from kaggriculture.simulator.reset import reset
-from kaggriculture.training.checkpoint import load_checkpoint, save_checkpoint
+from kaggriculture.training.checkpoint import (
+    load_checkpoint,
+    load_pytree,
+    save_checkpoint,
+    save_pytree,
+)
 from kaggriculture.training.ppo import core
-from kaggriculture.training.ppo.evaluation import evaluate_closed_loop
+from kaggriculture.training.ppo.evaluation import evaluate_both_seats
 from kaggriculture.training.ppo.rollout import RolloutConfig, collect_rollout, to_ppo_batch
 
 logger = logging.getLogger(__name__)
@@ -160,6 +165,21 @@ def _prune_checkpoints(directory: Path, keep_last: int) -> None:
         path.rmdir()
 
 
+def _load_eval_opponents(
+    cfg: DictConfig, train_state, model_config: ModelConfig
+) -> list[tuple[str, dict]]:
+    """設定されたPPO checkpointから評価相手のparameterを読み込む。"""
+    opponents = []
+    for raw_path in cfg.ppo.eval_opponent_checkpoints:
+        path = Path(to_absolute_path(raw_path))
+        metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+        if ModelConfig(**metadata["model_config"]) != model_config:
+            raise ValueError(f"evaluation opponent model structure does not match: {path}")
+        restored, _ = load_checkpoint(path, train_state)
+        opponents.append((str(path), {"params": restored.params}))
+    return opponents
+
+
 @hydra.main(version_base=None, config_path="../conf", config_name="ppo")
 def main(cfg: DictConfig) -> None:
     _validate_config(cfg)
@@ -184,6 +204,7 @@ def main(cfg: DictConfig) -> None:
         logger.info("resumed JAX PPO checkpoint: %s (update=%d)", path, start_update)
 
     reference_variables = {"params": train_state.params}
+    extra_opponents = _load_eval_opponents(cfg, train_state, model_config)
     eval_cache = None
     if cfg.ppo.eval_interval > 0:
         eval_cache = D.init_decode_cache(model, eval_cache_key, cfg.ppo.eval_episodes)
@@ -195,6 +216,24 @@ def main(cfg: DictConfig) -> None:
         starting_money=cfg.env.starting_money,
     )
     counters = H.zeros(cfg.env.batch_size)
+    if cfg.ppo.resume_checkpoint is not None:
+        runtime_path = Path(to_absolute_path(cfg.ppo.resume_checkpoint)) / "runtime.msgpack"
+        if runtime_path.exists():
+            runtime = load_pytree(
+                runtime_path,
+                {
+                    "key": key,
+                    "state": state,
+                    "counters": counters,
+                    "reference_params": reference_variables["params"],
+                },
+            )
+            key = runtime["key"]
+            state = runtime["state"]
+            counters = runtime["counters"]
+            reference_variables = {"params": runtime["reference_params"]}
+        else:
+            logger.warning("checkpoint has no runtime state; starting fresh environments")
     cache = D.init_decode_cache(model, cache_key, cfg.env.batch_size * 2)
     checkpoint_root = Path("checkpoints")
     resolved = OmegaConf.to_container(cfg, resolve=True)
@@ -232,23 +271,27 @@ def main(cfg: DictConfig) -> None:
             )
         if cfg.ppo.eval_interval > 0 and update % cfg.ppo.eval_interval == 0:
             key, eval_key = jax.random.split(key)
-            evaluation = evaluate_closed_loop(
-                model,
-                {"params": train_state.params},
-                reference_variables,
-                eval_cache,
-                replace(rollout_config, temperature=0.5),
-                eval_key,
-                cfg.ppo.eval_episodes,
-            )
-            result = jax.device_get(evaluation)
-            logger.info(
-                "closed_loop update=%d win_rate=%.3f cash=%.1f opponent_cash=%.1f",
-                update,
-                result.win_rate,
-                result.cash[:, 0].mean(),
-                result.cash[:, 1].mean(),
-            )
+            opponents = [("initial", reference_variables), *extra_opponents]
+            for name, opponent in opponents:
+                eval_key, matchup_key = jax.random.split(eval_key)
+                evaluation = evaluate_both_seats(
+                    model,
+                    {"params": train_state.params},
+                    opponent,
+                    eval_cache,
+                    replace(rollout_config, temperature=0.5),
+                    matchup_key,
+                    cfg.ppo.eval_episodes,
+                )
+                result = jax.device_get(evaluation)
+                logger.info(
+                    "closed_loop update=%d opponent=%s win_rate=%.3f cash=%.1f opponent_cash=%.1f",
+                    update,
+                    name,
+                    result.win_rate,
+                    result.cash[:, 0].mean(),
+                    result.cash[:, 1].mean(),
+                )
 
         if update % cfg.ppo.checkpoint_interval == 0 or update == cfg.ppo.total_updates:
             directory = checkpoint_root / f"step_{update}"
@@ -260,6 +303,15 @@ def main(cfg: DictConfig) -> None:
                     "model_config": asdict(model_config),
                     "ppo_config": asdict(ppo_config),
                     "config": resolved,
+                },
+            )
+            save_pytree(
+                directory / "runtime.msgpack",
+                {
+                    "key": key,
+                    "state": state,
+                    "counters": counters,
+                    "reference_params": reference_variables["params"],
                 },
             )
             _prune_checkpoints(checkpoint_root, cfg.ppo.keep_last_checkpoints)

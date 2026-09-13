@@ -17,7 +17,7 @@ from kaggriculture.training.ppo.rollout import RolloutConfig
 
 
 class EvaluationResult(NamedTuple):
-    """全対局の終端所持金とplayer 0視点の勝敗。"""
+    """全対局の候補方策視点の終端所持金と勝敗。"""
 
     cash: jnp.ndarray
     outcome: jnp.ndarray
@@ -109,6 +109,7 @@ def evaluate_closed_loop(
             next_counters = current_counters
         return (next_state, next_counters), None
 
+    # episodeStepsは初期状態を含む記録数。step 0からDONEのstep 719までは719遷移。
     keys = jax.random.split(key, config.episode_steps - 1)
     (final_state, _), _ = jax.lax.scan(step, (state, counters), keys)
     outcome = jnp.sign(final_state.money[:, 0] - final_state.money[:, 1])
@@ -117,3 +118,30 @@ def evaluate_closed_loop(
         outcome=outcome,
         win_rate=jnp.mean((outcome > 0).astype(jnp.float32)),
     )
+
+
+def _combine_seats(player0: EvaluationResult, player1: EvaluationResult) -> EvaluationResult:
+    """候補方策が両席で戦った結果を候補方策視点へ揃える。"""
+    cash = jnp.concatenate([player0.cash, player1.cash[:, ::-1]], axis=0)
+    outcome = jnp.concatenate([player0.outcome, -player1.outcome], axis=0)
+    return EvaluationResult(cash, outcome, jnp.mean((outcome > 0).astype(jnp.float32)))
+
+
+def evaluate_both_seats(
+    model: M.PolicyValueNet,
+    actor_variables: dict,
+    opponent_variables: dict,
+    cache_template: dict,
+    config: RolloutConfig,
+    key: jax.Array,
+    games_per_seat: int,
+) -> EvaluationResult:
+    """候補方策をplayer 0/1の両方に置き、候補方策視点で結果を結合する。"""
+    key0, key1 = jax.random.split(key)
+    as_player0 = evaluate_closed_loop(
+        model, actor_variables, opponent_variables, cache_template, config, key0, games_per_seat
+    )
+    as_player1 = evaluate_closed_loop(
+        model, opponent_variables, actor_variables, cache_template, config, key1, games_per_seat
+    )
+    return _combine_seats(as_player0, as_player1)
