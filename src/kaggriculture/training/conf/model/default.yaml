@@ -1,0 +1,10 @@
+# BCとPPOで共有するモデル構造。checkpointには解決済みの値を保存する。
+d_model: 128
+num_heads: 4
+d_feedforward: 512
+num_layers_encoder: 4
+num_layers_decoder: 3
+dropout: 0.0
+use_episode_history: false
+use_asymmetric_critic: false
+num_layers_critic: 2
