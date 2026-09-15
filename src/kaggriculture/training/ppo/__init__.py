@@ -1,1 +1,1 @@
-"""PPOのrollout、advantage計算、更新ループを置くパッケージ。"""
+"""PPO training for the fixed-slot policy."""

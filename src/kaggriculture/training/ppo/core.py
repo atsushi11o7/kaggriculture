@@ -1,4 +1,4 @@
-"""JAX PPOのGAE・目的関数・1 minibatch更新。"""
+"""固定slot非自己回帰方策のPPO目的関数。"""
 
 from __future__ import annotations
 
@@ -11,16 +11,16 @@ import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
 
-from kaggriculture.policy.jax import distribution as D
 from kaggriculture.policy.jax import model as M
-from kaggriculture.policy.jax import tokenize as T
+from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.tokenize import EpisodeCounters
+from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.state import State
+from kaggriculture.training.rl import compute_gae, terminal_win_rewards
 
 
 @dataclass(frozen=True)
 class PPOConfig:
-    """PPO更新のハイパーパラメータ。"""
-
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
@@ -28,31 +28,26 @@ class PPOConfig:
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 1.0
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     weight_decay: float = 0.0
-    temperature: float = 1.0
-    ratio_mode: str = "token"
+    temperature: float = 0.8
     turns_per_day: int = 24
     shed_capacity: int = 100
-    hire_mult: float = 1.0
 
 
 class PPOBatch(NamedTuple):
-    """環境・時刻・player軸を平坦化したPPO minibatch。"""
-
     states: State
     players: jnp.ndarray
-    choices: jnp.ndarray
-    decision_mask: jnp.ndarray
-    old_token_log_prob: jnp.ndarray
-    old_log_prob: jnp.ndarray
+    intent: Intent
+    slot_mask: jnp.ndarray
+    old_slot_log_prob: jnp.ndarray
     old_value: jnp.ndarray
     advantages: jnp.ndarray
     returns: jnp.ndarray
-    counters: T.EpisodeCounters | None = None
+    counters: EpisodeCounters | None
 
 
-class PPOMetrics(NamedTuple):
+class Metrics(NamedTuple):
     loss: jnp.ndarray
     policy_loss: jnp.ndarray
     value_loss: jnp.ndarray
@@ -61,139 +56,77 @@ class PPOMetrics(NamedTuple):
     clip_fraction: jnp.ndarray
 
 
-def terminal_win_rewards(cash: jnp.ndarray, done: jnp.ndarray) -> jnp.ndarray:
-    """終端所持金をゼロ和の勝敗報酬(+1/-1、同点0)へ変換する。"""
-    margin = cash[..., 0] - cash[..., 1]
-    result = jnp.sign(margin)
-    rewards = jnp.stack([result, -result], axis=-1)
-    return jnp.where(done[..., None], rewards, 0.0)
-
-
-def compute_gae(
-    rewards: jnp.ndarray,
-    values: jnp.ndarray,
-    dones: jnp.ndarray,
-    bootstrap_value: jnp.ndarray,
-    gamma: float = 0.999,
-    gae_lambda: float = 0.95,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """時間先頭軸のrolloutからGAE advantageとreturnを計算する。"""
-    if dones.ndim == rewards.ndim - 1:
-        dones = dones[..., None]
-    next_values = jnp.concatenate([values[1:], bootstrap_value[None]], axis=0)
-
-    def backward(advantage, inputs):
-        reward, value, next_value, done = inputs
-        discount = gamma * (1.0 - done.astype(jnp.float32))
-        delta = reward + discount * next_value - value
-        advantage = delta + discount * gae_lambda * advantage
-        return advantage, advantage
-
-    _, reversed_advantages = jax.lax.scan(
-        backward,
-        jnp.zeros_like(bootstrap_value),
-        (rewards[::-1], values[::-1], next_values[::-1], dones[::-1]),
-    )
-    advantages = reversed_advantages[::-1]
-    return advantages, advantages + values
-
-
-def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig) -> TrainState:
-    """gradient clipping付きAdamWの学習状態を作る。"""
+def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig):
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
     )
-    return TrainState.create(
-        apply_fn=model.apply,
-        params=variables["params"],
-        tx=optimizer,
-    )
+    return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 
-def _loss(
-    model: M.PolicyValueNet,
-    params: dict,
-    batch: PPOBatch,
-    config: PPOConfig,
-) -> tuple[jnp.ndarray, PPOMetrics]:
-    evaluation = D.evaluate_choices(
+def _normalize_advantages(advantages: jnp.ndarray, sample_mask: jnp.ndarray) -> jnp.ndarray:
+    """固定相手を除いたlearner行だけでadvantageを標準化する。"""
+    sample_mask = sample_mask.astype(jnp.float32)
+    sample_count = jnp.maximum(sample_mask.sum(), 1)
+    mean = jnp.sum(advantages * sample_mask) / sample_count
+    variance = jnp.sum(jnp.square(advantages - mean) * sample_mask) / sample_count
+    return (advantages - mean) / jnp.sqrt(variance + 1e-8)
+
+
+def _loss(model, params, batch: PPOBatch, config: PPOConfig):
+    evaluation = P.evaluate_intent(
         model,
         {"params": params},
         batch.states,
         batch.players,
-        batch.choices,
+        batch.intent,
         counters=batch.counters,
         temperature=config.temperature,
         turns_per_day=config.turns_per_day,
         shed_capacity=config.shed_capacity,
-        hire_mult=config.hire_mult,
     )
-    advantages = (batch.advantages - jnp.mean(batch.advantages)) / (
-        jnp.std(batch.advantages) + 1e-8
-    )
-    if config.ratio_mode == "token":
-        log_ratio = evaluation.token_log_prob - batch.old_token_log_prob
-        ratio = jnp.exp(jnp.clip(log_ratio, -20.0, 20.0))
-        token_advantages = advantages[:, None]
-        unclipped = ratio * token_advantages
-        clipped = (
-            jnp.clip(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * token_advantages
-        )
-        mask = batch.decision_mask.astype(jnp.float32)
-        decisions_per_sample = jnp.maximum(jnp.sum(mask, axis=-1), 1.0)
-        policy_per_sample = (
-            jnp.sum(jnp.minimum(unclipped, clipped) * mask, axis=-1) / decisions_per_sample
-        )
-        policy_loss = -jnp.mean(policy_per_sample)
-        approx_kl = jnp.mean(
-            jnp.sum(((ratio - 1.0) - log_ratio) * mask, axis=-1) / decisions_per_sample
-        )
-        clip_fraction = jnp.mean(
-            jnp.sum(
-                (jnp.abs(ratio - 1.0) > config.clip_epsilon).astype(jnp.float32) * mask,
-                axis=-1,
-            )
-            / decisions_per_sample
-        )
-    else:
-        log_ratio = evaluation.log_prob - batch.old_log_prob
-        ratio = jnp.exp(jnp.clip(log_ratio, -20.0, 20.0))
-        unclipped = ratio * advantages
-        clipped = jnp.clip(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * advantages
-        policy_loss = -jnp.mean(jnp.minimum(unclipped, clipped))
-        approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
-        clip_fraction = jnp.mean((jnp.abs(ratio - 1.0) > config.clip_epsilon).astype(jnp.float32))
+    sample_mask = batch.slot_mask.any(-1).astype(jnp.float32)
+    sample_count = jnp.maximum(sample_mask.sum(), 1)
+    advantage = _normalize_advantages(batch.advantages, sample_mask)
+    log_ratio = evaluation.slot_log_prob - batch.old_slot_log_prob
+    ratio = jnp.exp(jnp.clip(log_ratio, -20.0, 20.0))
+    unclipped = ratio * advantage[:, None]
+    clipped = jnp.clip(ratio, 1 - config.clip_epsilon, 1 + config.clip_epsilon) * advantage[:, None]
+    mask = batch.slot_mask.astype(jnp.float32)
+    count = jnp.maximum(mask.sum(-1), 1)
+    # population対戦(collect_rollout_vs_opponent)では、固定相手側の行は
+    # slot_maskが全slotでFalseになる。行内のmasked sumはここまでで既に0に
+    # なるが、外側の平均を全サンプル数で取ると相手の行が分母に残ってしまう
+    # (policy_loss等は薄まるだけで済むが、value_lossは相手の状態価値まで
+    # learnerのcriticに学習させてしまう不整合が起きる)。sample_maskで
+    # learner側の行だけを対象に平均する。自己対戦時は全行が有効なので、
+    # 従来の挙動と完全に一致する。
 
-    value_delta = evaluation.value - batch.old_value
+    def _sample_mean(per_sample: jnp.ndarray) -> jnp.ndarray:
+        return jnp.sum(per_sample * sample_mask) / sample_count
+
+    policy_loss = -_sample_mean((jnp.minimum(unclipped, clipped) * mask).sum(-1) / count)
+    approx_kl = _sample_mean((((ratio - 1) - log_ratio) * mask).sum(-1) / count)
+    clip_fraction = _sample_mean(
+        ((jnp.abs(ratio - 1) > config.clip_epsilon) * mask).sum(-1) / count
+    )
+    delta = evaluation.value - batch.old_value
     clipped_value = batch.old_value + jnp.clip(
-        value_delta, -config.value_clip_epsilon, config.value_clip_epsilon
+        delta, -config.value_clip_epsilon, config.value_clip_epsilon
     )
-    value_error = jnp.square(evaluation.value - batch.returns)
-    clipped_value_error = jnp.square(clipped_value - batch.returns)
-    value_loss = 0.5 * jnp.mean(jnp.maximum(value_error, clipped_value_error))
-
-    entropy = jnp.mean(evaluation.entropy / jnp.maximum(evaluation.num_decisions, 1))
+    value_loss = 0.5 * _sample_mean(
+        jnp.maximum(
+            jnp.square(evaluation.value - batch.returns),
+            jnp.square(clipped_value - batch.returns),
+        )
+    )
+    entropy = _sample_mean((evaluation.entropy * mask).sum(-1) / count)
     loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
-    metrics = PPOMetrics(
-        loss=loss,
-        policy_loss=policy_loss,
-        value_loss=value_loss,
-        entropy=entropy,
-        approx_kl=approx_kl,
-        clip_fraction=clip_fraction,
-    )
-    return loss, metrics
+    return loss, Metrics(loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction)
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def update_minibatch(
-    model: M.PolicyValueNet,
-    train_state: TrainState,
-    batch: PPOBatch,
-    config: PPOConfig,
-) -> tuple[TrainState, PPOMetrics]:
-    """1 minibatchのPPO勾配更新を行う。"""
+def update_minibatch(model, train_state, batch, config):
     (_, metrics), gradients = jax.value_and_grad(_loss, argnums=1, has_aux=True)(
         model, train_state.params, batch, config
     )
@@ -201,35 +134,26 @@ def update_minibatch(
 
 
 @partial(jax.jit, static_argnums=(0, 4, 5, 6))
-def update_epochs(
-    model: M.PolicyValueNet,
-    train_state: TrainState,
-    batch: PPOBatch,
-    key: jax.Array,
-    config: PPOConfig,
-    num_epochs: int,
-    minibatch_size: int,
-) -> tuple[TrainState, PPOMetrics]:
-    """rolloutをepochごとにshuffleし、全minibatchをGPU上で更新する。"""
-    sample_size = batch.players.shape[0]
-    if sample_size % minibatch_size:
+def update_epochs(model, train_state, batch, key, config, num_epochs, minibatch_size):
+    sample_count = batch.players.shape[0]
+    if sample_count % minibatch_size:
         raise ValueError("sample count must be divisible by minibatch_size")
-    num_minibatches = sample_size // minibatch_size
+    minibatches = sample_count // minibatch_size
 
     def epoch_step(carry, _):
         state, rng = carry
         rng, permutation_key = jax.random.split(rng)
-        indices = jax.random.permutation(permutation_key, sample_size).reshape(
-            num_minibatches, minibatch_size
+        indices = jax.random.permutation(permutation_key, sample_count).reshape(
+            minibatches, minibatch_size
         )
 
-        def minibatch_step(current_state, sample_indices):
+        def minibatch_step(current, selected):
             minibatch = jax.tree.map(
-                lambda value: value[sample_indices] if value is not None else None,
+                lambda value: value[selected] if value is not None else None,
                 batch,
                 is_leaf=lambda value: value is None,
             )
-            return update_minibatch(model, current_state, minibatch, config)
+            return update_minibatch(model, current, minibatch, config)
 
         state, metrics = jax.lax.scan(minibatch_step, state, indices)
         return (state, rng), jax.tree.map(jnp.mean, metrics)
@@ -238,3 +162,6 @@ def update_epochs(
         epoch_step, (train_state, key), xs=None, length=num_epochs
     )
     return train_state, jax.tree.map(jnp.mean, metrics)
+
+
+__all__ = ["PPOBatch", "PPOConfig", "compute_gae", "terminal_win_rewards"]
