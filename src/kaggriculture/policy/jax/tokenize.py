@@ -311,6 +311,30 @@ def encode_observation(
     return result
 
 
+def encode_unit_inventories(state: State, player: jnp.ndarray) -> F.DenseFeatures:
+    """farmer+全hands、各unit自身が運んでいるinventoryを1トークンずつ返す。
+
+    `encode_observation`の`own_inventory`は全unit合計なので、方策は
+    「どのhandが何を持っているか」を区別できない。`ParallelQueryEncoder`が
+    各unit queryへこのトークンを加算することで、farmer/hand毎にPLACE/DROP/
+    SELL等を判断できるようにする。`(N_UNIT_SLOTS, MAX_ENCODER_FEATURES)`。
+    """
+    inventories = jnp.concatenate(
+        [state.farmer_inventory[player][None], state.hands_inventory[player]], axis=0
+    )
+    per_unit = jax.vmap(
+        lambda counts: _count_token(
+            counts,
+            jnp.arange(C.N_SHED_ITEMS),
+            V.ENTITY_ITEM,
+            V.ENTITY_MAGNITUDE_BUCKET,
+            100,
+            F.MAX_ENCODER_FEATURES,
+        )
+    )(inventories)
+    return F.DenseFeatures(per_unit.index[:, 0], per_unit.value[:, 0])
+
+
 def encode_privileged(
     state: State, player: jnp.ndarray
 ) -> tuple[F.DenseFeatures, jnp.ndarray, jnp.ndarray]:

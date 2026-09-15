@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from kaggriculture.policy.common.vocab import SparseVector
-from kaggriculture.policy.torch import distribution as D
+from kaggriculture.policy.torch import candidate_decode as D
 
 
 @dataclass(frozen=True)
@@ -123,3 +123,8 @@ def trace_expert_candidates(
         return selected
 
     _run(observation, choose, rules)
+
+
+def normalize_expert_action(observation: dict, action: dict, **rules) -> dict:
+    """Normalize replay actions against the same candidates used by tracing."""
+    return D.normalize_expert_action(observation, action, **rules)

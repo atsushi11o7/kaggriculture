@@ -1,258 +1,132 @@
 # kaggriculture.policy
 
-盤面をTransformerで符号化し、farmer・hands・市場注文からなる1ターン分の複合行動を
-自己回帰生成する方策です。静的ゲーム規則は`kaggriculture.rules`、方策内の共有仕様と
-実行backendはこのパッケージ内で分離しています。
+盤面全体を1回符号化し、farmer・全hands・市場10slotを共同出力する固定slot方策です。
+旧自己回帰方策は推論コストが高すぎたため廃止し、Git履歴だけに残しています。
 
 ## 構成
 
 | 場所 | 役割 |
 |---|---|
-| `common/` | backend間で共有する語彙、トークン配置、`ModelConfig`の型。Torch/JAXには依存しない |
-| `torch/` | Python辞書観測の変換、旧BC経路、Kaggle提出用PyTorchモデル |
-| `jax/` | 固定shapeの状態変換、合法手mask、Flaxモデル、BC/PPO用自己回帰処理 |
+| `common/` | 語彙、token配置、モデル設定 |
+| `jax/` | GPU学習用モデル、合法mask、Executor、履歴 |
+| `torch/` | CPU提出モデル、観測token化、GBDT用候補処理 |
 
-backend固有コードは必ず`kaggriculture.policy.torch`または
-`kaggriculture.policy.jax`から明示的にimportします。親パッケージに互換re-exportは
-置かず、誤ってCPU経路をJAX学習から呼ぶことを防ぎます。
+JAX PPOでは観測変換、合法mask、方策、Executor、シミュレータ、GAE、更新をGPU上で処理します。
+Torch版はJAX checkpointからActorだけを変換し、JAXがないKaggle評価環境で使用します。
 
-```mermaid
-flowchart LR
-    R[共通仕様
-vocab / layout / rules]
-    O[Kaggle observation] --> T[torch backend
-BC・提出]
-    S[JAX State] --> J[jax backend
-PPO rollout・更新]
-    R --> T
-    R --> J
-    J --> X[JAX simulator]
-    J -->|weight bridge| T
-```
+## 入力とモデル
 
-JAXは学習時だけ必要です。PPO checkpointのactorを`training.export_policy`でPyTorchへ
-変換すると、提出物にはJAX・Flax・criticを含めずに済みます。
-
-## 入力と埋め込み
-
-Actorへ渡すのは、自分が本番でも観測できる情報だけです。10×10の両者の盤面を
-200トークンとし、プレイヤー情報、自分のshed・seeds・unit inventory、市場、街、時刻、
-任意の累積履歴を加えた合計214トークンを作ります。相手のshed・seeds・unit inventoryは
-Actor入力に含めません。
-
-各トークンは単一IDではなく、複数の語彙indexと値を持つ`SparseVector`です。例えば作物、
-タイル種別、収穫量、所有者などを同じトークンへ重ねます。内容埋め込みは概念的に
-`LayerNorm(sum(value_i * embedding[index_i]))`です。品目の語彙は観測と行動候補で共有されるため、
-盤面上のWHEATと「WHEATを植える・売る」という候補は同じ実体埋め込みを使います。
-
-```mermaid
-flowchart LR
-    subgraph OBS["Actorが観測できる状態"]
-        B["両者の盤面<br/>100マス × 2"]
-        P["両者の公開player情報"]
-        OWN["自分のprivate<br/>shed / seeds / unit inventory"]
-        WORLD["市場在庫・価格<br/>town / day / hour"]
-        HIST["任意の累積履歴<br/>produced / sold / bought / revenue / ever sold"]
-    end
-
-    B --> TOK["tokenize<br/>固定順の214 SparseVector"]
-    P --> TOK
-    OWN --> TOK
-    WORLD --> TOK
-    HIST --> TOK
-
-    TOK --> CONTENT["共有TokenEmbedding<br/>値付き埋め込み和 + LayerNorm"]
-    OWNER["owner embedding<br/>own / opponent / shared"] --> ADD((+))
-    ZONE["zone embedding<br/>tile / shed / market ..."] --> ADD
-    BOARD["共有board-position embedding<br/>マス座標 / no-position"] --> ADD
-    CONTENT --> ADD
-    CLS["learned CLS"] --> ADD
-    ADD --> EIN["Encoder入力<br/>(batch, 215, d_model)"]
-```
-
-数量も連続値回帰ではありません。量1〜100に個別のcategorical語彙を持たせ、log正規化した
-連続成分も補助的に加えます。これによりLayerNorm後にも数量を区別でき、PPOのlog probabilityへ
-通常の選択と同様に含められます。
-
-## Transformerと方策・価値出力
-
-Encoderは全入力をself-attentionし、各トークンの文脈表現と局面を集約したCLSを返します。
-Decoderは、これまでに選んだ候補を因果mask付きself-attentionで読み、Encoder memoryへ
-cross-attentionして次の決定を表現します。
-
-方策には行動空間全体へ固定logitを出す巨大な出力headがありません。その時点の合法候補を
-作り、候補自身を共有`TokenEmbedding`で埋め込み、Decoder hiddenを線形射影したベクトルとの
-内積で採点します。
+Actorには本番で観測可能な情報だけを渡します。両者の10×10盤面、公開player情報、自分の
+shed・seeds・unit inventory、市場、街、時刻、任意の累積履歴を214個のSparseVectorへ変換します。
+各tokenは`LayerNorm(sum(value_i * embedding[index_i]))`で埋め込みます。品目IDは観測と
+行動候補で共有するため、盤面上のWHEATとWHEATを植える・売る候補は同じ実体表現を使います。
 
 ```mermaid
 flowchart TB
-    EIN["埋め込み済みActor系列<br/>CLS + 214 tokens"]
-    ENC["Transformer Encoder × N<br/>bidirectional self-attention"]
-    MEM["Actor memory<br/>(batch, 215, d_model)"]
-    EIN --> ENC --> MEM
+    OBS[公開観測 + 自分のprivate + 任意の履歴]
+    TOK[214 SparseVector tokens]
+    EMB[共有TokenEmbedding + owner/zone/position]
+    ENC[Transformer Encoder]
+    MEM[State memory]
 
-    subgraph POLICY["Actor: 次の合法候補を選ぶ"]
-        PREV["直前までに選んだ候補<br/>+ 現在unitのinventory context"]
-        SLOT["決定slot embedding<br/>farmer / hand_i / market_i / quantity"]
-        UPOS["共有board-position embedding<br/>現在unitの座標"]
-        DADD((+))
-        DEC["Transformer Decoder × N<br/>causal self-attention<br/>+ memory cross-attention"]
-        H["現在slotのhidden"]
-        PROJ["Linear policy projection"]
+    OBS --> TOK --> EMB --> ENC --> MEM
 
-        PREV --> DE["共有TokenEmbedding"] --> DADD
-        SLOT --> DADD
-        UPOS --> DADD
-        DADD --> DEC --> H --> PROJ
-        MEM --> DEC
-
-        STATE["現在のshadow state"] --> LEGAL["合法候補の列挙 / mask"]
-        LEGAL --> CAND["候補SparseVector群"]
-        CAND --> CE["同じ共有TokenEmbedding"]
-        PROJ --> DOT["scaled dot product<br/>candidate · projected hidden / sqrt(d_model)"]
-        CE --> DOT
-        DOT --> SOFT["softmax / categorical"]
-        SOFT --> CHOICE["選択候補 + log_prob + entropy"]
+    subgraph Q[固定された35 query]
+        U[farmer + hands: 25]
+        M[market slots: 10]
     end
 
-    subgraph VALUE["Critic"]
-        ACLS["Actor Encoder CLS"]
-        PRIV["学習時だけ取得する両者private<br/>shed / seeds / unit inventories"]
-        PENC["Privileged Transformer Encoder × N"]
-        PCLS["Privileged CLS"]
-        CAT["concat"]
-        VHEAD["Linear → ReLU → Linear"]
-        V["state value"]
+    Q --> SELF[query self-attention]
+    SELF --> CROSS[cross-attention to state memory]
+    MEM --> CROSS
+    CROSS --> H[35 slot hidden states]
 
-        MEM --> ACLS --> CAT
-        PRIV --> PENC --> PCLS --> CAT
-        CAT --> VHEAD --> V
-    end
+    H --> OP[op/item categorical]
+    OP --> COND[選択op/itemで数量headを条件付け]
+    COND --> NUM[数量1..100 categorical]
+    OP --> EXEC[Deterministic Executor]
+    NUM --> EXEC
+    EXEC --> ACTION[farmer + hands + ordered market action]
+
+    MEM --> CLS[public CLS]
+    PRIV[学習時だけの両者private] --> PENC[Privileged Encoder]
+    CLS --> VALUE[value head]
+    PENC --> VALUE
 ```
 
-`use_asymmetric_critic=False`ではActor EncoderのCLSだけをvalue headへ渡します。
-`True`ではActorのmemoryを再計算せず、critic専用EncoderのCLSを連結します。価値損失は
-共有埋め込みとActor Encoderにも流れますが、Actorの候補選択はprivileged系列を一切参照しません。
-したがって本番推論で相手の非公開情報は不要で、提出用exportではcritic全体を除外できます。
+Encoderは1ターンに1回だけ実行します。query層は35 query同士をself-attentionで混合し、固定された
+状態memoryへcross-attentionします。各slotは同じTransformer出力から決まるため、農夫、hands、
+市場を盤面全体との整合性を含めて共同予測できます。
 
-## 複合行動の生成
+## 合法手とExecutor
 
-```mermaid
-sequenceDiagram
-    participant O as Observation / State
-    participant E as Encoder
-    participant S as Shadow state
-    participant L as Legal candidates
-    participant D as Decoder
+unitはターン開始時点で合法な候補だけをmaskします。市場は先行slotのSELLやHIREで後続の合法性が
+変化するため、ネットワークは構造上可能な候補を共同出力し、Executorがslot順に再検証します。
 
-    O->>E: 214 tokensを1回だけencode
-    E-->>D: memoryを全decisionで再利用
+Executorは次を決定論的に処理します。
 
-    loop farmer → 必要なら数量 → hands → market slots
-        S->>L: 現在slotと更新済み状態
-        L-->>D: 候補表 + legal mask
-        D->>D: 選択済みprefixをcausal self-attention
-        E-->>D: memoryへcross-attention
-        D->>D: 候補埋め込みとの内積 → softmax
-        D-->>S: 選択したop / item / quantity
-        S->>S: 資金・種・在庫・位置などをcommit
-        S-->>D: 選択候補を次decisionのprefixへ追加
-    end
+- 非active handをPASSへ変換
+- PICKUP・PLACE・売買数量を実行可能上限へクランプ
+- 全unitのPLANT要求が種数を超えた作物を一括PASS化
+- 市場注文をslot順にshadow stateへ反映
+- 無効な市場slotをno-opへ変換
+- WAITを数量0のSELL、STOPを注文列終了として表現
 
-    D-->>O: farmer + hands + marketの複合行動
-```
+Executorは戦略を追加するものではありません。方策のintentを環境契約に収める境界です。無効化率と
+クランプ率はPPOログで監視し、方策がExecutorへ過度に依存していないか確認します。
 
-生成順はfarmer → hand 0..N → 市場slot 0..9です。数量が必要な行動だけ直後に
-数量候補1..上限を選びます。各決定をshadow stateへ反映するため、自分の先行行動で
-消費した種・在庫・資金は後続候補へ即座に反映されます。市場WAITは数量0のSELLとして
-環境へ渡し、状態を変えず注文indexだけを消費します。STOPは以後の注文を終了します。
+## 数量
 
-この逐次性は依存関係を表現する代償として推論を遅くします。PyTorch提出経路は
-柔軟なPython候補列挙を使います。JAX学習経路は候補表とmaskを固定shape化し、Encoderを
-1回だけ実行、DecoderはKV cache付き88-step `lax.scan`で処理します。これにより方策生成、
-両者の市場処理、シミュレータ、GAE、PPO更新までCPUへ戻さず実行できます。
+数量は連続回帰ではなく1〜100のcategoricalです。量ごとに別の語彙indexを持ち、log正規化した
+連続成分も補助的に加えます。LayerNorm後も数量を区別でき、BCの交差エントロピーとPPOの
+log probabilityへ通常の行動選択と同様に含められます。
 
-## backend API
+## 非対称critic
 
-### PyTorch (`policy.torch.distribution`)
+`use_asymmetric_critic=true`では、価値headだけが両プレイヤーの非公開shed・seeds・inventoryを
+参照します。Actorは公開memoryしか使いません。したがって非対称criticは学習時だけ有効で、
+提出時はcritic全体を安全に除外できます。
+
+## API
+
+### JAX
 
 | API | 用途 |
 |---|---|
-| `predict_action(s)` | criticを実行しない提出・closed-loop推論 |
-| `act` / `evaluate_actions` | PyTorch版PPO互換API |
-| `evaluate_policy` | BCの教師強制評価 |
-| `normalize_expert_action` | リプレイのno-op・上限超過を表現可能な教師へ正規化 |
-| `validate_policy_action` | model実行なしで教師行動を合法候補と照合 |
-| `candidate_api.decode_with_candidates` | GBDT等の外部候補採点器で1ターン生成 |
-| `candidate_api.trace_expert_candidates` | 教師行動の候補表と正解indexを列挙 |
+| `policy.sample_actions` | 1プレイヤーの全slotを共同生成 |
+| `policy.sample_self_play_actions` | 両プレイヤーを1 batchで生成 |
+| `policy.evaluate_intent` | BC/PPOで保存済みintentを再評価 |
+| `policy.state_values` | bootstrap value |
+| `executor.execute` | intentを固定shape simulator actionへ変換 |
 
-PyTorch BCは比較・既存checkpointの再開・JAX経路の切り分けに使える代替経路です。
-既知の行動列をbatch評価では一括Decoder passへまとめます。大量データの通常学習には
-JAX BCを推奨します。固定shape cacheの詳細は`training/bc/README.md`を参照してください。
-
-### JAX (`policy.jax.distribution`)
+### Torch
 
 | API | 用途 |
 |---|---|
-| `sample_actions` | 1プレイヤーの複合行動を増分生成 |
-| `sample_self_play_actions` | 両プレイヤーを1 network batchで生成 |
-| `evaluate_choices` | 保存した候補index列をPPO更新時に再評価 |
-| `state_values` | 両プレイヤーのbootstrap valueを計算 |
+| `policy.predict_action` | JAXなしのCPU提出推論 |
+| `candidate_api.decode_with_candidates` | GBDT用の逐次候補生成 |
+| `candidate_api.trace_expert_candidates` | expert候補・正解indexの抽出 |
+| `candidate_api.normalize_expert_action` | リプレイの無効入力を正規化 |
 
-`training.ppo.rollout.collect_rollout`は生成と`step_batch_lockstep`を外側の`lax.scan`で
-接続します。PPOは既定で各decisionの条件付きratioをclipする`ratio_mode=token`を使い、
-長い複合行動の積でclipが飽和するのを抑えます。複合行動全体を1 actionとして扱う理論上の
-`ratio_mode=joint`も比較用に残しています。PPO評価は教師行動を使わず終端まで自走し、
-候補方策を両席へ置いて勝率と終端所持金を返します。開始時方策に加え、Hydra設定の
-`ppo.eval_opponent_checkpoints`で複数の固定checkpointを評価相手にできます。
+GBDTの逐次候補エンジンはTransformer方策とは独立しています。
 
-## 学習・提出
+## 学習と提出
 
 ```bash
-# BC (JAX)
-uv run python -m kaggriculture.training.bc.train_jax
+# 固定shape cacheを利用するJAX BC
+uv run python -m kaggriculture.training.bc.train
 
-# PPO (JAX end-to-end)
+# JAX/GPU end-to-end PPO
 uv run python -m kaggriculture.training.ppo.train \
-  ppo.init_bc_checkpoint=/absolute/path/to/bc_jax/checkpoints/best
+  ppo.init_bc_checkpoint=/absolute/path/to/bc/checkpoints/best
 
-# 非対称criticを除外して提出用actorへ変換
+# criticを除外してCPU提出用Torch checkpointへ変換
 uv run python -m kaggriculture.training.export_policy \
   /path/to/checkpoints/step_1000 /path/to/model_weights.pt
+
+# batch別の定常推論throughput
+uv run python -m kaggriculture.training.benchmark_policy --batch-sizes 64 128 256
 ```
 
-Hydra設定は`training/conf/`へ集約しています。`model/default.yaml`がBC/PPO共通の
-モデル構造、`bc_jax.yaml`と`ppo.yaml`が学習方式固有の設定です。Python側の`ModelConfig`は
-既定値を持たない型なので、学習時はHydra、提出時はcheckpointが必ず全項目を与えます。
-
-```bash
-# 合成・解決後の設定だけを確認
-uv run python -m kaggriculture.training.ppo.train --cfg job
-
-# 名前付きの単一実験。outputs/ppo/ablation_history/...へ保存
-uv run python -m kaggriculture.training.ppo.train \
-  experiment.name=ablation_history model.use_episode_history=true
-
-# Hydra multirun。各runにはconfig.yamlとoverrides.yamlが残る
-uv run python -m kaggriculture.training.ppo.train -m \
-  experiment.name=model_size model.d_model=64,128 ppo.learning_rate=1e-4,3e-4
-```
-
-PPO checkpointには重み・optimizerに加えて、環境状態、累積履歴、乱数key、開始時の
-固定評価相手を保存します。`resume_checkpoint`からは同じrollout系列を継続できます。
-
-rollout sample数は`env.batch_size * ppo.rollout_horizon * 2`で、`ppo.minibatch_size`は
-これを割り切る必要があります。`MAX_HANDS=32`はJAX配列の安全上限であり、リプレイ最大15
-だけを根拠に24へ下げると、将来PPOが到達した合法状態をシミュレータだけで不正に
-切り捨てるため維持します。
-
-## 既知の近似
-
-- 自己回帰中の市場shadow stateは自分の注文だけで更新します。実環境は同じindexの両者の
-  SELL/BUY_PRODUCTをlockstep処理するため、相手注文次第で後続の価格・購入可能量がずれます。
-- `estimated_bought_product`と`estimated_revenue`も同じ理由で推定値です。`produced`と`sold`は
-  自分の確定行動から得られる値です。
-- `use_episode_history=True`ではJAX rolloutが累積counterを状態として持ち回り、各turn開始時の
-  値をPPO bufferへ保存します。推定値の制約は上記と同じです。
-- 増分KV decodeと一括教師強制はfloat32演算順が異なり、複合行動log probabilityにおよそ
-  `1e-3`以下の差が出ます。PPO clip幅より十分小さく、回帰テストで上限を監視します。
+モデル構造は`training/conf/model/default.yaml`、ゲーム規則は`training/conf/rules/default.yaml`、
+学習固有設定は`bc.yaml`と`ppo.yaml`が正本です。
