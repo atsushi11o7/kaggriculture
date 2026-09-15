@@ -2,6 +2,28 @@
 
 from dataclasses import dataclass
 
+from kaggriculture.rules import constants as C
+
+POLICY_ARCHITECTURE = "fixed_slot"
+POLICY_ARCHITECTURE_VERSION = 2
+
+
+def checkpoint_shape_metadata() -> dict[str, int | str]:
+    """checkpoint互換性を決める固定shape情報を返す。"""
+    return {
+        "architecture": POLICY_ARCHITECTURE,
+        "architecture_version": POLICY_ARCHITECTURE_VERSION,
+        "max_hands": C.MAX_HANDS,
+    }
+
+
+def validate_checkpoint_metadata(metadata: dict) -> None:
+    """異なる方策schemaや固定shapeのcheckpointを早期に拒否する。"""
+    expected = checkpoint_shape_metadata()
+    actual = {name: metadata.get(name) for name in expected}
+    if actual != expected:
+        raise ValueError(f"incompatible policy checkpoint: expected {expected}, got {actual}")
+
 
 @dataclass(frozen=True)
 class ModelConfig:
