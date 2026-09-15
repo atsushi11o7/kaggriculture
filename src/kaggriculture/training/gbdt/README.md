@@ -24,11 +24,32 @@ uv run python -m kaggriculture.training.gbdt.train \
 各decisionをquery groupとし、合法候補を行、expertが選んだ候補をrelevance 1として
 `unit_op`、`market_op`、`quantity`の3 rankerを学習します。分割はターン単位ではなく
 試合単位です。データ条件とゲーム規則からcache名を決めるため、条件を変えても古いcacheを
-誤利用しません。
+誤利用しません。候補行は種別ごとのバイナリへ逐次保存し、学習時はmemmapと
+LightGBM `Sequence`から読みます。全行をNumPy配列へ連結しません。
 変換の正常件数・破棄件数・理由別件数は、実験出力の`data_summary.json`へ保存します。
+
+数量候補は学習時だけ既定16件へ削減します。expert数量、1、最大数量、expert近傍、
+対数間隔の代表値を必ず含む決定論的な負例選択です。推論時の候補は削減せず、
+従来どおり合法な全数量を採点します。全件が既定なので、小規模確認には
+`data.num_episodes=32`などを明示してください。cacheは生特徴量のためディスク容量を使います。
 
 GBDTの表形式特徴には現在の局面、候補のop/item/quantity、移動先タイル、対象在庫、価格を
 含めます。これはTransformerの埋め込みとは独立した教師用特徴です。
+
+### market_opのquery重み付け
+
+`market_op`はSTOP/HIREだけで全決定の過半数を占め、素のLambdaRankだと比較勾配がそこへ
+支配され、BUY_SEED/BUY_LAND/BUY_ANIMAL/BUY_PRODUCTのような出現頻度は低いが決定的に
+重要な行動をほぼ選べなくなります(実際に自己対戦で種を一度も購入せず資金が尽きる問題を
+確認しました)。そのため`build_ranking_files`/`build_ranking_data`は、正解opの出現頻度の
+平方根に反比例するquery重みを計算し(完全な逆頻度だと出現数十件のクラスが極端な重みに
+なるため`[0.25, 8.0]`にクリップし、平均が1.0になるよう正規化)、同じqueryに属する全候補
+行へ同じ重みを与えます。`unit_op`は対象外です(移動方向の低精度は多数派崩壊ではなく
+位置依存の難しさが原因)。`quantity`も対象外です(離散クラスを持たない)。
+
+学習後、`market_op`だけクラス別top1精度・macro精度・予測分布を`class_report.json`へ
+保存し、ログにも出力します。全体top1はSTOP/HIREの高精度に隠れるため、少数派クラスの
+実際の性能はこちらで確認してください。
 
 現在のPyPI LightGBM wheelにはCUDA learnerが含まれないため、GBDT学習と推論はCPUです。
 `model.n_jobs=4`で全コア占有を避けます。大量計算の中心となる蒸留BCとPPOはJAX/GPUで
@@ -55,7 +76,7 @@ shadow state更新・決定順を使います。方策内部のgeneratorや状�
 生成ファイルはKaggle episode JSONなので、既存JAX BCへそのまま渡せます。
 
 ```bash
-uv run python -m kaggriculture.training.bc.train_jax \
+uv run python -m kaggriculture.training.bc.train \
   experiment.name=gbdt_distillation \
   data.data_dir=data/replays/gbdt-generated \
   data.num_episodes=null

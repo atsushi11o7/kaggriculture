@@ -65,6 +65,28 @@ FEATURE_NAMES = CONTEXT_NAMES + CANDIDATE_NAMES + RESULT_NAMES
 
 _MOVES = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
 
+# market_opの行1本から、どのop名(STOP/HIRE/BUY_SEED等)の候補かを復元するための
+# 逆引き表。候補IDそのものは特徴量へ残していないが、one-hotフラグから一意に
+# 復元できるので、RankingData(features/labels)だけでクラス別の評価ができる。
+MARKET_OP_CLASS_NAMES = (*C.MARKET_OP_NAMES, "WAIT", "STOP")
+_MARKET_OP_FLAG_INDICES = tuple(
+    FEATURE_NAMES.index(f"market_op_{name}") for name in C.MARKET_OP_NAMES
+)
+_MARKET_WAIT_INDEX = FEATURE_NAMES.index("market_wait")
+_MARKET_STOP_INDEX = FEATURE_NAMES.index("market_stop")
+
+
+def classify_market_op_row(row: np.ndarray) -> str:
+    """market_op特徴行1本から、対応するop名(MARKET_OP_CLASS_NAMESの要素)を返す。"""
+    if row[_MARKET_WAIT_INDEX]:
+        return "WAIT"
+    if row[_MARKET_STOP_INDEX]:
+        return "STOP"
+    for name, index in zip(C.MARKET_OP_NAMES, _MARKET_OP_FLAG_INDICES, strict=True):
+        if row[index]:
+            return name
+    raise ValueError("row does not encode a recognizable market_op candidate")
+
 
 def context_features(
     obs: dict, env, slot_kind: str, position: int, board_position: int, total_days: int = 30
