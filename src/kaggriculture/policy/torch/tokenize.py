@@ -330,6 +330,27 @@ def get_encoder_input(
     return tokens
 
 
+def get_unit_inventory_input(obs: dict) -> list[V.SparseVector]:
+    """farmer+全hands、各unit自身が運んでいるinventoryを1トークンずつ返す。
+
+    `get_encoder_input`の`_encode_inventory_sum`は全unit合計なので、方策は
+    「どのhandが何を持っているか」を区別できない。JAX側の
+    `encode_unit_inventories`と同じ符号化(マーカー無し)で、
+    `N_UNIT_SLOTS`個(未使用slotは空)を返す。位置はmodel側で別途加える。
+    """
+    from kaggriculture.policy.torch.model import N_UNIT_SLOTS
+
+    private = obs["private"]
+    tokens: list[V.SparseVector] = []
+    for inventory in private["inventories"]:
+        sv = V.SparseVector()
+        _add_shed_item_counts(sv, inventory)
+        tokens.append(sv)
+    while len(tokens) < N_UNIT_SLOTS:
+        tokens.append(V.SparseVector())
+    return tokens
+
+
 def get_privileged_critic_input(
     obs: dict, opponent_private: dict
 ) -> tuple[list[V.SparseVector], list[int], list[bool]]:

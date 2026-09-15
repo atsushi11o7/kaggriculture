@@ -1,336 +1,159 @@
-"""代替PyTorch BC(Behavior Cloning)学習ループ。
+"""大量リプレイ対応のparallel JAX BC学習入口。"""
 
-`uv run python -m kaggriculture.training.bc.train`で起動する。設定は
-`training/conf/bc.yaml`(Hydra)。ログ・checkpointはHydraのrun dir(`outputs/`配下、
-gitignore対象)にまとめる。
-"""
+from __future__ import annotations
 
 import logging
 import random
+from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 
 import hydra
-import torch
+import jax
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
-from kaggriculture.policy.common.config import ModelConfig
-from kaggriculture.policy.torch import distribution as D
-from kaggriculture.policy.torch import model as M
-from kaggriculture.rules import constants as C
-from kaggriculture.training.bc.dataset import ReplayActionDataset
-from kaggriculture.training.bc.objective import mean_token_nll
+from kaggriculture.policy.common.config import (
+    ModelConfig,
+    checkpoint_shape_metadata,
+    validate_checkpoint_metadata,
+)
+from kaggriculture.policy.jax import model as M
+from kaggriculture.policy.jax import policy as P
+from kaggriculture.training.bc import core
+from kaggriculture.training.bc.cache import iter_batches, prepare_episodes
+from kaggriculture.training.checkpoint import (
+    load_checkpoint,
+    read_checkpoint_metadata,
+    save_checkpoint,
+)
 from kaggriculture.training.replays import (
-    filter_episodes_by_agent_score,
     list_episode_files,
-    load_rating_manifest,
+    load_selected_sources,
     split_episode_files,
 )
+from kaggriculture.training.replays.state import CacheRules
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_config(cfg: DictConfig) -> None:
-    """早い段階で、Hydra設定の矛盾と危険な値を検出する。"""
-    if not 0 <= cfg.data.val_fraction < 1:
-        raise ValueError("data.val_fraction must be in [0, 1)")
-    if cfg.data.num_episodes is not None and cfg.data.num_episodes <= 0:
-        raise ValueError("data.num_episodes must be positive or null")
-    if cfg.data.turns_per_day <= 0 or cfg.data.shed_capacity <= 0:
-        raise ValueError("turns_per_day and shed_capacity must be positive")
-    if not 1 <= cfg.data.max_market_orders <= C.MAX_MARKET_ORDERS:
-        raise ValueError(f"max_market_orders must be in [1, {C.MAX_MARKET_ORDERS}]")
-    if cfg.data.hire_mult < 0:
-        raise ValueError("data.hire_mult must be non-negative")
-    if (
-        cfg.data.min_avg_agent_score is not None or cfg.data.min_agent_score is not None
-    ) and cfg.data.manifest_dir is None:
-        raise ValueError("score thresholds require data.manifest_dir")
-    _model_config(cfg)
-    if cfg.model.use_episode_history:
-        raise ValueError(
-            "BC replay counters are not implemented; use_episode_history must be false"
-        )
-    if cfg.model.use_asymmetric_critic:
-        raise ValueError("BC does not train a critic; use_asymmetric_critic must be false")
-    for name in (
-        "batch_size",
-        "max_epochs",
-        "log_interval",
-        "val_interval",
-        "val_batches",
-        "checkpoint_interval",
-    ):
-        if cfg.train[name] <= 0:
-            raise ValueError(f"train.{name} must be positive")
-    if cfg.train.num_workers < 0:
-        raise ValueError("train.num_workers must be non-negative")
-    if cfg.train.lr <= 0 or cfg.train.weight_decay < 0 or cfg.train.grad_clip_norm <= 0:
-        raise ValueError(
-            "lr and grad_clip_norm must be positive; weight_decay must be non-negative"
-        )
-    if cfg.train.init_checkpoint is not None and cfg.train.init_weights is not None:
-        raise ValueError("specify at most one of train.init_checkpoint / train.init_weights")
+def _restored_best(metadata: dict) -> float:
+    """再開元checkpointのvalidation値をbest判定へ引き継ぐ。"""
+    validation = metadata.get("best_validation_loss", metadata.get("validation_loss"))
+    return float(validation) if validation is not None else float("inf")
 
 
-def _model_config(cfg: DictConfig) -> ModelConfig:
-    """解決済みHydra model節をbackend共通の構成型へ変換する。"""
-    values = OmegaConf.to_container(cfg.model, resolve=True)
-    if not isinstance(values, dict):
-        raise TypeError("model config must be a mapping")
-    return ModelConfig(**values)
+def _sources(cfg):
+    if cfg.data.selection_dir:
+        directory = Path(to_absolute_path(cfg.data.selection_dir))
+        train = load_selected_sources(directory, "train")
+        validation = load_selected_sources(directory, "validation")
+        if cfg.data.num_episodes is not None:
+            rng = random.Random(cfg.data.split_seed)
+            rng.shuffle(train)
+            train = train[: cfg.data.num_episodes]
+        return train, validation
+    files = list_episode_files(Path(to_absolute_path(cfg.data.data_dir)))
+    random.Random(cfg.data.split_seed).shuffle(files)
+    if cfg.data.num_episodes is not None:
+        files = files[: cfg.data.num_episodes]
+    return split_episode_files(files, cfg.data.val_fraction, cfg.data.split_seed)
 
 
-def _collate_pairs(batch: list[tuple[dict, dict]]) -> list[tuple[dict, dict]]:
-    """(観測, 行動)は可変長の辞書なので、tensorへcollateせずそのまま束ねる。"""
-    return batch
-
-
-def _resolve_device(name: str) -> torch.device:
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
-
-
-def _make_loader(dataset: ReplayActionDataset, cfg: DictConfig) -> DataLoader:
-    # CUDA初期化後のforkは安全でないため、workerはspawnで起動する。
-    multiprocessing_context = "spawn" if cfg.train.num_workers > 0 else None
-    return DataLoader(
-        dataset,
-        batch_size=cfg.train.batch_size,
-        num_workers=cfg.train.num_workers,
-        collate_fn=_collate_pairs,
-        multiprocessing_context=multiprocessing_context,
-    )
-
-
-def _run_validation(
-    net: M.PolicyValueNet, val_loader: DataLoader, cfg: DictConfig, max_batches: int
-) -> float | None:
-    """val setの一部で平均token NLLを計算する。valが空ならNoneを返す。"""
-    was_training = net.training
-    net.eval()
-    total_nll = 0.0
-    total_decisions = 0
-    data_kwargs = {
-        "turns_per_day": cfg.data.turns_per_day,
-        "shed_capacity": cfg.data.shed_capacity,
-        "hire_mult": cfg.data.hire_mult,
-        "max_market_orders": cfg.data.max_market_orders,
+def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best):
+    """step_<n>を保存し、validationがこれまでの最良ならbestも更新する。"""
+    validation = _validate(model, state.params, validation_paths, cfg, bc_config)
+    improved = validation is not None and validation < best
+    updated_best = validation if improved else best
+    metadata = {
+        **checkpoint_shape_metadata(),
+        "trainer": "bc",
+        "step": step,
+        "epoch": epoch,
+        "validation_loss": validation,
+        "best_validation_loss": None if updated_best == float("inf") else updated_best,
+        "model_config": asdict(model_config),
+        "config": OmegaConf.to_container(cfg, resolve=True),
     }
-    try:
-        with torch.no_grad():
-            for i, batch in enumerate(val_loader):
-                if i >= max_batches:
-                    break
-                log_probs, _entropies, num_decisions = D.evaluate_policy_batch(
-                    net, batch, **data_kwargs
-                )
-                total_nll += float(-log_probs.sum().item())
-                total_decisions += sum(num_decisions)
-    finally:
-        net.train(was_training)
-    if total_decisions == 0:
-        return None
-    return total_nll / total_decisions
+    directory = Path("checkpoints") / f"step_{step}"
+    save_checkpoint(directory, state, metadata)
+    if improved:
+        save_checkpoint(Path("checkpoints/best"), state, metadata)
+    return updated_best
 
 
-def _save_checkpoint(
-    net: M.PolicyValueNet,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    checkpoint_dir: Path,
-    config: dict | None = None,
-    keep_last: int = 0,
-) -> None:
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    path = checkpoint_dir / f"step_{step}.pt"
-    torch.save(
-        {
-            "model_state_dict": net.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "step": step,
-            "config": config,
-        },
-        path,
-    )
-    logger.info("saved checkpoint: %s", path)
-    if keep_last > 0:
-        _prune_checkpoints(checkpoint_dir, keep_last)
-
-
-def _prune_checkpoints(checkpoint_dir: Path, keep_last: int) -> None:
-    """`step_<n>.pt`をstep番号順に並べ、直近keep_last件だけ残して残りを削除する。
-
-    checkpointは1件あたりモデル+optimizer state(Adamはmomentを2つ持つため実質
-    モデルの3倍程度)なので、長時間学習すると際限なく増える。checkpoint_interval
-    ごとの保存はそのままに、ディスク使用量だけ抑える。
-    """
-    checkpoints = sorted(
-        checkpoint_dir.glob("step_*.pt"),
-        key=lambda p: int(p.stem.removeprefix("step_")),
-    )
-    for path in checkpoints[:-keep_last]:
-        path.unlink()
-        logger.info("removed old checkpoint: %s", path)
-
-
-def _load_checkpoint(
-    net: M.PolicyValueNet,
-    optimizer: torch.optim.Optimizer,
-    path: Path,
-    device: torch.device,
-) -> int:
-    """_save_checkpoint形式のcheckpointから重み・optimizer状態を読み込み、続きから
-    学習するためのstepを返す。"""
-    ckpt = torch.load(path, map_location=device)
-    net.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    step = ckpt["step"]
-    logger.info("resumed from checkpoint: %s (step=%d)", path, step)
-    return step
-
-
-def _load_initial_weights(net: M.PolicyValueNet, path: Path, device: torch.device) -> None:
-    """checkpointから重みだけを読み込む(optimizer state・stepは引き継がない)。
-
-    再開(_load_checkpoint)とは別物で、別データセットでのfine-tuning用途を想定する
-    (例: 大量データでBCした後、稼いだ額の多いエピソードだけに絞って続けて学習する)。
-    optimizerのAdam moment推定は元の分布に対するものなので引き継がず、stepも0から
-    数え直す。
-    """
-    ckpt = torch.load(path, map_location=device)
-    net.load_state_dict(ckpt["model_state_dict"])
-    logger.info("loaded initial weights from: %s (checkpoint step=%s)", path, ckpt.get("step"))
+def _validate(model, params, paths, cfg, bc_config):
+    total = tokens = 0.0
+    batches = iter_batches(paths, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
+    for batch in islice(batches, cfg.train.validation_batches):
+        loss, count = core.evaluate_minibatch(model, params, jax.device_put(batch), bc_config)
+        loss, count = jax.device_get((loss, count))
+        total += float(loss * count)
+        tokens += float(count)
+    return total / tokens if tokens else None
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="bc")
 def main(cfg: DictConfig) -> None:
-    _validate_config(cfg)
-    torch.manual_seed(cfg.train.seed)
-    device = _resolve_device(cfg.train.device)
-    logger.info("device: %s", device)
-
-    data_kwargs = {
-        "turns_per_day": cfg.data.turns_per_day,
-        "shed_capacity": cfg.data.shed_capacity,
-        "hire_mult": cfg.data.hire_mult,
-        "max_market_orders": cfg.data.max_market_orders,
-    }
-    cache_dir = (
-        Path(to_absolute_path(cfg.data.cache_dir)) if cfg.data.cache_dir is not None else None
+    model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
+    if model_config.use_asymmetric_critic:
+        raise ValueError("BC trains actor only; use_asymmetric_critic must be false")
+    train_sources, validation_sources = _sources(cfg)
+    rules = CacheRules(
+        turns_per_day=cfg.rules.turns_per_day,
+        shed_capacity=cfg.rules.shed_capacity,
+        hire_mult=cfg.rules.hire_mult,
+        max_market_orders=cfg.rules.max_market_orders,
+        min_player_reward=cfg.data.min_player_reward,
     )
-    dataset_kwargs = {
-        **data_kwargs,
-        "min_player_reward": cfg.data.min_player_reward,
-        "cache_dir": cache_dir,
-        "validate_normalized": cfg.data.validate_normalized,
-    }
-
-    # hydra.job.chdir=trueによりcwdがrun dirへ変わるため、data_dirは元のcwd基準の
-    # 絶対パスへ解決してから使う。
-    data_dir = Path(to_absolute_path(cfg.data.data_dir))
-    episode_files = list_episode_files(data_dir)
-    if cfg.data.manifest_dir is not None:
-        manifest_dir = Path(to_absolute_path(cfg.data.manifest_dir))
-        manifest = load_rating_manifest(manifest_dir)
-        before = len(episode_files)
-        episode_files = filter_episodes_by_agent_score(
-            episode_files, manifest, cfg.data.min_avg_agent_score, cfg.data.min_agent_score
-        )
-        logger.info(
-            "score filter (manifest=%s): %d -> %d episodes",
-            manifest_dir,
-            before,
-            len(episode_files),
-        )
-    if cfg.data.num_episodes is not None:
-        random.Random(cfg.data.split_seed).shuffle(episode_files)
-        episode_files = episode_files[: cfg.data.num_episodes]
-    if not episode_files:
-        raise ValueError(f"no episode files found under {data_dir} (after filtering)")
-    train_files, val_files = split_episode_files(
-        episode_files, cfg.data.val_fraction, cfg.data.split_seed
+    cache = Path(to_absolute_path(cfg.data.cache_dir))
+    train_paths = prepare_episodes(train_sources, cache / "train", rules)
+    validation_paths = prepare_episodes(validation_sources, cache / "validation", rules)
+    model = M.PolicyValueNet(model_config)
+    variables = P.initialize(model, jax.random.key(cfg.train.seed))
+    bc_config = core.BCConfig(
+        cfg.train.learning_rate,
+        cfg.train.weight_decay,
+        cfg.train.max_grad_norm,
+        cfg.rules.turns_per_day,
+        cfg.rules.shed_capacity,
     )
-    if not train_files or (cfg.data.val_fraction > 0 and not val_files):
-        raise ValueError("not enough episodes for the requested train/validation split")
-    logger.info("episodes: %d train, %d val", len(train_files), len(val_files))
-
-    val_loader = _make_loader(ReplayActionDataset(val_files, **dataset_kwargs), cfg)
-
-    model_config = _model_config(cfg)
-    net = M.PolicyValueNet(model_config).to(device)
-    if cfg.train.init_weights is not None:
-        init_weights = Path(to_absolute_path(cfg.train.init_weights))
-        _load_initial_weights(net, init_weights, device)
-
-    optimizer = torch.optim.AdamW(
-        net.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
-    )
-    writer = SummaryWriter(log_dir=".")
-    checkpoint_dir = Path("checkpoints")
-
+    state = core.create_train_state(model, variables, bc_config)
     step = 0
-    if cfg.train.init_checkpoint is not None:
-        init_checkpoint = Path(to_absolute_path(cfg.train.init_checkpoint))
-        step = _load_checkpoint(net, optimizer, init_checkpoint, device)
-
-    resolved_config = OmegaConf.to_container(cfg, resolve=True)
-    initial_step = step
+    best = float("inf")
+    if cfg.train.resume_checkpoint:
+        directory = Path(to_absolute_path(cfg.train.resume_checkpoint))
+        metadata = read_checkpoint_metadata(directory)
+        validate_checkpoint_metadata(metadata)
+        state, _ = load_checkpoint(directory, state)
+        step = int(metadata["step"])
+        best = _restored_best(metadata)
+    last_saved_step = step
+    epoch = 0
     for epoch in range(cfg.train.max_epochs):
-        epoch_files = list(train_files)
-        random.Random(cfg.train.seed + epoch).shuffle(epoch_files)
-        train_loader = _make_loader(ReplayActionDataset(epoch_files, **dataset_kwargs), cfg)
-        for batch in train_loader:
-            if cfg.train.max_steps > 0 and step >= cfg.train.max_steps:
-                break
-            net.train()
-            optimizer.zero_grad(set_to_none=True)
-            log_probs, _entropies, num_decisions = D.evaluate_policy_batch(
-                net, batch, **data_kwargs
-            )
-            loss = mean_token_nll(log_probs, num_decisions)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), cfg.train.grad_clip_norm)
-            optimizer.step()
-            step += 1
-
-            if step % cfg.train.log_interval == 0:
-                logger.info("epoch %d step %d train_loss %.4f", epoch, step, loss.item())
-                writer.add_scalar("train/loss", loss.item(), step)
-
-            if step % cfg.train.val_interval == 0:
-                val_loss = _run_validation(net, val_loader, cfg, cfg.train.val_batches)
-                if val_loss is not None:
-                    logger.info("epoch %d step %d val_loss %.4f", epoch, step, val_loss)
-                    writer.add_scalar("val/loss", val_loss, step)
-
-            if step % cfg.train.checkpoint_interval == 0:
-                _save_checkpoint(
-                    net,
-                    optimizer,
-                    step,
-                    checkpoint_dir,
-                    resolved_config,
-                    cfg.train.keep_last_checkpoints,
-                )
-
-            if cfg.train.max_steps > 0 and step >= cfg.train.max_steps:
-                break
-        if cfg.train.max_steps > 0 and step >= cfg.train.max_steps:
-            break
-
-    already_at_target = cfg.train.max_steps > 0 and initial_step >= cfg.train.max_steps
-    if step == initial_step and not already_at_target:
-        writer.close()
-        raise ValueError("no training samples remained after applying data filters")
-    if step == 0 or step % cfg.train.checkpoint_interval != 0:
-        _save_checkpoint(
-            net, optimizer, step, checkpoint_dir, resolved_config, cfg.train.keep_last_checkpoints
+        batches = iter_batches(
+            train_paths,
+            cfg.train.batch_size,
+            seed=cfg.train.seed + epoch,
+            shuffle=True,
+            drop_last=True,
         )
-    writer.close()
+        for batch in batches:
+            if 0 < cfg.train.max_steps <= step:
+                break
+            state, (loss, _) = core.update_minibatch(model, state, jax.device_put(batch), bc_config)
+            step += 1
+            if step % cfg.train.log_interval == 0:
+                logger.info("epoch=%d step=%d loss=%.4f", epoch, step, float(jax.device_get(loss)))
+            if step % cfg.train.checkpoint_interval == 0:
+                best = _checkpoint(
+                    model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best
+                )
+                last_saved_step = step
+    # checkpoint_intervalの倍数で終わらなかった場合でも、最後の状態を必ず残す
+    # (PPOのtrain.pyと同じく、最終回は間隔に関わらず保存する)。
+    if step > last_saved_step:
+        _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""JAX方策とシミュレータを接続するGPU完結rollout収集。"""
+"""非自己回帰方策・Executor・シミュレータを結ぶGPU完結rollout。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from kaggriculture.policy.jax import distribution as D
 from kaggriculture.policy.jax import history as H
-from kaggriculture.policy.jax import model as M
+from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax import tokenize as T
+from kaggriculture.policy.jax.types import Intent
+from kaggriculture.simulator.action import Action
 from kaggriculture.simulator.reset import reset
 from kaggriculture.simulator.state import State
 from kaggriculture.simulator.step import step_batch_lockstep
@@ -21,8 +22,6 @@ from kaggriculture.training.ppo.core import PPOBatch, compute_gae, terminal_win_
 
 @dataclass(frozen=True)
 class RolloutConfig:
-    """rollout長とシミュレータの静的設定。"""
-
     horizon: int = 128
     board_size: int = 10
     turns_per_day: int = 24
@@ -35,28 +34,26 @@ class RolloutConfig:
     max_shop_instances: int = 8
     episode_steps: int = 720
     starting_money: float = 3000.0
-    temperature: float = 1.0
+    temperature: float = 0.8
 
 
 class Rollout(NamedTuple):
-    """時間軸先頭のPPO rollout。"""
-
     states: State
-    choices: jnp.ndarray
-    decision_mask: jnp.ndarray
-    token_log_prob: jnp.ndarray
-    log_prob: jnp.ndarray
+    intent: Intent
+    slot_mask: jnp.ndarray
+    slot_log_prob: jnp.ndarray
     value: jnp.ndarray
     rewards: jnp.ndarray
     dones: jnp.ndarray
-    num_decisions: jnp.ndarray
     counters: T.EpisodeCounters
+    executor_invalid: jnp.ndarray
+    executor_clamped: jnp.ndarray
     final_state: State
     final_counters: T.EpisodeCounters
     bootstrap_value: jnp.ndarray
 
 
-def _step_simulator(state: State, action, config: RolloutConfig):
+def _step(state, action, config):
     return step_batch_lockstep(
         state,
         action,
@@ -73,26 +70,17 @@ def _step_simulator(state: State, action, config: RolloutConfig):
     )
 
 
-@partial(jax.jit, static_argnums=(0, 3))
-def collect_rollout(
-    model: M.PolicyValueNet,
-    variables: dict,
-    cache_template: dict,
-    config: RolloutConfig,
-    initial_state: State,
-    initial_counters: T.EpisodeCounters,
-    key: jax.Array,
-) -> Rollout:
-    """方策生成・環境遷移・終端resetを1つの`lax.scan`で実行する。"""
+@partial(jax.jit, static_argnums=(0, 2))
+def collect_rollout(model, variables, config, initial_state, initial_counters, key):
+    """1回の方策forwardを含む環境stepを時間軸scanする。"""
     batch_size = initial_state.step.shape[0]
 
     def scan_step(carry, _):
         state, counters, rng = carry
         rng, action_key, reset_key = jax.random.split(rng, 3)
-        output = D.sample_self_play_actions(
+        output = P.sample_self_play_actions(
             model,
             variables,
-            cache_template,
             state,
             action_key,
             counters=counters if model.config.use_episode_history else None,
@@ -101,10 +89,10 @@ def collect_rollout(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
-        stepped_state, terminal_cash, done = _step_simulator(state, output.action, config)
-        reward = terminal_win_rewards(terminal_cash, done)
-        if model.config.use_episode_history:
-            updated_counters = H.update_counters(
+        stepped, cash, done = _step(state, output.action, config)
+        rewards = terminal_win_rewards(cash, done)
+        updated_counters = (
+            H.update_counters(
                 state,
                 output.action,
                 counters,
@@ -112,79 +100,198 @@ def collect_rollout(
                 shed_capacity=config.shed_capacity,
                 hire_mult=config.hire_mult,
             )
-        else:
-            updated_counters = counters
-        fresh_state = reset(
+            if model.config.use_episode_history
+            else counters
+        )
+        fresh = reset(
             reset_key,
             batch_size,
             board_size=config.board_size,
             starting_money=config.starting_money,
         )
-        # lockstep batchなので全局が同じターンで同時に終端へ到達する。
-        next_state = jax.lax.cond(done[0], lambda: fresh_state, lambda: stepped_state)
+        next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
         next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
         transition = (
             state,
-            output.choices,
-            output.decision_mask,
-            output.token_log_prob,
-            output.log_prob,
+            output.intent,
+            output.slot_mask,
+            output.slot_log_prob,
             output.value,
-            reward,
+            rewards,
             done,
-            output.num_decisions,
             counters,
+            output.stats.invalid_market,
+            output.stats.clamped_market_quantity,
         )
         return (next_state, next_counters, rng), transition
 
-    (final_state, final_counters, _), transitions = jax.lax.scan(
+    (final_state, final_counters, _), values = jax.lax.scan(
         scan_step, (initial_state, initial_counters, key), xs=None, length=config.horizon
     )
-    bootstrap_value = D.state_values(
+    bootstrap = P.state_values(
         model,
         variables,
         final_state,
         final_counters if model.config.use_episode_history else None,
-        turns_per_day=config.turns_per_day,
+        config.turns_per_day,
     )
-    return Rollout(*transitions, final_state, final_counters, bootstrap_value)
+    return Rollout(*values, final_state, final_counters, bootstrap)
 
 
-def to_ppo_batch(
-    rollout: Rollout,
-    gamma: float = 0.999,
-    gae_lambda: float = 0.95,
-) -> PPOBatch:
-    """`[time, env, player]` rolloutをPPO用の1次元sample軸へ変換する。"""
+def _stack_seats(seat0, seat1):
+    return jax.tree.map(lambda a, b: jnp.stack([a, b], axis=1), seat0, seat1)
+
+
+@partial(jax.jit, static_argnums=(0, 3, 4))
+def collect_rollout_vs_opponent(
+    model,
+    learner_variables,
+    opponent_variables,
+    learner_seat: int,
+    config,
+    initial_state,
+    initial_counters,
+    key,
+):
+    """learner_seat側だけlearner_variablesで行動し、もう片方は固定の
+    opponent_variablesで行動する。opponentは学習対象ではないため、
+    opponent側のslot_maskは常にFalseで書き出し、PPOの損失に一切寄与
+    させない(固定方策の行動をlearnerの現在paramsで評価するのは不整合
+    なため)。Rollout/PPOBatch/GAEの形状・計算はcollect_rolloutと共通の
+    まま流用できる(マスクされた行は損失への寄与が0になるだけ)。
+    """
+    batch_size = initial_state.step.shape[0]
+    opponent_seat = 1 - learner_seat
+    use_history = model.config.use_episode_history
+
+    def scan_step(carry, _):
+        state, counters, rng = carry
+        rng, learner_key, opponent_key, reset_key = jax.random.split(rng, 4)
+        learner_players = jnp.full((batch_size,), learner_seat, jnp.int32)
+        opponent_players = jnp.full((batch_size,), opponent_seat, jnp.int32)
+        learner_counters = counters[:, learner_seat] if use_history else None
+        opponent_counters = counters[:, opponent_seat] if use_history else None
+        learner_out = P.sample_actions(
+            model,
+            learner_variables,
+            state,
+            learner_players,
+            learner_key,
+            learner_counters,
+            temperature=config.temperature,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
+        )
+        opponent_out = P.sample_actions(
+            model,
+            opponent_variables,
+            state,
+            opponent_players,
+            opponent_key,
+            opponent_counters,
+            temperature=config.temperature,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
+        )
+        outputs = [None, None]
+        outputs[learner_seat] = learner_out
+        outputs[opponent_seat] = opponent_out
+        action = Action(
+            *(
+                jnp.stack([f0, f1], axis=1)
+                for f0, f1 in zip(outputs[0].action, outputs[1].action, strict=True)
+            )
+        )
+        stepped, cash, done = _step(state, action, config)
+        rewards = terminal_win_rewards(cash, done)
+        updated_counters = (
+            H.update_counters(
+                state,
+                action,
+                counters,
+                turns_per_day=config.turns_per_day,
+                shed_capacity=config.shed_capacity,
+                hire_mult=config.hire_mult,
+            )
+            if use_history
+            else counters
+        )
+        fresh = reset(
+            reset_key,
+            batch_size,
+            board_size=config.board_size,
+            starting_money=config.starting_money,
+        )
+        next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
+        next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
+        intent = _stack_seats(outputs[0].intent, outputs[1].intent)
+        slot_masks = [outputs[0].slot_mask, outputs[1].slot_mask]
+        slot_masks[opponent_seat] = jnp.zeros_like(slot_masks[opponent_seat])
+        slot_mask = jnp.stack(slot_masks, axis=1)
+        slot_log_prob = jnp.stack([outputs[0].slot_log_prob, outputs[1].slot_log_prob], axis=1)
+        value = jnp.stack([outputs[0].value, outputs[1].value], axis=1)
+        invalid = jnp.stack(
+            [outputs[0].stats.invalid_market, outputs[1].stats.invalid_market], axis=1
+        )
+        clamped = jnp.stack(
+            [outputs[0].stats.clamped_market_quantity, outputs[1].stats.clamped_market_quantity],
+            axis=1,
+        )
+        transition = (
+            state,
+            intent,
+            slot_mask,
+            slot_log_prob,
+            value,
+            rewards,
+            done,
+            counters,
+            invalid,
+            clamped,
+        )
+        return (next_state, next_counters, rng), transition
+
+    (final_state, final_counters, _), values = jax.lax.scan(
+        scan_step, (initial_state, initial_counters, key), xs=None, length=config.horizon
+    )
+    bootstrap = P.state_values(
+        model,
+        learner_variables,
+        final_state,
+        final_counters if use_history else None,
+        config.turns_per_day,
+    )
+    return Rollout(*values, final_state, final_counters, bootstrap)
+
+
+def to_ppo_batch(rollout: Rollout, gamma=0.999, gae_lambda=0.95):
     advantages, returns = compute_gae(
-        rollout.rewards,
-        rollout.value,
-        rollout.dones,
-        rollout.bootstrap_value,
-        gamma,
-        gae_lambda,
+        rollout.rewards, rollout.value, rollout.dones, rollout.bootstrap_value, gamma, gae_lambda
     )
     horizon, batch_size = rollout.dones.shape
-    sample_size = horizon * batch_size * 2
-
-    # 各Stateをplayer 0, 1の順に複製し、行動側の[B, 2]順と揃える。
+    samples = horizon * batch_size * 2
     states = jax.tree.map(
         lambda value: jnp.repeat(value[:, :, None], 2, axis=2).reshape(
-            (sample_size,) + value.shape[2:]
+            (samples,) + value.shape[2:]
         ),
         rollout.states,
     )
     players = jnp.broadcast_to(jnp.asarray([0, 1]), (horizon, batch_size, 2)).reshape(-1)
-    counters = jax.tree.map(lambda value: value.reshape(sample_size, -1), rollout.counters)
+
+    def flatten(value):
+        return value.reshape((samples,) + value.shape[3:])
+
+    counters = jax.tree.map(lambda value: value.reshape(samples, -1), rollout.counters)
     return PPOBatch(
-        states=states,
-        players=players,
-        choices=rollout.choices.reshape(sample_size, -1),
-        decision_mask=rollout.decision_mask.reshape(sample_size, -1),
-        old_token_log_prob=rollout.token_log_prob.reshape(sample_size, -1),
-        old_log_prob=rollout.log_prob.reshape(-1),
-        old_value=rollout.value.reshape(-1),
-        advantages=advantages.reshape(-1),
-        returns=returns.reshape(-1),
-        counters=counters,
+        states,
+        players,
+        jax.tree.map(flatten, rollout.intent),
+        flatten(rollout.slot_mask),
+        flatten(rollout.slot_log_prob),
+        rollout.value.reshape(-1),
+        advantages.reshape(-1),
+        returns.reshape(-1),
+        counters,
     )

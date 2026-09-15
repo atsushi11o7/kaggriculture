@@ -1,0 +1,80 @@
+"""非自己回帰JAX方策の固定shape・再評価契約。"""
+
+import jax
+import jax.numpy as jnp
+
+from kaggriculture.policy.common.config import ModelConfig
+from kaggriculture.policy.jax import model as M
+from kaggriculture.policy.jax import policy as P
+from kaggriculture.rules import constants as C
+from kaggriculture.simulator.reset import reset
+from kaggriculture.simulator.step import step_batch_lockstep
+
+
+def _model():
+    config = ModelConfig(16, 2, 32, 1, 1, 0.0, False, False, 1)
+    model = M.PolicyValueNet(config)
+    return model, P.initialize(model, jax.random.PRNGKey(0), batch_size=2)
+
+
+def test_policy_samples_and_re_evaluates() -> None:
+    model, variables = _model()
+    states = reset(jax.random.PRNGKey(1), 2)
+    players = jnp.asarray([0, 1], dtype=jnp.int32)
+    output = P.sample_actions(model, variables, states, players, jax.random.PRNGKey(2), greedy=True)
+    evaluated = P.evaluate_intent(model, variables, states, players, output.intent)
+
+    assert output.intent.unit.shape == (2, C.MAX_HANDS + 1)
+    assert output.intent.market.shape == (2, C.MAX_MARKET_ORDERS)
+    assert output.action.hands_op.shape == (2, C.MAX_HANDS)
+    assert jnp.allclose(evaluated.log_prob, output.log_prob, atol=1e-5)
+    assert jnp.allclose(evaluated.slot_log_prob, output.slot_log_prob, atol=1e-5)
+    assert jnp.allclose(evaluated.value, output.value, atol=1e-5)
+
+
+def test_unit_inventory_changes_the_encoded_query() -> None:
+    """own_inventoryは全unit合計なので、query側で各unit固有のinventoryを
+    別途注入していないと、farmer/hand毎にPLACE/DROP/SELL等の対象unitを
+    区別できない(レビューで指摘・修正した問題の回帰テスト)。"""
+    model, variables = _model()
+    base = reset(jax.random.PRNGKey(5), 1)  # batch=1、hands_active等は(1, 2, ...)
+    player = 0
+    hand_slot = 2  # unit index = hand_slot + 1 (0はfarmer)
+    active = base.hands_active.at[0, player, hand_slot].set(True)
+    base = base._replace(hands_active=active)
+    wheat = C.SHED_ITEMS.index("WHEAT")
+    with_item = base.hands_inventory.at[0, player, hand_slot, wheat].set(3)
+    empty = base
+    with_item_state = base._replace(hands_inventory=with_item)
+    players = jnp.asarray([player], jnp.int32)
+
+    def _queries(state):
+        encoded, positions, active_mask, _, inventory = P._inputs(state, players, None, 24)
+        queries, _ = model.apply(
+            variables,
+            encoded.index,
+            encoded.value,
+            positions,
+            active_mask,
+            inventory.index,
+            inventory.value,
+        )
+        return queries
+
+    queries_empty = _queries(empty)
+    queries_with_item = _queries(with_item_state)
+    assert not jnp.allclose(queries_empty, queries_with_item)
+
+
+def test_self_play_action_steps_simulator() -> None:
+    model, variables = _model()
+    states = reset(jax.random.PRNGKey(3), 2)
+    output = jax.jit(P.sample_self_play_actions, static_argnums=(0,))(
+        model, variables, states, jax.random.PRNGKey(4), greedy=True
+    )
+    next_state, _, _ = step_batch_lockstep(states, output.action)
+
+    assert output.action.farmer_op.shape == (2, 2)
+    assert output.intent.market.shape == (2, 2, C.MAX_MARKET_ORDERS)
+    assert output.value.shape == (2, 2)
+    assert next_state.step.tolist() == [1, 1]

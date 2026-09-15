@@ -6,6 +6,8 @@ data/はgitignore対象(AGENTS.md参照)のため、リポジトリには実際�
 act()/evaluate_actions()系のテストが完結するようにする。
 """
 
+from __future__ import annotations
+
 from dataclasses import replace
 
 import pytest

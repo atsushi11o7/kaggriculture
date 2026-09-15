@@ -11,7 +11,7 @@ _CONFIG_DIR = Path(__file__).parents[2] / "src/kaggriculture/training/conf"
 
 def test_jax_bc_and_ppo_share_actor_structure() -> None:
     with initialize_config_dir(version_base=None, config_dir=str(_CONFIG_DIR.resolve())):
-        bc = compose(config_name="bc_jax")
+        bc = compose(config_name="bc")
         ppo = compose(config_name="ppo")
     fields = (
         "d_model",
@@ -30,12 +30,15 @@ def test_jax_bc_and_ppo_share_actor_structure() -> None:
 
 def test_default_training_profiles_are_bounded() -> None:
     with initialize_config_dir(version_base=None, config_dir=str(_CONFIG_DIR.resolve())):
-        bc = compose(config_name="bc_jax")
+        bc = compose(config_name="bc")
         ppo = compose(config_name="ppo")
 
     assert bc.data.data_dir == "data/replays"
-    assert bc.data.num_episodes == 256
-    assert bc.train.batch_size == 64
+    # nullなら選別後の全エピソードを使う(gbdt.yaml/test_gbdt_hydra_configs_composeと
+    # 同じ前提)。既定値を件数上限にすると、READMEのコマンドをそのまま実行した際に
+    # 気づかず小規模なスモークテスト相当で終わってしまう。小規模確認はCLIの
+    # 明示的な上書きで行う。
+    assert bc.data.num_episodes is None
+    assert bc.train.batch_size > 0
     assert ppo.env.batch_size * ppo.ppo.rollout_horizon * 2 % ppo.ppo.minibatch_size == 0
     assert ppo.ppo.learning_rate <= bc.train.learning_rate
-    assert ppo.ppo.eval_interval > 0

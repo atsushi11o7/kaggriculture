@@ -6,7 +6,7 @@ Kaggleリプレイをプレイヤー単位で解析し、再現可能なBC用man
 uv run python -m kaggriculture.training.replay_curation.select \
   experiment.name=broad_winners
 
-uv run python -m kaggriculture.training.bc.train_jax \
+uv run python -m kaggriculture.training.bc.train \
   data.selection_dir=data/training_sets/broad_winners
 ```
 

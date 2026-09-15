@@ -12,34 +12,18 @@ hydra:
     chdir: true
   run:
     dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  sweep:
-    dir: outputs/${hydra.job.name}/${experiment.name}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
-    subdir: ${hydra.job.num}
 
-# Actor構造はmodel/default.yamlと共有し、PPOだけcriticを追加する。
 model:
   use_asymmetric_critic: true
 
 env:
-  batch_size: 64
-  board_size: ${rules.board_size}
-  turns_per_day: ${rules.turns_per_day}
-  shed_capacity: ${rules.shed_capacity}
-  weed_chance: ${rules.weed_chance}
-  shop_unlock_interval: ${rules.shop_unlock_interval}
-  shop_sell_interval: ${rules.shop_sell_interval}
-  center_sell_interval: ${rules.center_sell_interval}
-  hire_mult: ${rules.hire_mult}
-  max_shop_instances: ${rules.max_shop_instances}
-  episode_steps: ${rules.episode_steps}
-  starting_money: ${rules.starting_money}
+  batch_size: 128
 
 ppo:
   total_updates: 1000
   rollout_horizon: 128
   update_epochs: 4
   minibatch_size: 256
-  # BCからfine-tuningする初期値。スクラッチ学習では別途比較する。
   learning_rate: 1.0e-4
   weight_decay: 0.0
   gamma: 0.999
@@ -50,19 +34,22 @@ ppo:
   entropy_coef: 0.01
   max_grad_norm: 1.0
   temperature: 0.8
-  # "token"は長い複合行動でclip飽和しにくい。理論上のjoint比率も選択可能。
-  ratio_mode: token
   seed: 0
-  log_interval: 10
+  log_interval: 1
   checkpoint_interval: 50
+  # step_*だけ古い順に削除する(best/poolは対象外)。0以下で無効。
   keep_last_checkpoints: 5
-  # 更新開始時の固定方策を相手に、教師なしで終端まで自走評価する。0なら無効。
-  eval_interval: 50
-  # 各相手について両席でこの局数ずつ評価する。
-  eval_episodes: 32
-  # 追加のJAX PPO checkpoint。開始時の固定方策は常に評価相手へ含まれる。
-  eval_opponent_checkpoints: []
-  # JAX BC directoryまたは旧PyTorch BC fileからactorだけを初期化する。
   init_bc_checkpoint: null
-  # JAX PPO checkpointからoptimizerを含めて再開する。init_bc_checkpointとは排他。
   resume_checkpoint: null
+  # このupdate間隔でcandidateをchekcpoints/best/と対戦させ、昇格判定を行う。0以下で無効。
+  eval_interval: 50
+  eval_episodes: 32
+  # 昇格に必要な勝率(24位のPokemon TCGソリューションと同じ値)。
+  promotion_win_rate: 0.52
+  # 昇格したcandidateを追加保存するpopulation-based self-play用の対戦相手プール。
+  # checkpoints/配下の相対名(実行ディレクトリ内に閉じる。絶対パス化すると
+  # 実行間で共有される固定パスになり、別runのpool対戦相手が混ざってしまう)。
+  pool_dir: pool
+  pool_size: 5
+  # 各updateでpoolの相手と対戦させる確率(pool_dirが空なら常に自己対戦)。
+  pool_sample_prob: 0.5

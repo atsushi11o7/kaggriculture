@@ -9,8 +9,25 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 
-from kaggriculture.training.gbdt.dataset import RankingData
+from kaggriculture.training.gbdt.dataset import RankingData, RankingFiles, open_ranking_data
 from kaggriculture.training.gbdt.features import FEATURE_NAMES, FEATURE_VERSION
+
+
+class _MappedSequence(lgb.Sequence):
+    """LightGBMのDataset構築時にmemmapから必要な行だけ読む。"""
+
+    batch_size = 8192
+
+    def __init__(self, features: np.ndarray):
+        self.features = features
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    def __getitem__(self, index):
+        values = np.asarray(self.features[index])
+        # LightGBMのcolumn samplingは単一行をfloat64で要求する。
+        return values.astype(np.float64) if isinstance(index, (int, np.integer)) else values
 
 
 @dataclass(frozen=True)
@@ -39,9 +56,9 @@ class GBDTRanker:
     @classmethod
     def fit(
         cls,
-        datasets: dict[str, RankingData],
+        datasets: dict[str, RankingData] | RankingFiles,
         config: RankerConfig,
-        validation: dict[str, RankingData] | None = None,
+        validation: dict[str, RankingData] | RankingFiles | None = None,
     ) -> GBDTRanker:
         """正解候補をrelevance 1とするLambdaRankを学習する。"""
         models = {}
@@ -60,23 +77,45 @@ class GBDTRanker:
             "num_threads": config.n_jobs,
             "verbosity": -1,
         }
-        for kind, data in datasets.items():
+        kinds = (
+            [kind for kind, info in datasets.kinds.items() if info["rows"]]
+            if isinstance(datasets, RankingFiles)
+            else list(datasets)
+        )
+        for kind in kinds:
+            data = (
+                open_ranking_data(datasets, kind)
+                if isinstance(datasets, RankingFiles)
+                else datasets[kind]
+            )
             dataset = lgb.Dataset(
-                data.features,
+                _MappedSequence(data.features)
+                if isinstance(datasets, RankingFiles)
+                else data.features,
                 label=data.labels,
                 group=data.groups,
+                weight=data.weights,
                 feature_name=list(FEATURE_NAMES),
-                free_raw_data=False,
+                free_raw_data=True,
             )
-            valid = validation.get(kind) if validation is not None else None
+            valid = (
+                open_ranking_data(validation, kind)
+                if isinstance(validation, RankingFiles) and validation.kinds[kind]["rows"]
+                else validation.get(kind)
+                if isinstance(validation, dict)
+                else None
+            )
             valid_sets = None
             callbacks = None
             if valid is not None:
                 valid_sets = [
                     lgb.Dataset(
-                        valid.features,
+                        _MappedSequence(valid.features)
+                        if isinstance(validation, RankingFiles)
+                        else valid.features,
                         label=valid.labels,
                         group=valid.groups,
+                        weight=valid.weights,
                         reference=dataset,
                         feature_name=list(FEATURE_NAMES),
                     )
@@ -92,15 +131,102 @@ class GBDTRanker:
         return cls(models, config)
 
     def top1_accuracy(self, kind: str, data: RankingData) -> float:
-        """queryごとの最上位候補が教師選択と一致する割合を返す。"""
-        scores = self.score(kind, data.features)
+        """query境界で分割し、予測スコア全件をRAMへ置かずに評価する。"""
         correct = 0
         offset = 0
-        for size in data.groups:
-            end = offset + int(size)
-            correct += int(np.argmax(scores[offset:end]) == np.argmax(data.labels[offset:end]))
-            offset = end
-        return correct / len(data.groups)
+        groups = data.groups
+        group_index = 0
+        while group_index < len(groups):
+            start = offset
+            end_group = group_index
+            while end_group < len(groups) and offset - start < 100_000:
+                offset += int(groups[end_group])
+                end_group += 1
+            scores = self.score(kind, data.features[start:offset])
+            relative = 0
+            for size in groups[group_index:end_group]:
+                end = relative + int(size)
+                correct += int(
+                    np.argmax(scores[relative:end])
+                    == np.argmax(data.labels[start + relative : start + end])
+                )
+                relative = end
+            group_index = end_group
+        return correct / len(groups)
+
+    def class_top1_report(self, kind: str, data: RankingData) -> dict:
+        """market_op向け: クラス別top1精度・macro精度・予測分布を返す。
+
+        全体top1(top1_accuracy)はSTOP/HIREのような多数派クラスの高精度に
+        隠れて、BUY_SEED等の少数派だが重要なクラスの性能が見えない。この
+        メソッドはRankingData(features/labels)だけから、期待した候補
+        (正解ラベル)とモデルの予測それぞれのop名をone-hot特徴から復元し、
+        クラスごとの精度・出現数・モデルが実際に選んだクラスの分布を返す。
+
+        精度は2種類計算する。`per_class_accuracy`(exact)は候補インデックスの
+        完全一致(top1_accuracyと同じ基準。作物まで一致が必要)、
+        `per_class_op_accuracy`(op)は復元したop名同士の一致だけを見る
+        (BUY_SEEDが正解でBUY_SEED(別の作物)を選んでも正解扱い)。opレベルは
+        「その種類の行動を選ぶという判断自体ができたか」を、exactは「候補の
+        細部まで正しいか」を見る。両方の値を混同しないよう分けて保持する。
+        """
+        from kaggriculture.training.gbdt.features import classify_market_op_row
+
+        exact_correct_by_class: dict[str, int] = {}
+        op_correct_by_class: dict[str, int] = {}
+        total_by_class: dict[str, int] = {}
+        predicted_by_class: dict[str, int] = {}
+        offset = 0
+        groups = data.groups
+        group_index = 0
+        while group_index < len(groups):
+            start = offset
+            end_group = group_index
+            while end_group < len(groups) and offset - start < 100_000:
+                offset += int(groups[end_group])
+                end_group += 1
+            scores = self.score(kind, data.features[start:offset])
+            relative = 0
+            for size in groups[group_index:end_group]:
+                size = int(size)
+                end = relative + size
+                group_scores = scores[relative:end]
+                group_labels = np.asarray(data.labels[start + relative : start + end])
+                group_rows = np.asarray(data.features[start + relative : start + end])
+                expert_index = int(np.argmax(group_labels))
+                predicted_index = int(np.argmax(group_scores))
+                expert_class = classify_market_op_row(group_rows[expert_index])
+                predicted_class = classify_market_op_row(group_rows[predicted_index])
+                total_by_class[expert_class] = total_by_class.get(expert_class, 0) + 1
+                if predicted_index == expert_index:
+                    exact_correct_by_class[expert_class] = (
+                        exact_correct_by_class.get(expert_class, 0) + 1
+                    )
+                if predicted_class == expert_class:
+                    op_correct_by_class[expert_class] = op_correct_by_class.get(expert_class, 0) + 1
+                predicted_by_class[predicted_class] = predicted_by_class.get(predicted_class, 0) + 1
+                relative = end
+            group_index = end_group
+        per_class_accuracy = {
+            cls: exact_correct_by_class.get(cls, 0) / total for cls, total in total_by_class.items()
+        }
+        per_class_op_accuracy = {
+            cls: op_correct_by_class.get(cls, 0) / total for cls, total in total_by_class.items()
+        }
+        macro_accuracy = (
+            float(np.mean(list(per_class_accuracy.values()))) if per_class_accuracy else 0.0
+        )
+        macro_op_accuracy = (
+            float(np.mean(list(per_class_op_accuracy.values()))) if per_class_op_accuracy else 0.0
+        )
+        return {
+            "per_class_accuracy": per_class_accuracy,
+            "per_class_op_accuracy": per_class_op_accuracy,
+            "per_class_count": total_by_class,
+            "macro_accuracy": macro_accuracy,
+            "macro_op_accuracy": macro_op_accuracy,
+            "predicted_distribution": predicted_by_class,
+        }
 
     def score(self, kind: str, features: np.ndarray) -> np.ndarray:
         """同一query内の各合法候補へ順位スコアを返す。"""

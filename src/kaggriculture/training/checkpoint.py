@@ -27,9 +27,15 @@ def save_checkpoint(
     metadata_tmp.replace(directory / "metadata.json")
 
 
+def read_checkpoint_metadata(directory: Path) -> dict:
+    """重いstate復元を行わずcheckpoint metadataだけを読む。"""
+    return json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+
+
 def load_checkpoint(directory: Path, target: TrainState) -> tuple[TrainState, dict]:
     """初期化済みtargetへcheckpointを復元する。"""
     restored = serialization.from_bytes(target, (directory / "state.msgpack").read_bytes())
+    metadata = read_checkpoint_metadata(directory)
     # msgpack復元はNumPy配列を返す。そのままJIT内でindexすると
     # TracerArrayConversionErrorになるため、学習状態の配列leafをdeviceへ戻す。
     restored = restored.replace(
@@ -37,7 +43,6 @@ def load_checkpoint(directory: Path, target: TrainState) -> tuple[TrainState, di
         params=jax.tree.map(jnp.asarray, restored.params),
         opt_state=jax.tree.map(jnp.asarray, restored.opt_state),
     )
-    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     return restored, metadata
 
 
