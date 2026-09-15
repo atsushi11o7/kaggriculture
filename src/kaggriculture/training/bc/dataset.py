@@ -1,130 +1,152 @@
-"""PyTorch BC用のストリーミングリプレイデータセット。
+"""正規化済みリプレイを非自己回帰方策の固定slot教師へ変換する。"""
 
-`data/replays/`(gitignore対象、AGENTS.md参照)配下のエピソードJSONから
-(観測, expert行動)の組をストリーミングで取り出す。生リプレイには
-`distribution.validate_policy_action`がValueErrorにする無効な注文
-(在庫0へのSELL、上限超過の数量等)が含まれるため、
-`distribution.normalize_expert_action`で正規化してから最終確認する
-(policy/README.mdの「BC用リプレイの入力契約」参照)。
-"""
+from __future__ import annotations
 
-import gzip
-import hashlib
-import json
-import logging
-import os
-from collections.abc import Iterator
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
-import torch.utils.data
+import numpy as np
 
-from kaggriculture.policy.torch import distribution as D
+from kaggriculture.policy.jax import actions as A
+from kaggriculture.policy.jax.types import Intent
 from kaggriculture.rules import constants as C
+from kaggriculture.simulator.state import State
 from kaggriculture.training.replays.io import iter_replay_samples
-
-logger = logging.getLogger(__name__)
-_CACHE_VERSION = 1
+from kaggriculture.training.replays.state import CacheRules, observation_to_state
 
 
-class ReplayActionDataset(torch.utils.data.IterableDataset):
-    """エピソードファイル群から、正規化・検証済みの(観測, 行動)をyieldする。
+class BCBatch(NamedTuple):
+    states: State
+    players: np.ndarray
+    intent: Intent
+    slot_mask: np.ndarray
 
-    複数DataLoader workerがある場合、エピソード単位で分担する(1エピソード内の
-    ターンを複数workerで分けたりはしない)。
-    """
 
-    def __init__(
-        self,
-        episode_files: list[Path],
-        turns_per_day: int = 24,
-        shed_capacity: int = 100,
-        hire_mult: float = 1,
-        max_market_orders: int = C.MAX_MARKET_ORDERS,
-        min_player_reward: float | None = None,
-        cache_dir: Path | None = None,
-        validate_normalized: bool = False,
-    ) -> None:
-        self.episode_files = episode_files
-        self.turns_per_day = turns_per_day
-        self.shed_capacity = shed_capacity
-        self.hire_mult = hire_mult
-        self.max_market_orders = max_market_orders
-        self.min_player_reward = min_player_reward
-        self.cache_dir = cache_dir
-        self.validate_normalized = validate_normalized
+@dataclass
+class BuildStats:
+    accepted: int = 0
+    discarded: int = 0
+    reasons: Counter[str] = field(default_factory=Counter)
 
-    def _kwargs(self) -> dict:
-        return {
-            "turns_per_day": self.turns_per_day,
-            "shed_capacity": self.shed_capacity,
-            "hire_mult": self.hire_mult,
-            "max_market_orders": self.max_market_orders,
-        }
 
-    def _files_for_this_worker(self) -> list[Path]:
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            return self.episode_files
-        return self.episode_files[worker_info.id :: worker_info.num_workers]
+def _lookup(table) -> dict[tuple[int, int], int]:
+    return {
+        (int(op), int(arg)): index
+        for index, (op, arg) in enumerate(zip(table.op, table.arg, strict=True))
+    }
 
-    def _cache_path(self, episode_path: Path) -> Path | None:
-        if self.cache_dir is None:
-            return None
-        stat = episode_path.stat()
-        identity = (
-            str(episode_path.resolve()),
-            stat.st_size,
-            stat.st_mtime_ns,
-            self.turns_per_day,
-            self.shed_capacity,
-            self.hire_mult,
-            self.max_market_orders,
-            self.min_player_reward,
-            self.validate_normalized,
-            _CACHE_VERSION,
+
+_UNIT = _lookup(A.UNIT_CANDIDATES)
+_MARKET = _lookup(A.MARKET_CANDIDATES)
+_PASS = _UNIT[(C.FARMER_OP_PASS, -1)]
+_STOP = _MARKET[(A.MARKET_STOP, -1)]
+_WAIT = _MARKET[(A.MARKET_WAIT, -1)]
+
+
+def _unit(entry: list) -> tuple[int, int]:
+    op = C.FARMER_OP_NAMES.index(entry[0])
+    if op == C.FARMER_OP_PLANT:
+        arg = C.CROPS.index(entry[1])
+    elif op in (C.FARMER_OP_PICKUP, C.FARMER_OP_PLACE):
+        arg = C.SHED_ITEMS.index(entry[1])
+    else:
+        arg = -1
+    quantity = int(entry[2]) if len(entry) > 2 else 1
+    if not 1 <= quantity <= 100:
+        raise ValueError("invalid_quantity")
+    return _UNIT[(op, arg)], quantity - 1
+
+
+def _market(entry: list) -> tuple[int, int]:
+    if entry == ["SELL", "WHEAT", 0]:
+        return _WAIT, 0
+    op = C.MARKET_OP_NAMES.index(entry[0])
+    if op == C.MARKET_OP_BUY_SEED:
+        arg = C.CROPS.index(entry[1])
+    elif op == C.MARKET_OP_BUY_ANIMAL:
+        arg = C.ANIMALS.index(entry[1])
+    elif op in (C.MARKET_OP_BUY_PRODUCT, C.MARKET_OP_SELL):
+        arg = C.PRODUCTS.index(entry[1])
+    else:
+        arg = -1
+    quantity = int(entry[2]) if len(entry) > 2 else 1
+    if not 1 <= quantity <= 100:
+        raise ValueError("invalid_quantity")
+    return _MARKET[(op, arg)], quantity - 1
+
+
+def action_to_intent(obs: dict, action: dict, rules: CacheRules):
+    """expertを正規化し、全unit・市場10slotの教師indexへ変換する。"""
+    from kaggriculture.policy.torch.candidate_api import normalize_expert_action
+
+    normalized = normalize_expert_action(
+        obs,
+        action,
+        turns_per_day=rules.turns_per_day,
+        shed_capacity=rules.shed_capacity,
+        hire_mult=rules.hire_mult,
+        max_market_orders=rules.max_market_orders,
+    )
+    hands = obs["farms"][obs["player"]]["hands"]
+    if len(hands) > C.MAX_HANDS:
+        raise ValueError("too_many_hands")
+    unit = np.full(C.MAX_HANDS + 1, _PASS, np.int32)
+    unit_quantity = np.zeros(C.MAX_HANDS + 1, np.int32)
+    unit_mask = np.zeros(C.MAX_HANDS + 1, bool)
+    unit_mask[: len(hands) + 1] = True
+    for index, entry in enumerate([normalized["farmer"], *normalized["hands"]]):
+        unit[index], unit_quantity[index] = _unit(entry)
+    market = np.full(C.MAX_MARKET_ORDERS, _STOP, np.int32)
+    market_quantity = np.zeros(C.MAX_MARKET_ORDERS, np.int32)
+    market_mask = np.zeros(C.MAX_MARKET_ORDERS, bool)
+    for index, entry in enumerate(normalized["market"][: C.MAX_MARKET_ORDERS]):
+        market[index], market_quantity[index] = _market(entry)
+        market_mask[index] = True
+    if len(normalized["market"]) < C.MAX_MARKET_ORDERS:
+        market_mask[len(normalized["market"])] = True
+    return Intent(unit, unit_quantity, market, market_quantity), np.concatenate(
+        [unit_mask, market_mask]
+    )
+
+
+def iter_samples(sources, rules: CacheRules, stats: BuildStats):
+    """不正サンプルを理由別に集計して逐次変換する。"""
+    for item in sources:
+        path, selected_players = item if isinstance(item, tuple) else (item, None)
+        for obs, action in iter_replay_samples(
+            Path(path), rules.min_player_reward, set(selected_players) if selected_players else None
+        ):
+            try:
+                intent, mask = action_to_intent(obs, action, rules)
+                state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
+                stats.accepted += 1
+                yield state, int(obs["player"]), intent, mask
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                stats.discarded += 1
+                stats.reasons[type(error).__name__ + ":" + str(error)[:80]] += 1
+
+
+def stack_samples(samples) -> BCBatch:
+    samples = list(samples)
+    if not samples:
+        raise ValueError("empty BC batch")
+    states = State(
+        *(
+            np.stack([np.asarray(getattr(sample[0], name)) for sample in samples])
+            for name in State._fields
         )
-        digest = hashlib.sha256(repr(identity).encode()).hexdigest()
-        return self.cache_dir / f"{digest}.jsonl.gz"
-
-    def _normalized_samples(self, episode_path: Path) -> Iterator[tuple[dict, dict]]:
-        kwargs = self._kwargs()
-        for obs, action in iter_replay_samples(episode_path, self.min_player_reward):
-            try:
-                normalized = D.normalize_expert_action(obs, action, **kwargs)
-                if self.validate_normalized:
-                    D.validate_policy_action(obs, normalized, **kwargs)
-            except ValueError as error:
-                logger.warning("discarding unrepresentable sample from %s: %s", episode_path, error)
-                continue
-            yield obs, normalized
-
-    def _episode_samples(self, episode_path: Path) -> Iterator[tuple[dict, dict]]:
-        cache_path = self._cache_path(episode_path)
-        if cache_path is not None and cache_path.exists():
-            with gzip.open(cache_path, "rt", encoding="utf-8") as stream:
-                for line in stream:
-                    obs, action = json.loads(line)
-                    yield obs, action
-            return
-        if cache_path is None:
-            yield from self._normalized_samples(episode_path)
-            return
-
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_path.with_suffix(f".tmp-{os.getpid()}")
-        try:
-            with gzip.open(temporary, "wt", encoding="utf-8") as stream:
-                for obs, action in self._normalized_samples(episode_path):
-                    stream.write(json.dumps([obs, action], separators=(",", ":")) + "\n")
-                    yield obs, action
-            temporary.replace(cache_path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-
-    def __iter__(self) -> Iterator[tuple[dict, dict]]:
-        for episode_path in self._files_for_this_worker():
-            try:
-                yield from self._episode_samples(episode_path)
-            except (OSError, json.JSONDecodeError, KeyError) as error:
-                logger.warning("skipping unreadable episode %s: %s", episode_path, error)
+    )
+    intent = Intent(
+        *(
+            np.stack([np.asarray(getattr(sample[2], name)) for sample in samples])
+            for name in Intent._fields
+        )
+    )
+    return BCBatch(
+        states,
+        np.asarray([sample[1] for sample in samples], np.int32),
+        intent,
+        np.stack([sample[3] for sample in samples]),
+    )

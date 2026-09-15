@@ -12,59 +12,27 @@ hydra:
     chdir: true
   run:
     dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  sweep:
-    dir: outputs/${hydra.job.name}/${experiment.name}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
-    subdir: ${hydra.job.num}
 
 data:
-  # エピソードJSONを再帰的に探すディレクトリ(1日分のサブディレクトリでも、
-  # data/replays/自体でもよい)。
-  data_dir: data/replays/kaggriculture-episodes-2026-08-30
-  # 指定すればソート後の先頭からこの件数だけ使う。スモークテスト例:
-  # data.num_episodes=20 train.max_steps=10
+  data_dir: data/replays
+  selection_dir: null
+  # nullなら選別後(またはdata_dir以下)の全エピソードを使う。小規模確認時だけ
+  # コマンドラインで件数を指定する。
   num_episodes: null
   val_fraction: 0.1
   split_seed: 0
-  turns_per_day: ${rules.turns_per_day}
-  shed_capacity: ${rules.shed_capacity}
-  hire_mult: ${rules.hire_mult}
-  max_market_orders: ${rules.max_market_orders}
-  # manifestのscoreはエージェントのSkill Ratingで、終端所持金ではない。
-  # 強いエージェント同士の対局へ絞る場合に指定する。
-  manifest_dir: null
-  min_avg_agent_score: null
-  min_agent_score: null
-  # JSONのrewards[player](終端所持金)がこの値未満のプレイヤーを教師から除く。
+  cache_dir: data/cache/bc
   min_player_reward: null
-  # 複数epochでJSON解析・正規化を再利用する場合に指定する。nullならcacheしない。
-  cache_dir: null
-  # normalize後の全系列再検証。監査用であり、本学習では重複計算なのでfalse。
-  validate_normalized: false
 
 train:
-  lr: 3.0e-4
-  # RTX 5070 Tiで32/64/128を比較し、64が最も高スループットだった。
-  batch_size: 64
-  num_workers: 2
+  learning_rate: 3.0e-4
+  batch_size: 128
   weight_decay: 0.01
-  grad_clip_norm: 1.0
-  max_epochs: 1
-  # 0以下なら制限しない(スモークテスト用に数十stepだけ回す時に使う)。
+  max_grad_norm: 1.0
+  max_epochs: 2
   max_steps: -1
-  log_interval: 10
-  val_interval: 100
-  val_batches: 20
-  checkpoint_interval: 200
-  # 直近この件数だけ`checkpoints/step_*.pt`を残し、古いものは保存のたびに削除する。
-  # 0以下なら削除せず全件残す。
-  keep_last_checkpoints: 10
-  device: auto  # "auto" | "cpu" | "cuda"
+  log_interval: 50
+  validation_batches: 100
+  checkpoint_interval: 1000
   seed: 0
-  # 指定すれば、そのcheckpoint(_save_checkpoint形式)から重み・optimizer状態・step
-  # を読み込んで続きから学習する(中断した学習の再開用)。nullなら初期化から開始する。
-  # init_weightsとは排他(同時指定はエラー)。
-  init_checkpoint: null
-  # 指定すれば、そのcheckpointから重みだけを読み込み、optimizer状態とstepは0から
-  # 始める(別データセットでのfine-tuning用。例: 大量データでBCした後、稼いだ額の
-  # 多いエピソードだけに絞って続けて学習する)。init_checkpointとは排他。
-  init_weights: null
+  resume_checkpoint: null

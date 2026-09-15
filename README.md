@@ -17,7 +17,7 @@ PPOで自己対戦学習し、最後にActorだけをPyTorchへ変換する流�
 uv run python -m kaggriculture.training.replay_curation.select
 
 # Behavior Cloning
-uv run python -m kaggriculture.training.bc.train_jax \
+uv run python -m kaggriculture.training.bc.train \
   data.selection_dir=data/training_sets/broad_winners
 
 # BC checkpointからPPO
