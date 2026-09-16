@@ -16,7 +16,7 @@ from kaggriculture.rules import constants as C
 from kaggriculture.simulator.reset import reset
 from kaggriculture.training.bc import core as bc_core
 from kaggriculture.training.bc.dataset import action_to_intent, stack_samples
-from kaggriculture.training.bc.train import _restored_best
+from kaggriculture.training.bc.train import _restored_best, _schedule_steps
 from kaggriculture.training.ppo import core as ppo_core
 from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
@@ -54,12 +54,41 @@ def test_bc_update() -> None:
 
     batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
     train_state = bc_core.create_train_state(model, variables, bc_core.BCConfig())
-    train_state, (loss, count) = bc_core.update_minibatch(
+    train_state, (loss, count, excluded) = bc_core.update_minibatch(
         model, train_state, jax.device_put(batch), bc_core.BCConfig()
     )
 
     assert jnp.isfinite(loss)
     assert count == 2
+    assert excluded == 0
+
+
+def test_bc_loss_excludes_structurally_illegal_labels() -> None:
+    """固定mask上で不可能な有効ラベルをlossから除外する。"""
+    from kaggriculture.policy.jax import actions as A
+    from kaggriculture.training.replays.state import observation_to_state
+
+    model, variables = _model()
+    obs = make_fresh_observation()
+    action = {"farmer": ["PASS"], "hands": [], "market": []}
+    intent, mask = action_to_intent(obs, action, CacheRules())
+
+    # obsのseedsは全crop 0なので、PLANTはshedと無関係に常に不合法。
+    (candidates,) = jnp.nonzero(A.UNIT_CANDIDATES.op == C.FARMER_OP_PLANT)
+    unit = intent.unit.copy()
+    unit[0] = int(candidates[0])  # farmer slotへ不合法なPLANTを差し替える
+    unit[1] = int(candidates[0])  # inactive handは不合法でも集計対象外
+    intent = intent._replace(unit=unit)
+
+    batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
+    train_state = bc_core.create_train_state(model, variables, bc_core.BCConfig())
+    train_state, (loss, count, excluded) = bc_core.update_minibatch(
+        model, train_state, jax.device_put(batch), bc_core.BCConfig()
+    )
+
+    assert excluded == 1
+    assert count == 1  # farmer slot(illegal)が除外され、市場STOP slotだけ残る
+    assert jnp.isfinite(loss)
 
 
 def test_ppo_rollout_and_update() -> None:
@@ -146,3 +175,12 @@ def test_checkpoint_shape_metadata_rejects_different_hand_limit() -> None:
 def test_checkpoint_shape_metadata_rejects_legacy_checkpoint() -> None:
     with pytest.raises(ValueError, match="incompatible policy checkpoint"):
         validate_checkpoint_metadata({"architecture": "fixed_slot", "trainer": "ppo"})
+
+
+def test_bc_schedule_respects_step_limit() -> None:
+    assert _schedule_steps(100, 20, -1) == 2000
+    assert _schedule_steps(100, 20, 250) == 250
+    with pytest.raises(ValueError, match="complete batch"):
+        _schedule_steps(0, 20, -1)
+    with pytest.raises(ValueError, match="max_epochs"):
+        _schedule_steps(100, 0, -1)

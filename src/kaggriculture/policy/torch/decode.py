@@ -4,9 +4,6 @@
 ブロックは逐次再現できないため、種を予約して供給超過そのものを防ぐ。
 """
 
-# requires_quantity/max_executable_quantityは合法候補の生成(legal_market_actions)と
-# 数量の上限計算を同じ場所にまとめるため、actions.pyに定義されている
-# (このモジュールはcommit_*_actionでも同じ上限計算が必要なので使う)。
 from kaggriculture.policy.torch.actions import (
     _fib,
     _market_price_one,
@@ -107,11 +104,8 @@ def commit_unit_action(
             shed_total += added
 
     elif op_name == "PLACE" and item_name is not None:
-        # PLACE(item_name)は同じ候補ベクトルが「動物配置」と「納屋落とし」の
-        # どちらの意味にもなりうる(actions.is_animal_placement参照。item_nameが
-        # 動物名というだけでは区別できない)。
+        # PLACEの意味は品目名だけでなく、現在のタイルにも依存する。
         if is_animal_placement(item_name, tile):
-            # 動物は1マスに1匹なので数量の概念が無い(quantity_candidatesを使わない)。
             farm["tiles"][fy][fx] = {
                 "kind": tile["kind"],
                 "animal": item_name,
@@ -126,8 +120,6 @@ def commit_unit_action(
         else:
             if inventory is None:
                 raise ValueError("commit_unit_action: PLACE(納屋落とし) requires inventory")
-            # 納屋落とし側。持ち物数と納屋の空き容量の両方でクランプする
-            # (animal_actions.apply_placeのn_take参照)。
             shed_room = max(shed_capacity - sum(shed.values()), 0)
             taken = min(max(n, 0), inventory.get(item_name, 0), shed_room)
             shed[item_name] = shed.get(item_name, 0) + taken
@@ -238,17 +230,13 @@ def commit_market_action(
         cost = _fib(farm["hires_today"]) * hire_mult
         farm["money"] -= cost
         farm["hires_today"] += 1
-        # apply_hireは新しいhandを1体増やす。今ターンは既存hand分の行動しか処理
-        # しない(player_turn.pyは市場注文より先にユニット行動を処理する)ため、
-        # 実際のspawn位置は影響せず、MAX_HANDS判定(len()のみ参照)用にダミー
-        # 位置を足せば十分。
+        # unit行動は市場注文より前に終わるため、次注文の人数判定にだけ使う。
         farm["hands"] = [*farm["hands"], (0, 0)]
 
     elif op_name == "BUY_LAND":
         n_unlocked_extra = len(farm["unlocked_quadrants"]) - 1
         farm["money"] -= P.LAND_PRICES[n_unlocked_extra]
-        # unlocked_quadrantsの実際の値(どの区画か)は合法候補の判定に使われない
-        # (len()しか見ない)ため、ダミー値を足すだけでよい。
+        # 後続注文は解放区画の数だけを参照する。
         farm["unlocked_quadrants"] = [*farm["unlocked_quadrants"], "_"]
 
     elif op_name == "BUY_SEED" and item_name is not None:
@@ -273,9 +261,6 @@ def commit_market_action(
         farm["money"] = new_money
         shed[item_name] = new_shed_count
         market["inventory"][item_name] = new_inv
-        # legal_market_actions自体はmarket["inventory"]しか見ないが、marketを丸ごと
-        # 呼び出し側が使い回す可能性があるため、pricesも実際の在庫と矛盾しないよう
-        # 更新しておく。
         market["prices"][item_name] = _market_price_one(item_idx, new_inv)
 
         if op_name == "BUY_PRODUCT":

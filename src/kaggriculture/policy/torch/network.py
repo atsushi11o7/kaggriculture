@@ -100,17 +100,26 @@ class Encoder(nn.Module):
             torch.Tensor: 形状(batch, L.NUM_WORDS_ENCODER + 1, d_model)。
             [:, 0]がCLSトークンの出力(局面全体の集約表現)。
         """
-        x = self.token_embedding(index, value, offset)
-        x = x.reshape(-1, L.NUM_WORDS_ENCODER, self.d_model)
-        batch_size = x.size(0)
+        embedded = self.token_embedding(index, value, offset)
+        embedded = embedded.reshape(-1, L.NUM_WORDS_ENCODER, self.d_model)
+        return self.forward_embedded(embedded)
 
+    def forward_embedded(self, embedded: torch.Tensor) -> torch.Tensor:
+        """Encode an already embedded fixed-width observation.
+
+        Args:
+            embedded: Tensor with shape ``(batch, tokens, d_model)``.
+
+        Returns:
+            Encoder output including the CLS token.
+        """
+        batch_size = embedded.size(0)
         cls = self.cls_token.expand(batch_size, 1, -1)
-        x = torch.cat([cls, x], dim=1)
-        x = x + self.owner_embedding(self._owner_ids)
-        x = x + self.zone_embedding(self._zone_ids)
-        x = x + self.position_embedding(self._position_ids)
-
-        return self.transformer(x)
+        hidden = torch.cat([cls, embedded], dim=1)
+        hidden = hidden + self.owner_embedding(self._owner_ids)
+        hidden = hidden + self.zone_embedding(self._zone_ids)
+        hidden = hidden + self.position_embedding(self._position_ids)
+        return self.transformer(hidden)
 
 
 class PrivilegedEncoder(nn.Module):
