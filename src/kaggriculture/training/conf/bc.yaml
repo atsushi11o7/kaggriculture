@@ -26,13 +26,18 @@ data:
 
 train:
   learning_rate: 3.0e-4
+  # 全学習をmax_epochs分のtotal_stepsでcosine decayし、この比率(learning_rate*
+  # lr_decay_alpha)まで下げる。長時間の学習ほど終盤の収束を安定させるため。
+  lr_decay_alpha: 0.1
   batch_size: 128
   weight_decay: 0.01
   max_grad_norm: 1.0
-  max_epochs: 2
+  max_epochs: 20
   max_steps: -1
   log_interval: 50
   validation_batches: 100
-  checkpoint_interval: 1000
+  # BCにはPPOのようなstep_*自動削除が無いため、max_epochsを増やす時はここも
+  # 増やしてcheckpoint数(=ディスク・時間)を抑える。
+  checkpoint_interval: 3000
   seed: 0
   resume_checkpoint: null

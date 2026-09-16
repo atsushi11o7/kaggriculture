@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from dataclasses import asdict
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import hydra
 import jax
+import optax
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
@@ -60,6 +62,37 @@ def _sources(cfg):
     return split_episode_files(files, cfg.data.val_fraction, cfg.data.split_seed)
 
 
+def _steps_per_epoch(paths, batch_size: int) -> int:
+    """Return the number of complete training batches in one epoch."""
+    total = 0
+    for path in paths:
+        stats = json.loads(path.with_suffix(".stats.json").read_text(encoding="utf-8"))
+        total += stats["accepted"]
+    return total // batch_size
+
+
+def _schedule_steps(steps_per_epoch: int, max_epochs: int, max_steps: int) -> int:
+    """Return the configured number of optimizer updates.
+
+    Args:
+        steps_per_epoch: Number of complete batches in one epoch.
+        max_epochs: Maximum number of passes over the dataset.
+        max_steps: Positive global update limit, or a non-positive value for no limit.
+
+    Returns:
+        Number of updates covered by the learning-rate schedule.
+
+    Raises:
+        ValueError: If the dataset cannot produce a complete batch.
+    """
+    if steps_per_epoch <= 0:
+        raise ValueError("training data must contain at least one complete batch")
+    if max_epochs <= 0:
+        raise ValueError("max_epochs must be positive")
+    epoch_steps = steps_per_epoch * max_epochs
+    return min(epoch_steps, max_steps) if max_steps > 0 else epoch_steps
+
+
 def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best):
     """step_<n>を保存し、validationがこれまでの最良ならbestも更新する。"""
     validation = _validate(model, state.params, validation_paths, cfg, bc_config)
@@ -86,7 +119,7 @@ def _validate(model, params, paths, cfg, bc_config):
     total = tokens = 0.0
     batches = iter_batches(paths, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
     for batch in islice(batches, cfg.train.validation_batches):
-        loss, count = core.evaluate_minibatch(model, params, jax.device_put(batch), bc_config)
+        loss, count, _ = core.evaluate_minibatch(model, params, jax.device_put(batch), bc_config)
         loss, count = jax.device_get((loss, count))
         total += float(loss * count)
         tokens += float(count)
@@ -111,8 +144,19 @@ def main(cfg: DictConfig) -> None:
     validation_paths = prepare_episodes(validation_sources, cache / "validation", rules)
     model = M.PolicyValueNet(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
+    steps_per_epoch = _steps_per_epoch(train_paths, cfg.train.batch_size)
+    total_steps = _schedule_steps(steps_per_epoch, cfg.train.max_epochs, cfg.train.max_steps)
+    learning_rate = optax.cosine_decay_schedule(
+        cfg.train.learning_rate, total_steps, alpha=cfg.train.lr_decay_alpha
+    )
+    logger.info(
+        "steps_per_epoch=%d total_steps=%d (max_epochs=%d)",
+        steps_per_epoch,
+        total_steps,
+        cfg.train.max_epochs,
+    )
     bc_config = core.BCConfig(
-        cfg.train.learning_rate,
+        learning_rate,
         cfg.train.weight_decay,
         cfg.train.max_grad_norm,
         cfg.rules.turns_per_day,
@@ -120,6 +164,7 @@ def main(cfg: DictConfig) -> None:
     )
     state = core.create_train_state(model, variables, bc_config)
     step = 0
+    start_epoch = 0
     best = float("inf")
     if cfg.train.resume_checkpoint:
         directory = Path(to_absolute_path(cfg.train.resume_checkpoint))
@@ -127,10 +172,13 @@ def main(cfg: DictConfig) -> None:
         validate_checkpoint_metadata(metadata)
         state, _ = load_checkpoint(directory, state)
         step = int(metadata["step"])
+        start_epoch = int(metadata.get("epoch", 0))
         best = _restored_best(metadata)
     last_saved_step = step
-    epoch = 0
-    for epoch in range(cfg.train.max_epochs):
+    epoch = start_epoch
+    for epoch in range(start_epoch, cfg.train.max_epochs):
+        if 0 < cfg.train.max_steps <= step:
+            break
         batches = iter_batches(
             train_paths,
             cfg.train.batch_size,
@@ -141,10 +189,19 @@ def main(cfg: DictConfig) -> None:
         for batch in batches:
             if 0 < cfg.train.max_steps <= step:
                 break
-            state, (loss, _) = core.update_minibatch(model, state, jax.device_put(batch), bc_config)
+            state, (loss, _, excluded) = core.update_minibatch(
+                model, state, jax.device_put(batch), bc_config
+            )
             step += 1
             if step % cfg.train.log_interval == 0:
-                logger.info("epoch=%d step=%d loss=%.4f", epoch, step, float(jax.device_get(loss)))
+                loss, excluded = jax.device_get((loss, excluded))
+                logger.info(
+                    "epoch=%d step=%d loss=%.4f excluded=%d",
+                    epoch,
+                    step,
+                    float(loss),
+                    int(excluded),
+                )
             if step % cfg.train.checkpoint_interval == 0:
                 best = _checkpoint(
                     model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best

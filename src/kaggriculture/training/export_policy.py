@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import jax
+import optax
 import torch
 
 from kaggriculture.policy.common.config import (
@@ -35,8 +36,13 @@ def export_policy(source: Path, destination: Path) -> None:
     rules = config["rules"]
     if metadata.get("trainer") == "bc":
         train = config["train"]
+        # bc/train.pyはlearning_rateを常にcosine decay schedule(callable)として
+        # optimizerへ渡すため、optax内部のstate構造(step数を追跡するcount等)は
+        # 定数floatの場合と異なる。値そのものはこの後すぐparamsだけ取り出して
+        # 捨てるので、復元用テンプレートは構造さえ一致すればよい(ダミーの
+        # schedule)。
         optimizer = bc_core.BCConfig(
-            learning_rate=train["learning_rate"],
+            learning_rate=optax.cosine_decay_schedule(train["learning_rate"], 1),
             weight_decay=train["weight_decay"],
             max_grad_norm=train["max_grad_norm"],
             turns_per_day=rules["turns_per_day"],

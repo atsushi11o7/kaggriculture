@@ -10,6 +10,7 @@ from pathlib import Path
 
 import hydra
 import jax
+import optax
 from flax import traverse_util
 from flax.core import freeze, unfreeze
 from hydra.utils import to_absolute_path
@@ -51,7 +52,13 @@ def _load_bc_actor(path: Path, variables: dict) -> dict:
     source_config = ModelConfig(**metadata["model_config"])
     source_model = M.PolicyValueNet(source_config)
     source_variables = P.initialize(source_model, jax.random.key(0))
-    source_state = bc_core.create_train_state(source_model, source_variables, bc_core.BCConfig())
+    # bc/train.pyはlearning_rateを常にcosine decay schedule(callable)として
+    # optimizerへ渡すため、復元用テンプレートもoptax内部のstate構造(count等)を
+    # 合わせる必要がある(paramsだけ取り出してすぐ捨てるので値は使わない)。
+    dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
+    source_state = bc_core.create_train_state(
+        source_model, source_variables, bc_core.BCConfig(dummy_schedule)
+    )
     source_state, _ = load_checkpoint(path, source_state)
     target = traverse_util.flatten_dict(unfreeze(variables["params"]))
     source = traverse_util.flatten_dict(unfreeze(source_state.params))
@@ -223,14 +230,19 @@ def main(cfg: DictConfig) -> None:
             values = jax.device_get(metrics)
             invalid = float(jax.device_get(rollout.executor_invalid).mean())
             clamped = float(jax.device_get(rollout.executor_clamped).mean())
+            invalid_unit = float(jax.device_get(rollout.executor_invalid_unit).mean())
+            clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
             logger.info(
-                "update=%d seconds=%.1f samples/s=%.1f loss=%.4f invalid=%.3f clamped=%.3f pool=%s",
+                "update=%d seconds=%.1f samples/s=%.1f loss=%.4f invalid=%.3f clamped=%.3f "
+                "invalid_unit=%.3f clamped_unit=%.3f pool=%s",
                 update,
                 elapsed,
                 samples / elapsed,
                 values.loss,
                 invalid,
                 clamped,
+                invalid_unit,
+                clamped_unit,
                 used_pool,
             )
 
