@@ -207,8 +207,6 @@ def main(cfg: DictConfig) -> None:
                     model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best
                 )
                 last_saved_step = step
-    # checkpoint_intervalの倍数で終わらなかった場合でも、最後の状態を必ず残す
-    # (PPOのtrain.pyと同じく、最終回は間隔に関わらず保存する)。
     if step > last_saved_step:
         _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best)
 

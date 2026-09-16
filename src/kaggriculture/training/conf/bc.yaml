@@ -16,8 +16,6 @@ hydra:
 data:
   data_dir: data/replays
   selection_dir: null
-  # nullなら選別後(またはdata_dir以下)の全エピソードを使う。小規模確認時だけ
-  # コマンドラインで件数を指定する。
   num_episodes: null
   val_fraction: 0.1
   split_seed: 0
@@ -26,8 +24,7 @@ data:
 
 train:
   learning_rate: 3.0e-4
-  # 全学習をmax_epochs分のtotal_stepsでcosine decayし、この比率(learning_rate*
-  # lr_decay_alpha)まで下げる。長時間の学習ほど終盤の収束を安定させるため。
+  # cosine decayの最終学習率はlearning_rate * lr_decay_alpha。
   lr_decay_alpha: 0.1
   batch_size: 128
   weight_decay: 0.01
@@ -36,8 +33,6 @@ train:
   max_steps: -1
   log_interval: 50
   validation_batches: 100
-  # BCにはPPOのようなstep_*自動削除が無いため、max_epochsを増やす時はここも
-  # 増やしてcheckpoint数(=ディスク・時間)を抑える。
   checkpoint_interval: 3000
   seed: 0
   resume_checkpoint: null

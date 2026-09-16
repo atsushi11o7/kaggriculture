@@ -388,24 +388,10 @@ def _envs_from_observations(
     hire_mult: float,
     max_market_orders: int,
 ) -> list[_DecodeEnv]:
-    """観測を破壊的に更新可能なデコード用状態へコピーする。
+    """観測から変更可能なデコード状態を作る。
 
-    汎用のcopy.deepcopyは使わず、decode_state.commit_unit_action/commit_market_action
-    が実際に書き換える範囲だけを手動でコピーする(プロファイリングの結果、
-    copy.deepcopyがBC学習の総実行時間の1〜2割を占めていた)。安全性の根拠:
-
-    - farm["tiles"]: セル丸ごとの置換(PLANT/DIG等)とセル内フィールドの書き換え
-      (WATER等)の両方が起きるため、行ごと・dict型セルごとに複製が必要
-    - farm["farmer"]/["hands"]/["unlocked_quadrants"]: 参照を直接書き換えることは
-      無く、常に新しいlistで再代入される(commit_market_action参照)ため、
-      トップレベルの浅いコピーだけで安全(元のlistを共有していても再代入時に
-      上書きされるだけで元は壊れない)
-    - shed/seeds/market["inventory"]/market["prices"]: 全てキー単位の再代入のみ
-      (ネストした書き換えは無い)ため、1階層の浅いコピーで十分
-    - private["inventories"](各ユニットの持ち物): commit_unit_actionは読み取る
-      だけで一切書き換えない(=deepcopyの再帰コピーは不要)が、呼び出し側が
-      観測と参照を共有しないことに依存し得るため、各ユニット分の辞書だけは
-      浅くコピーする
+    タイルはセル内も書き換えるため複製する。他の辞書はキー単位の更新なので
+    浅いコピーで足りる。元のobservationとは書き換え可能な参照を共有しない。
 
     Args:
         observations: ターン開始時点の観測。
@@ -415,12 +401,11 @@ def _envs_from_observations(
         max_market_orders: 1ターンの市場注文上限。
 
     Returns:
-        観測と共有参照を持たないデコード用状態。
+        観測から独立したデコード用状態。
 
     Raises:
         ValueError: 市場注文上限が設定範囲外の場合。
     """
-    # 0だと最初の注文が上限判定より先に通るため、設定契約をここで検証する。
     if not (1 <= max_market_orders <= C.MAX_MARKET_ORDERS):
         raise ValueError(
             f"max_market_orders must be in [1, {C.MAX_MARKET_ORDERS}], got {max_market_orders}"
