@@ -155,14 +155,7 @@ class PolicyValueNet(nn.Module):
         privileged_padding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         embedded = self.embed_dense(encoder_index, encoder_value)
-        batch = embedded.shape[0]
-        # Encoder only needs the already embedded sequence; reproduce its positional path here.
-        cls = self.encoder.cls_token.expand(batch, 1, -1)
-        memory = torch.cat([cls, embedded], dim=1)
-        memory = memory + self.encoder.owner_embedding(self.encoder._owner_ids)
-        memory = memory + self.encoder.zone_embedding(self.encoder._zone_ids)
-        memory = memory + self.board_position_embedding(self.encoder._position_ids)
-        memory = self.encoder.transformer(memory)
+        memory = self.encoder.forward_embedded(embedded)
         unit_inventory_embedding = self.embed_dense(unit_inventory_index, unit_inventory_value)
         queries = self.query_encoder(memory, unit_positions, unit_active, unit_inventory_embedding)
         value_input = memory[:, 0]

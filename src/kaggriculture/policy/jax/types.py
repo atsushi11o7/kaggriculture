@@ -46,5 +46,6 @@ class EvaluationOutput(NamedTuple):
     log_prob: jnp.ndarray
     slot_log_prob: jnp.ndarray
     slot_mask: jnp.ndarray
+    slot_valid: jnp.ndarray
     entropy: jnp.ndarray
     value: jnp.ndarray

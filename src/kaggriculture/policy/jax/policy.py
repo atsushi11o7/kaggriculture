@@ -65,7 +65,6 @@ def _logits(
     counters,
     turns_per_day: int,
     shed_capacity: int,
-    selected: Intent | None = None,
 ):
     encoded, positions, unit_active, _, unit_inventory = _inputs(
         states, players, counters, turns_per_day
@@ -123,7 +122,7 @@ def _logits(
         A.MARKET_CANDIDATES.value[None, None],
         market_mask,
     )
-    return value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active
+    return value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, unit_mask
 
 
 def _market_active(choices: jnp.ndarray) -> jnp.ndarray:
@@ -167,7 +166,7 @@ def sample_actions(
     hire_mult: float = 1.0,
 ) -> PolicyOutput:
     """全slotを1回のTransformer計算で共同生成する。"""
-    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active = _logits(
+    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _ = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     keys = jax.random.split(key, 4)
@@ -183,9 +182,7 @@ def sample_actions(
     unit_arg = A.UNIT_CANDIDATES.arg[unit]
     unit_max = jax.vmap(
         lambda state, player, ops, args: jax.vmap(
-            lambda index, op, arg: A.max_unit_quantity(
-                state, player, index, op, arg, shed_capacity=shed_capacity
-            )
+            lambda index, op, arg: A.unit_quantity_upper_bound(state, player, index, op, arg)
         )(units, ops, args)
     )(states, players, unit_op, unit_arg)
     unit_needs = jax.vmap(
@@ -264,8 +261,8 @@ def evaluate_intent(
     shed_capacity: int = 100,
 ) -> EvaluationOutput:
     """保存したintentを一括再評価する。PPO用の逐次traceは不要。"""
-    value, uh, mh, ul, ml, active = _logits(
-        model, variables, states, players, counters, turns_per_day, shed_capacity, intent
+    value, uh, mh, ul, ml, active, unit_mask = _logits(
+        model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     _, ulp, ue = _distribution(ul / temperature, choices=intent.unit)
     _, mlp, me = _distribution(ml / temperature, choices=intent.market)
@@ -279,9 +276,7 @@ def evaluate_intent(
     )(states, players, uop, uarg)
     umax = jax.vmap(
         lambda state, player, ops, args: jax.vmap(
-            lambda index, op, arg: A.max_unit_quantity(
-                state, player, index, op, arg, shed_capacity=shed_capacity
-            )
+            lambda index, op, arg: A.unit_quantity_upper_bound(state, player, index, op, arg)
         )(units, ops, args)
     )(states, players, uop, uarg)
     numbers = jnp.arange(1, A.QUANTITY_INDEX.shape[0] + 1)
@@ -294,6 +289,12 @@ def evaluate_intent(
         numbers[None, None] <= jnp.maximum(umax[..., None], 1),
     )
     _, uqlp, uqe = _distribution(uql / temperature, choices=intent.unit_quantity)
+    unit_candidate_valid = jnp.take_along_axis(unit_mask, intent.unit[..., None], axis=-1)[..., 0]
+    unit_quantity_mask = numbers[None, None] <= jnp.maximum(umax[..., None], 1)
+    unit_quantity_valid = jnp.take_along_axis(
+        unit_quantity_mask, intent.unit_quantity[..., None], axis=-1
+    )[..., 0]
+    unit_valid = unit_candidate_valid & (~uneeds | unit_quantity_valid)
     mop = A.MARKET_CANDIDATES.op[intent.market]
     mactive = _market_active(intent.market)
     mneeds = mactive & (
@@ -314,7 +315,8 @@ def evaluate_intent(
         axis=1,
     )
     slot_mask = jnp.concatenate([active, mactive], axis=1)
-    return EvaluationOutput(slot_lp.sum(-1), slot_lp, slot_mask, entropy, value)
+    slot_valid = jnp.concatenate([unit_valid, jnp.ones_like(mactive)], axis=1)
+    return EvaluationOutput(slot_lp.sum(-1), slot_lp, slot_mask, slot_valid, entropy, value)
 
 
 def sample_self_play_actions(model, variables, states, key, counters=None, **kwargs):

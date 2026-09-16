@@ -23,9 +23,10 @@ _ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
 MARKET_WAIT_ACTION = ("SELL", "WHEAT", 0)
 
 
-def _is_shed_adjacent(pos: tuple[int, int], board_size: int) -> bool:
+def _is_shed_adjacent(pos: tuple[int, int] | list[int], board_size: int) -> bool:
     half = board_size // 2
-    return pos in ((half - 1, half - 1), (half, half - 1), (half - 1, half), (half, half))
+    x, y = pos
+    return x in (half - 1, half) and y in (half - 1, half)
 
 
 def is_animal_placement(item_name: str | None, tile) -> bool:
@@ -65,6 +66,8 @@ def legal_unit_actions(
     pos: tuple[int, int],
     day: int,
     shed_capacity: int = 100,
+    *,
+    defer_shared_resources: bool = False,
 ) -> list:
     """1ユニット(farmerまたは1体のhand)の、今合法な行動候補を列挙する。
 
@@ -76,6 +79,7 @@ def legal_unit_actions(
         pos: (x, y) このユニットの現在位置。
         day: 現在の日。作物HARVESTの成熟判定(下記参照)に使う。
         shed_capacity: 納屋の容量。PLACE(納屋落とし)の空き容量判定に使う。
+        defer_shared_resources: Trueなら納屋在庫と空き容量の判定をExecutorへ委ねる。
 
     Returns:
         list[SparseVector]: 合法な(op, item)候補のリスト。PASS(常に合法)を含む。
@@ -144,24 +148,19 @@ def legal_unit_actions(
 
     if shed_adjacent:
         has_inventory = any(n > 0 for n in inventory.values())
-        # WATER/HARVEST等と同じく、実際に効果がある時だけ候補に出す
-        # (納屋が満杯ならDROPは何も移せない)。
-        if has_inventory and sum(shed.values()) < shed_capacity:
+        room = sum(shed.values()) < shed_capacity
+        if has_inventory and (defer_shared_resources or room):
             candidates.append(_candidate(farmer_op="DROP"))
         if has_inventory:
             for item in C.SHED_ITEMS:
-                if inventory.get(item, 0) > 0 and item not in on_animal_branch_items:
-                    # 納屋が満杯だとPLACE(納屋落とし)は0個しか置けない(=数量スロットが
-                    # 空になり自己回帰が行き止まる)ため、置ける時だけ候補に出す。
-                    placeable = max_executable_quantity(
-                        "PLACE", item, farm, shed, None, shed_capacity, inventory=inventory
+                if inventory.get(item, 0) <= 0 or item in on_animal_branch_items:
+                    continue
+                if defer_shared_resources or room:
+                    candidates.append(
+                        _candidate(farmer_op="PLACE", item_index=V.entity_index(item))
                     )
-                    if placeable > 0:
-                        candidates.append(
-                            _candidate(farmer_op="PLACE", item_index=V.entity_index(item))
-                        )
         for item in C.SHED_ITEMS:
-            if shed.get(item, 0) > 0:
+            if defer_shared_resources or shed.get(item, 0) > 0:
                 candidates.append(_candidate(farmer_op="PICKUP", item_index=V.entity_index(item)))
 
     return candidates

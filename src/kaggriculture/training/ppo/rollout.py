@@ -48,6 +48,8 @@ class Rollout(NamedTuple):
     counters: T.EpisodeCounters
     executor_invalid: jnp.ndarray
     executor_clamped: jnp.ndarray
+    executor_invalid_unit: jnp.ndarray
+    executor_clamped_unit: jnp.ndarray
     final_state: State
     final_counters: T.EpisodeCounters
     bootstrap_value: jnp.ndarray
@@ -122,6 +124,8 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
             counters,
             output.stats.invalid_market,
             output.stats.clamped_market_quantity,
+            output.stats.invalid_unit,
+            output.stats.clamped_unit_quantity,
         )
         return (next_state, next_counters, rng), transition
 
@@ -239,6 +243,13 @@ def collect_rollout_vs_opponent(
             [outputs[0].stats.clamped_market_quantity, outputs[1].stats.clamped_market_quantity],
             axis=1,
         )
+        invalid_unit = jnp.stack(
+            [outputs[0].stats.invalid_unit, outputs[1].stats.invalid_unit], axis=1
+        )
+        clamped_unit = jnp.stack(
+            [outputs[0].stats.clamped_unit_quantity, outputs[1].stats.clamped_unit_quantity],
+            axis=1,
+        )
         transition = (
             state,
             intent,
@@ -250,6 +261,8 @@ def collect_rollout_vs_opponent(
             counters,
             invalid,
             clamped,
+            invalid_unit,
+            clamped_unit,
         )
         return (next_state, next_counters, rng), transition
 

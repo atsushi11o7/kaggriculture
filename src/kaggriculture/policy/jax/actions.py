@@ -166,8 +166,6 @@ def legal_unit_mask(
     animal_cared = state.tiles_cared_today[player, y, x]
     fertilizer_available = state.tiles_fertilizer_available[player, y, x]
     day = state.step // turns_per_day
-    shed = state.shed[player]
-    room = jnp.sum(shed) < shed_capacity
     adjacent = _shed_adjacent(pos, state.tiles_kind.shape[-1])
     op, arg = UNIT_CANDIDATES.op, UNIT_CANDIDATES.arg
 
@@ -187,7 +185,8 @@ def legal_unit_mask(
     legal = op == C.FARMER_OP_PASS
     move = (op >= C.FARMER_OP_NORTH) & (op <= C.FARMER_OP_WEST)
     legal |= move & in_bounds
-    legal |= (op == C.FARMER_OP_PICKUP) & adjacent & (shed[item_arg] > 0)
+    # 納屋の共有在庫と空き容量はExecutorがunit順に解決する。
+    legal |= (op == C.FARMER_OP_PICKUP) & adjacent
     legal |= (op == C.FARMER_OP_PLANT) & empty & (state.seeds[player, crop_arg] > 0)
     legal |= (op == C.FARMER_OP_WATER) & is_plant & ~cared
     legal |= (op == C.FARMER_OP_HARVEST) & (
@@ -200,13 +199,13 @@ def legal_unit_mask(
     legal |= (op == C.FARMER_OP_DIG) & (
         is_plant | (kind == C.TILE_WEED) | (is_structure & ~has_animal)
     )
-    shed_drop = adjacent & room & (inventory[item_arg] > 0) & ~animal_place
+    shed_drop = adjacent & (inventory[item_arg] > 0) & ~animal_place
     legal |= (op == C.FARMER_OP_PLACE) & ((animal_place & (inventory[item_arg] > 0)) | shed_drop)
     wheat_idx = C.SHED_ITEMS.index("WHEAT")
     legal |= (op == C.FARMER_OP_FEED) & has_animal & ~cared & (inventory[wheat_idx] > 0)
     legal |= (op == C.FARMER_OP_COLLECT_FERTILIZER) & has_animal & fertilizer_available
     legal |= (op == C.FARMER_OP_CARE) & has_animal & ~animal_cared
-    legal |= (op == C.FARMER_OP_DROP) & adjacent & room & jnp.any(inventory > 0)
+    legal |= (op == C.FARMER_OP_DROP) & adjacent & jnp.any(inventory > 0)
     return legal
 
 
@@ -257,10 +256,29 @@ def unit_requires_quantity(state: State, player: jnp.ndarray, unit: jnp.ndarray,
     return (op == C.FARMER_OP_PICKUP) | ((op == C.FARMER_OP_PLACE) & ~animal_place)
 
 
+def unit_quantity_upper_bound(state: State, player: jnp.ndarray, unit: jnp.ndarray, op, arg):
+    """数量head向けに共有納屋へ依存しない上限を返す。
+
+    Args:
+        state: ターン開始時の状態。
+        player: 対象プレイヤー。
+        unit: 対象unitの固定slot index。
+        op: 選択したunit操作。
+        arg: 選択した品目index。
+
+    Returns:
+        Executorで逐次クランプする前の数量上限。
+    """
+    _, inventory = unit_fields(state, player, unit)
+    held = inventory[jnp.clip(arg, 0, C.N_SHED_ITEMS - 1)]
+    bound = jnp.where(op == C.FARMER_OP_PICKUP, V.MAX_ACTION_QUANTITY, held)
+    return jnp.clip(bound, 0, V.MAX_ACTION_QUANTITY)
+
+
 def max_unit_quantity(
     state: State, player: jnp.ndarray, unit: jnp.ndarray, op, arg, shed_capacity: int = 100
 ):
-    """選択済みunit行動の実行可能数量上限を返す。"""
+    """選択済みunit行動の実行可能数量上限を返す(Executorが逐次stateに対して呼ぶ、厳密版)。"""
     _, inventory = unit_fields(state, player, unit)
     shed = state.shed[player]
     pickup = shed[jnp.clip(arg, 0, C.N_SHED_ITEMS - 1)]

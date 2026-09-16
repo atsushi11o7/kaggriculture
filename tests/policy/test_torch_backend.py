@@ -11,6 +11,7 @@ from kaggriculture.policy.jax import features as F
 from kaggriculture.policy.jax.model import N_UNIT_SLOTS
 from kaggriculture.policy.jax.model import PolicyValueNet as JaxNet
 from kaggriculture.policy.jax.policy import initialize
+from kaggriculture.policy.torch import policy as torch_policy
 from kaggriculture.policy.torch.model import PolicyValueNet as TorchNet
 from kaggriculture.policy.torch.policy import predict_action
 from kaggriculture.training.weight_bridge import jax_to_torch
@@ -87,3 +88,17 @@ def test_torch_predicts_complete_action() -> None:
     assert action["farmer"]
     assert action["hands"] == []
     assert len(action["market"]) <= 10
+
+
+def test_torch_place_quantity_bound_uses_unit_inventory() -> None:
+    """TorchとJAXがPLACE数量を同じ手持ち数で制約する。"""
+    farm = {"tiles": [[None] * 10 for _ in range(10)]}
+    op = next(
+        op
+        for op, arg in torch_policy.UNIT_META
+        if op == torch_policy.C.FARMER_OP_PLACE and arg == 0
+    )
+    bound = torch_policy._unit_quantity_upper_bound(
+        op, 0, (4, 4), {torch_policy.C.SHED_ITEMS[0]: 3}, farm
+    )
+    assert bound == 3

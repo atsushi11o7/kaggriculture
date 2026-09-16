@@ -15,7 +15,7 @@ from kaggriculture.policy.jax import policy as P
 
 @dataclass(frozen=True)
 class BCConfig:
-    learning_rate: float = 3e-4
+    learning_rate: float | optax.Schedule = 3e-4
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     turns_per_day: int = 24
@@ -41,18 +41,24 @@ def loss(model, params, batch, config: BCConfig):
         shed_capacity=config.shed_capacity,
     )
     mask = batch.slot_mask.astype(jnp.float32)
+    excluded_mask = batch.slot_mask & ~evaluation.slot_valid
+    excluded = jnp.sum(excluded_mask.astype(jnp.float32))
+    mask = mask * evaluation.slot_valid.astype(jnp.float32)
     count = jnp.maximum(mask.sum(), 1)
     nll = -jnp.sum(jnp.where(mask > 0, evaluation.slot_log_prob, 0.0)) / count
-    return nll, count
+    return nll, count, excluded
 
 
 @partial(jax.jit, static_argnums=(0, 3))
 def update_minibatch(model, train_state, batch, config):
     def objective(params):
-        return loss(model, params, batch, config)
+        value, count, excluded = loss(model, params, batch, config)
+        return value, (count, excluded)
 
-    (value, count), gradients = jax.value_and_grad(objective, has_aux=True)(train_state.params)
-    return train_state.apply_gradients(grads=gradients), (value, count)
+    (value, (count, excluded)), gradients = jax.value_and_grad(objective, has_aux=True)(
+        train_state.params
+    )
+    return train_state.apply_gradients(grads=gradients), (value, count, excluded)
 
 
 @partial(jax.jit, static_argnums=(0, 3))

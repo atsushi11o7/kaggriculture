@@ -25,23 +25,9 @@ def _execute_one(
     unit_choice = intent.unit
     unit_op = A.UNIT_CANDIDATES.op[unit_choice]
     unit_arg = jnp.maximum(A.UNIT_CANDIDATES.arg[unit_choice], 0)
-    units = jnp.arange(C.MAX_HANDS + 1, dtype=jnp.int32)
     unit_active = jnp.concatenate([jnp.ones((1,), dtype=bool), state.hands_active[player]], axis=0)
-    needs_quantity = jax.vmap(A.unit_requires_quantity, in_axes=(None, None, 0, 0, 0))(
-        state, player, units, unit_op, unit_arg
-    )
-    requested_unit_n = jnp.where(needs_quantity, intent.unit_quantity + 1, 1)
-    maximum_unit_n = jax.vmap(
-        lambda unit, op, arg: A.max_unit_quantity(
-            state, player, unit, op, arg, shed_capacity=shed_capacity
-        )
-    )(units, unit_op, unit_arg)
-    unit_n = jnp.where(
-        needs_quantity, jnp.minimum(requested_unit_n, jnp.maximum(maximum_unit_n, 1)), 1
-    )
-    clamped_unit = jnp.sum(
-        (unit_active & needs_quantity & (unit_n != requested_unit_n)).astype(jnp.int32)
-    )
+
+    # PLANTは元シミュレータと同様に全unitの需要を一括判定する。
     plant = unit_active & (unit_op == C.FARMER_OP_PLANT)
     demand = jnp.sum(jax.nn.one_hot(unit_arg, C.N_CROPS, dtype=jnp.int32) * plant[:, None], axis=0)
     blocked = demand > state.seeds[player]
@@ -50,7 +36,72 @@ def _execute_one(
     unit_op = jnp.where(blocked_units, C.FARMER_OP_PASS, unit_op)
     unit_op = jnp.where(unit_active, unit_op, C.FARMER_OP_PASS)
     unit_arg = jnp.where(unit_active, unit_arg, 0)
-    unit_n = jnp.where(unit_active, unit_n, 1)
+
+    def apply_shed_action(shed, inventory, op, arg, quantity, needs_quantity):
+        """数量解決に必要な納屋の変化だけを適用する。"""
+        item = jnp.clip(arg, 0, C.N_SHED_ITEMS - 1)
+        pickup = op == C.FARMER_OP_PICKUP
+        place = (op == C.FARMER_OP_PLACE) & needs_quantity
+        shed = shed.at[item].add(jnp.where(pickup, -jnp.minimum(quantity, shed[item]), 0))
+        room = jnp.maximum(shed_capacity - jnp.sum(shed), 0)
+        placed = jnp.minimum(quantity, jnp.minimum(inventory[item], room))
+        shed = shed.at[item].add(jnp.where(place, placed, 0))
+
+        def apply_drop(current):
+            def step(value, index):
+                added = jnp.minimum(
+                    inventory[index], jnp.maximum(shed_capacity - jnp.sum(value), 0)
+                )
+                return value.at[index].add(added), None
+
+            return jax.lax.scan(step, current, jnp.arange(C.N_SHED_ITEMS))[0]
+
+        return jax.lax.cond(op == C.FARMER_OP_DROP, apply_drop, lambda value: value, shed)
+
+    # unit間で数量解決に影響する共有状態は納屋だけなので、State全体は複製しない。
+    def unit_step(carry, i):
+        shed, unit_n, invalid, clamped = carry
+        op_i = unit_op[i]
+        arg_i = unit_arg[i]
+        active_i = unit_active[i]
+        _, inventory_i = A.unit_fields(state, player, i)
+        needs_i = A.unit_requires_quantity(state, player, i, op_i, arg_i)
+        item_i = jnp.clip(arg_i, 0, C.N_SHED_ITEMS - 1)
+        room_i = jnp.maximum(shed_capacity - jnp.sum(shed), 0)
+        exact_max_i = jnp.where(
+            op_i == C.FARMER_OP_PICKUP,
+            shed[item_i],
+            jnp.minimum(inventory_i[item_i], room_i),
+        )
+        exact_max_i = jnp.clip(exact_max_i, 0, A.QUANTITY_INDEX.shape[0])
+        requested_i = jnp.where(needs_i, intent.unit_quantity[i] + 1, 1)
+        quantity_i = jnp.where(needs_i, jnp.minimum(requested_i, jnp.maximum(exact_max_i, 1)), 1)
+        drop_ineffective = (
+            active_i & (op_i == C.FARMER_OP_DROP) & (room_i <= 0) & jnp.any(inventory_i > 0)
+        )
+        quantity_ineffective = active_i & needs_i & (exact_max_i == 0)
+        invalid = invalid + (quantity_ineffective | drop_ineffective).astype(jnp.int32)
+        clamped = clamped + (
+            active_i & needs_i & (exact_max_i > 0) & (quantity_i != requested_i)
+        ).astype(jnp.int32)
+        unit_n = unit_n.at[i].set(jnp.where(active_i, quantity_i, 1))
+        shed = jax.lax.cond(
+            active_i,
+            lambda value: apply_shed_action(value, inventory_i, op_i, arg_i, quantity_i, needs_i),
+            lambda value: value,
+            shed,
+        )
+        return (shed, unit_n, invalid, clamped), None
+
+    unit_init = (
+        state.shed[player],
+        jnp.ones((C.MAX_HANDS + 1,), dtype=jnp.int32),
+        jnp.asarray(0, jnp.int32),
+        jnp.asarray(0, jnp.int32),
+    )
+    (_, unit_n, invalid_unit, clamped_unit), _ = jax.lax.scan(
+        unit_step, unit_init, jnp.arange(C.MAX_HANDS + 1, dtype=jnp.int32)
+    )
 
     market_op = jnp.full((C.MAX_MARKET_ORDERS,), -1, dtype=jnp.int32)
     market_arg = jnp.zeros((C.MAX_MARKET_ORDERS,), dtype=jnp.int32)
@@ -136,7 +187,7 @@ def _execute_one(
         market_n,
     )
     return action, ExecutorStats(
-        jnp.asarray(0, jnp.int32),
+        invalid_unit,
         clamped_unit,
         blocked_plants,
         invalid,
