@@ -36,3 +36,7 @@ train:
   checkpoint_interval: 3000
   seed: 0
   resume_checkpoint: null
+  # 別のBC checkpointからparamsだけを引き継いでゼロから学習を始める(step・
+  # epoch・optimizer state・学習率scheduleの位置は引き継がない)。同じ実行を
+  # 続きから再開したいだけならresume_checkpointを使うこと(両立不可)。
+  init_checkpoint: null
