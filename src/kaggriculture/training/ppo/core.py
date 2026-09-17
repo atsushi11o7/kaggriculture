@@ -27,6 +27,7 @@ class PPOConfig:
     value_clip_epsilon: float = 0.2
     value_coef: float = 0.5
     entropy_coef: float = 0.01
+    target_kl: float | None = 0.02
     max_grad_norm: float = 1.0
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
@@ -140,28 +141,47 @@ def update_epochs(model, train_state, batch, key, config, num_epochs, minibatch_
         raise ValueError("sample count must be divisible by minibatch_size")
     minibatches = sample_count // minibatch_size
 
+    zero_metrics = Metrics(*(jnp.asarray(0.0) for _ in Metrics._fields))
+
     def epoch_step(carry, _):
-        state, rng = carry
+        state, rng, active = carry
         rng, permutation_key = jax.random.split(rng)
-        indices = jax.random.permutation(permutation_key, sample_count).reshape(
-            minibatches, minibatch_size
-        )
 
-        def minibatch_step(current, selected):
-            minibatch = jax.tree.map(
-                lambda value: value[selected] if value is not None else None,
-                batch,
-                is_leaf=lambda value: value is None,
+        def run_epoch(current):
+            indices = jax.random.permutation(permutation_key, sample_count).reshape(
+                minibatches, minibatch_size
             )
-            return update_minibatch(model, current, minibatch, config)
 
-        state, metrics = jax.lax.scan(minibatch_step, state, indices)
-        return (state, rng), jax.tree.map(jnp.mean, metrics)
+            def minibatch_step(inner_state, selected):
+                minibatch = jax.tree.map(
+                    lambda value: value[selected] if value is not None else None,
+                    batch,
+                    is_leaf=lambda value: value is None,
+                )
+                return update_minibatch(model, inner_state, minibatch, config)
 
-    (train_state, _), metrics = jax.lax.scan(
-        epoch_step, (train_state, key), xs=None, length=num_epochs
+            updated, minibatch_metrics = jax.lax.scan(minibatch_step, current, indices)
+            return updated, jax.tree.map(jnp.mean, minibatch_metrics)
+
+        state, metrics = jax.lax.cond(
+            active,
+            run_epoch,
+            lambda current: (current, zero_metrics),
+            state,
+        )
+        executed = active.astype(jnp.float32)
+        within_target = (
+            jnp.asarray(True) if config.target_kl is None else metrics.approx_kl <= config.target_kl
+        )
+        return (state, rng, active & within_target), (metrics, executed)
+
+    (train_state, _, _), (metrics, executed) = jax.lax.scan(
+        epoch_step, (train_state, key, jnp.asarray(True)), xs=None, length=num_epochs
     )
-    return train_state, jax.tree.map(jnp.mean, metrics)
+    epochs_completed = executed.sum().astype(jnp.int32)
+    divisor = jnp.maximum(epochs_completed, 1)
+    metrics = jax.tree.map(lambda value: value.sum(axis=0) / divisor, metrics)
+    return train_state, metrics, epochs_completed
 
 
 __all__ = ["PPOBatch", "PPOConfig", "compute_gae", "terminal_win_rewards"]

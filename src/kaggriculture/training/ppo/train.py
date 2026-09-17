@@ -101,6 +101,66 @@ def _add_to_pool(pool_dir: Path, train_state, metadata: dict, pool_size: int) ->
             shutil.rmtree(stale)
 
 
+def _select_opponent(
+    draw: float, has_pool: bool, anchor_probability: float, pool_probability: float
+) -> str:
+    """Select the rollout opponent class from one uniform draw.
+
+    poolが空の間は、pool分の確率もself-playへ逃がさずanchorへ回す
+    (両者が同時に劣化しうるself-playを増やさないため)。
+    """
+    if not 0 <= anchor_probability <= 1 or not 0 <= pool_probability <= 1:
+        raise ValueError("opponent probabilities must be between 0 and 1")
+    if anchor_probability + pool_probability > 1:
+        raise ValueError("anchor and pool probabilities must sum to at most 1")
+    effective_anchor = anchor_probability if has_pool else anchor_probability + pool_probability
+    if draw < effective_anchor:
+        return "anchor"
+    if has_pool and draw < anchor_probability + pool_probability:
+        return "pool"
+    return "self"
+
+
+def _evaluation_summary(result) -> dict[str, float | int]:
+    """Summarize candidate-relative outcomes and cash for logging."""
+    outcome = jax.device_get(result.outcome)
+    cash = jax.device_get(result.cash)
+    games_per_seat = outcome.shape[0] // 2
+
+    def rate(values):
+        return float(((values > 0) + 0.5 * (values == 0)).mean())
+
+    return {
+        "win_rate": float(jax.device_get(result.win_rate)),
+        "wins": int((outcome > 0).sum()),
+        "draws": int((outcome == 0).sum()),
+        "losses": int((outcome < 0).sum()),
+        "seat0_win_rate": rate(outcome[:games_per_seat]),
+        "seat1_win_rate": rate(outcome[games_per_seat:]),
+        "candidate_cash": float(cash[:, 0].mean()),
+        "opponent_cash": float(cash[:, 1].mean()),
+    }
+
+
+def _log_evaluation(update: int, opponent: str, result) -> dict[str, float | int]:
+    summary = _evaluation_summary(result)
+    logger.info(
+        "update=%d eval_opponent=%s win_rate=%.3f wins=%d draws=%d losses=%d "
+        "seat0_win_rate=%.3f seat1_win_rate=%.3f candidate_cash=%.1f opponent_cash=%.1f",
+        update,
+        opponent,
+        summary["win_rate"],
+        summary["wins"],
+        summary["draws"],
+        summary["losses"],
+        summary["seat0_win_rate"],
+        summary["seat1_win_rate"],
+        summary["candidate_cash"],
+        summary["opponent_cash"],
+    )
+    return summary
+
+
 def _prune_step_checkpoints(directory: Path, keep_last: int) -> None:
     """checkpoints/step_*だけ古い順に間引く(best/poolは対象外)。"""
     if keep_last <= 0 or not directory.exists():
@@ -141,11 +201,29 @@ def main(cfg: DictConfig) -> None:
     model = M.PolicyValueNet(model_config)
     key = jax.random.key(cfg.ppo.seed)
     key, init_key, reset_key = jax.random.split(key, 3)
-    variables = P.initialize(model, init_key)
+    initial_variables = P.initialize(model, init_key)
+    variables = initial_variables
     if cfg.ppo.init_bc_checkpoint and cfg.ppo.resume_checkpoint:
         raise ValueError("init_bc_checkpoint and resume_checkpoint are mutually exclusive")
+    resume_metadata = None
+    if cfg.ppo.resume_checkpoint:
+        resume_metadata = read_checkpoint_metadata(
+            Path(to_absolute_path(cfg.ppo.resume_checkpoint))
+        )
+    anchor_checkpoint = cfg.ppo.anchor_bc_checkpoint or cfg.ppo.init_bc_checkpoint
+    if anchor_checkpoint is None and resume_metadata is not None:
+        previous_ppo = resume_metadata.get("config", {}).get("ppo", {})
+        anchor_checkpoint = previous_ppo.get("anchor_bc_checkpoint") or previous_ppo.get(
+            "init_bc_checkpoint"
+        )
+    if anchor_checkpoint is None:
+        raise ValueError("PPO requires init_bc_checkpoint or anchor_bc_checkpoint")
+    anchor_path = Path(to_absolute_path(anchor_checkpoint))
+    anchor_variables = _load_bc_actor(anchor_path, initial_variables)
     if cfg.ppo.init_bc_checkpoint:
-        variables = _load_bc_actor(Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), variables)
+        variables = _load_bc_actor(
+            Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), initial_variables
+        )
     ppo_config = core.PPOConfig(
         gamma=cfg.ppo.gamma,
         gae_lambda=cfg.ppo.gae_lambda,
@@ -153,6 +231,7 @@ def main(cfg: DictConfig) -> None:
         value_clip_epsilon=cfg.ppo.value_clip_epsilon,
         value_coef=cfg.ppo.value_coef,
         entropy_coef=cfg.ppo.entropy_coef,
+        target_kl=cfg.ppo.target_kl,
         max_grad_norm=cfg.ppo.max_grad_norm,
         learning_rate=cfg.ppo.learning_rate,
         weight_decay=cfg.ppo.weight_decay,
@@ -166,7 +245,7 @@ def main(cfg: DictConfig) -> None:
     start_update = 0
     if cfg.ppo.resume_checkpoint:
         directory = Path(to_absolute_path(cfg.ppo.resume_checkpoint))
-        metadata = read_checkpoint_metadata(directory)
+        metadata = resume_metadata
         validate_checkpoint_metadata(metadata)
         train_state, _ = load_checkpoint(directory, train_state)
         start_update = int(metadata["update"])
@@ -182,17 +261,32 @@ def main(cfg: DictConfig) -> None:
     # 固定パスになってしまい、別runのpool対戦相手が混ざり込む)。
     pool_dir = checkpoints_dir / cfg.ppo.pool_dir
     for update in range(start_update + 1, cfg.ppo.total_updates + 1):
-        key, rollout_key, update_key, pool_key, member_key, seat_key, eval_key = jax.random.split(
-            key, 7
+        key, rollout_key, update_key, opponent_key, member_key, seat_key, eval_key = (
+            jax.random.split(key, 7)
         )
         started = time.perf_counter()
         pool_members = _pool_members(pool_dir)
-        used_pool = bool(pool_members) and bool(
-            jax.random.bernoulli(pool_key, cfg.ppo.pool_sample_prob)
+        opponent = _select_opponent(
+            float(jax.random.uniform(opponent_key)),
+            bool(pool_members),
+            cfg.ppo.anchor_sample_prob,
+            cfg.ppo.pool_sample_prob,
         )
-        if used_pool:
-            member = pool_members[int(jax.random.randint(member_key, (), 0, len(pool_members)))]
-            opponent_variables = _opponent_variables(member, train_state)
+        if opponent == "self":
+            rollout = collect_rollout(
+                model,
+                {"params": train_state.params},
+                rollout_config,
+                state,
+                counters,
+                rollout_key,
+            )
+        else:
+            if opponent == "anchor":
+                opponent_variables = anchor_variables
+            else:
+                member = pool_members[int(jax.random.randint(member_key, (), 0, len(pool_members)))]
+                opponent_variables = _opponent_variables(member, train_state)
             learner_seat = int(jax.random.bernoulli(seat_key))
             rollout = collect_rollout_vs_opponent(
                 model,
@@ -204,17 +298,8 @@ def main(cfg: DictConfig) -> None:
                 counters,
                 rollout_key,
             )
-        else:
-            rollout = collect_rollout(
-                model,
-                {"params": train_state.params},
-                rollout_config,
-                state,
-                counters,
-                rollout_key,
-            )
         batch = to_ppo_batch(rollout, ppo_config.gamma, ppo_config.gae_lambda)
-        train_state, metrics = core.update_epochs(
+        train_state, metrics, epochs_completed = core.update_epochs(
             model,
             train_state,
             batch,
@@ -232,18 +317,40 @@ def main(cfg: DictConfig) -> None:
             clamped = float(jax.device_get(rollout.executor_clamped).mean())
             invalid_unit = float(jax.device_get(rollout.executor_invalid_unit).mean())
             clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
+            dones = jax.device_get(rollout.dones)
+            terminal_count = int(dones.sum())
+            value_arr = jax.device_get(batch.old_value)
+            return_arr = jax.device_get(batch.returns)
+            advantage_arr = jax.device_get(batch.advantages)
             logger.info(
-                "update=%d seconds=%.1f samples/s=%.1f loss=%.4f invalid=%.3f clamped=%.3f "
-                "invalid_unit=%.3f clamped_unit=%.3f pool=%s",
+                "update=%d seconds=%.1f samples/s=%.1f loss=%.4f policy_loss=%.4f "
+                "value_loss=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.3f epochs=%d "
+                "terminal_count=%d "
+                "value_mean=%.4f value_std=%.4f return_mean=%.4f return_std=%.4f "
+                "advantage_mean=%.4f advantage_std=%.4f "
+                "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f opponent=%s",
                 update,
                 elapsed,
                 samples / elapsed,
                 values.loss,
+                values.policy_loss,
+                values.value_loss,
+                values.entropy,
+                values.approx_kl,
+                values.clip_fraction,
+                int(jax.device_get(epochs_completed)),
+                terminal_count,
+                value_arr.mean(),
+                value_arr.std(),
+                return_arr.mean(),
+                return_arr.std(),
+                advantage_arr.mean(),
+                advantage_arr.std(),
                 invalid,
                 clamped,
                 invalid_unit,
                 clamped_unit,
-                used_pool,
+                opponent,
             )
 
         metadata = {
@@ -254,26 +361,48 @@ def main(cfg: DictConfig) -> None:
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
         if cfg.ppo.eval_interval > 0 and update % cfg.ppo.eval_interval == 0:
-            if not (best_dir / "metadata.json").exists():
-                save_checkpoint(best_dir, train_state, metadata)
-                _add_to_pool(pool_dir, train_state, metadata, cfg.ppo.pool_size)
-                logger.info("update=%d promoted=bootstrap", update)
-            else:
-                best_variables = _opponent_variables(best_dir, train_state)
-                result = evaluate_both_seats(
+            best_exists = (best_dir / "metadata.json").exists()
+            best_variables = (
+                _opponent_variables(best_dir, train_state) if best_exists else anchor_variables
+            )
+            best_key, anchor_key = jax.random.split(eval_key)
+            best_result = evaluate_both_seats(
+                model,
+                {"params": train_state.params},
+                best_variables,
+                rollout_config,
+                best_key,
+                cfg.ppo.eval_episodes,
+            )
+            best_summary = _log_evaluation(
+                update, "best" if best_exists else "anchor_as_best", best_result
+            )
+            if best_exists:
+                anchor_result = evaluate_both_seats(
                     model,
                     {"params": train_state.params},
-                    best_variables,
+                    anchor_variables,
                     rollout_config,
-                    eval_key,
+                    anchor_key,
                     cfg.ppo.eval_episodes,
                 )
-                win_rate = float(jax.device_get(result.win_rate))
-                promoted = win_rate >= cfg.ppo.promotion_win_rate
-                if promoted:
-                    save_checkpoint(best_dir, train_state, metadata)
-                    _add_to_pool(pool_dir, train_state, metadata, cfg.ppo.pool_size)
-                logger.info("update=%d eval_win_rate=%.3f promoted=%s", update, win_rate, promoted)
+                anchor_summary = _log_evaluation(update, "anchor", anchor_result)
+            else:
+                anchor_summary = best_summary
+            promoted = (
+                best_summary["win_rate"] >= cfg.ppo.promotion_win_rate
+                and anchor_summary["win_rate"] >= cfg.ppo.anchor_promotion_win_rate
+            )
+            if promoted:
+                save_checkpoint(best_dir, train_state, metadata)
+                _add_to_pool(pool_dir, train_state, metadata, cfg.ppo.pool_size)
+            logger.info(
+                "update=%d promoted=%s best_win_rate=%.3f anchor_win_rate=%.3f",
+                update,
+                promoted,
+                best_summary["win_rate"],
+                anchor_summary["win_rate"],
+            )
 
         if update % cfg.ppo.checkpoint_interval == 0 or update == cfg.ppo.total_updates:
             directory = checkpoints_dir / f"step_{update}"
