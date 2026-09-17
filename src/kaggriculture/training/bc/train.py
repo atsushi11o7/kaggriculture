@@ -115,6 +115,29 @@ def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, 
     return updated_best
 
 
+def _load_bc_checkpoint_params(path: Path, model_config: ModelConfig) -> dict:
+    """別のBC checkpointからparamsだけを読み込む(optimizer state・step・epoch・
+    学習率scheduleの位置は一切引き継がず、新しいrunをゼロから始める)。"""
+    metadata = read_checkpoint_metadata(path)
+    validate_checkpoint_metadata(metadata)
+    source_config = ModelConfig(**metadata["model_config"])
+    if source_config != model_config:
+        raise ValueError(
+            f"init_checkpoint's model_config does not match cfg.model: "
+            f"{source_config} != {model_config}"
+        )
+    source_model = M.PolicyValueNet(source_config)
+    source_variables = P.initialize(source_model, jax.random.key(0))
+    # optax内部のstate構造(count等)をcheckpoint保存時のschedule形状に合わせる
+    # ためのダミー(値は使わない、paramsだけ取り出してすぐ捨てる)。
+    dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
+    source_state = core.create_train_state(
+        source_model, source_variables, core.BCConfig(dummy_schedule)
+    )
+    source_state, _ = load_checkpoint(path, source_state)
+    return {"params": source_state.params}
+
+
 def _validate(model, params, paths, cfg, bc_config):
     total = tokens = 0.0
     batches = iter_batches(paths, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
@@ -144,6 +167,12 @@ def main(cfg: DictConfig) -> None:
     validation_paths = prepare_episodes(validation_sources, cache / "validation", rules)
     model = M.PolicyValueNet(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
+    if cfg.train.init_checkpoint:
+        if cfg.train.resume_checkpoint:
+            raise ValueError("init_checkpoint and resume_checkpoint are mutually exclusive")
+        variables = _load_bc_checkpoint_params(
+            Path(to_absolute_path(cfg.train.init_checkpoint)), model_config
+        )
     steps_per_epoch = _steps_per_epoch(train_paths, cfg.train.batch_size)
     total_steps = _schedule_steps(steps_per_epoch, cfg.train.max_epochs, cfg.train.max_steps)
     learning_rate = optax.cosine_decay_schedule(
