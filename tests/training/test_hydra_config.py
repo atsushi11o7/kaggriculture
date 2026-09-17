@@ -39,3 +39,14 @@ def test_cli_overrides_apply_after_shared_model_config() -> None:
 
     assert cfg.model.d_model == 64
     assert cfg.experiment.name == "small"
+
+
+def test_ppo_stability_defaults() -> None:
+    cfg = _compose("ppo")
+
+    assert cfg.ppo.learning_rate == 5.0e-5
+    assert cfg.ppo.entropy_coef == 0.0
+    assert cfg.ppo.target_kl == 0.02
+    assert cfg.ppo.anchor_sample_prob == 0.5
+    assert cfg.ppo.pool_sample_prob == 0.5
+    assert cfg.ppo.anchor_promotion_win_rate == 0.5

@@ -24,14 +24,16 @@ ppo:
   rollout_horizon: 128
   update_epochs: 4
   minibatch_size: 256
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-5
   weight_decay: 0.0
   gamma: 0.999
   gae_lambda: 0.95
   clip_epsilon: 0.2
   value_clip_epsilon: 0.2
   value_coef: 0.5
-  entropy_coef: 0.01
+  entropy_coef: 0.0
+  # epoch平均KLが閾値を超えたら、そのrolloutに対する残りのepochを打ち切る。
+  target_kl: 0.02
   max_grad_norm: 1.0
   temperature: 0.8
   seed: 0
@@ -40,16 +42,22 @@ ppo:
   # step_*だけ古い順に削除する(best/poolは対象外)。0以下で無効。
   keep_last_checkpoints: 5
   init_bc_checkpoint: null
+  # nullならinit_bc_checkpoint、resume時は元runの設定から固定BCを復元する。
+  anchor_bc_checkpoint: null
   resume_checkpoint: null
   # このupdate間隔でcandidateをchekcpoints/best/と対戦させ、昇格判定を行う。0以下で無効。
   eval_interval: 50
   eval_episodes: 32
   # 昇格に必要な勝率(24位のPokemon TCGソリューションと同じ値)。
   promotion_win_rate: 0.52
+  # 固定BCに対して退化したcandidateを昇格させない。
+  anchor_promotion_win_rate: 0.5
   # 昇格したcandidateを追加保存するpopulation-based self-play用の対戦相手プール。
   # checkpoints/配下の相対名(実行ディレクトリ内に閉じる。絶対パス化すると
   # 実行間で共有される固定パスになり、別runのpool対戦相手が混ざってしまう)。
   pool_dir: pool
   pool_size: 5
-  # 各updateでpoolの相手と対戦させる確率(pool_dirが空なら常に自己対戦)。
+  # rollout相手は固定BC 50%、昇格済みpool 50%(self-playは使わない)。
+  # poolが空ならpool分もanchorへ回す。
+  anchor_sample_prob: 0.5
   pool_sample_prob: 0.5

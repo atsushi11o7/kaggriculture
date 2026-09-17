@@ -1,5 +1,7 @@
 """固定slot BC/PPOの最小学習経路。"""
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -24,7 +26,11 @@ from kaggriculture.training.ppo.rollout import (
     collect_rollout_vs_opponent,
     to_ppo_batch,
 )
-from kaggriculture.training.ppo.train import _pool_members
+from kaggriculture.training.ppo.train import (
+    _evaluation_summary,
+    _pool_members,
+    _select_opponent,
+)
 from kaggriculture.training.replays.state import CacheRules
 from tests.policy.conftest import make_fresh_observation
 
@@ -110,6 +116,32 @@ def test_ppo_rollout_and_update() -> None:
     assert jnp.isfinite(metrics.loss)
 
 
+def test_ppo_target_kl_stops_after_first_epoch() -> None:
+    model, variables = _model()
+    rollout = collect_rollout(
+        model,
+        variables,
+        RolloutConfig(horizon=1),
+        reset(jax.random.key(1), 1),
+        H.zeros(1),
+        jax.random.key(2),
+    )
+    batch = to_ppo_batch(rollout)
+    config = ppo_core.PPOConfig(target_kl=-1.0)
+    train_state = ppo_core.create_train_state(model, variables, config)
+    key = jax.random.key(3)
+
+    stopped, metrics, epochs = ppo_core.update_epochs(model, train_state, batch, key, config, 3, 2)
+    first, first_metrics, first_epochs = ppo_core.update_epochs(
+        model, train_state, batch, key, replace(config, target_kl=None), 1, 2
+    )
+
+    assert epochs == first_epochs == 1
+    assert stopped.step == first.step == 1
+    assert jnp.isfinite(metrics.loss)
+    assert jnp.allclose(metrics.loss, first_metrics.loss)
+
+
 def test_collect_rollout_vs_opponent_masks_opponent_slots() -> None:
     model, learner_variables = _model()
     _, opponent_variables = _model()
@@ -147,6 +179,41 @@ def test_bc_resume_restores_validation_best() -> None:
     assert _restored_best({"validation_loss": 0.25}) == 0.25
     assert _restored_best({}) == float("inf")
     assert _restored_best({"best_validation_loss": 0.2, "validation_loss": 0.3}) == 0.2
+
+
+def test_select_opponent_uses_anchor_pool_and_self_probabilities() -> None:
+    assert _select_opponent(0.1, True, 0.5, 0.25) == "anchor"
+    assert _select_opponent(0.6, True, 0.5, 0.25) == "pool"
+    assert _select_opponent(0.9, True, 0.5, 0.25) == "self"
+
+
+def test_select_opponent_routes_empty_pool_share_to_anchor() -> None:
+    # poolが空の間は、pool分の確率もself-playへ逃がさずanchorへ回す。
+    assert _select_opponent(0.6, False, 0.5, 0.25) == "anchor"
+    assert _select_opponent(0.8, False, 0.5, 0.25) == "self"
+
+
+def test_evaluation_summary_reports_outcomes_seats_and_cash() -> None:
+    from kaggriculture.training.ppo.evaluation import EvaluationResult
+
+    result = EvaluationResult(
+        cash=jnp.asarray([[10.0, 2.0], [5.0, 5.0], [3.0, 9.0], [8.0, 4.0]]),
+        outcome=jnp.asarray([1.0, 0.0, -1.0, 1.0]),
+        win_rate=jnp.asarray(0.625),
+    )
+
+    summary = _evaluation_summary(result)
+
+    assert summary == {
+        "win_rate": 0.625,
+        "wins": 2,
+        "draws": 1,
+        "losses": 1,
+        "seat0_win_rate": 0.75,
+        "seat1_win_rate": 0.5,
+        "candidate_cash": 6.5,
+        "opponent_cash": 5.0,
+    }
 
 
 def test_pool_members_are_sorted_by_numeric_suffix(tmp_path) -> None:
