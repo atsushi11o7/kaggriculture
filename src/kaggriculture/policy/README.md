@@ -75,6 +75,12 @@ Executorは次を決定論的に処理します。
 Executorは戦略を追加するものではありません。方策のintentを環境契約に収める境界です。無効化率と
 クランプ率はPPOログで監視し、方策がExecutorへ過度に依存していないか確認します。
 
+採点前には合法maskと別にstrategy maskを重ねます。共有規則は
+`common/strategy.py`、状態表現に依存する判定はJAX/Torch各`strategy.py`に置きます。
+現在の追加規則は、市場の最終slotで結果がSTOPと等しいWAITを除くものだけです。
+unitのPASSを一律に除外する規則はありません。同じmaskがBC学習、PPOの選択・再評価、
+Torch提出推論に適用されます。候補IDやモデル重みの形状は変わりません。
+
 ## 数量
 
 数量は連続回帰ではなく1〜100のcategoricalです。量ごとに別の語彙indexを持ち、log正規化した
@@ -120,6 +126,9 @@ uv run python -m kaggriculture.training.bc.train
 uv run python -m kaggriculture.training.ppo.train \
   ppo.init_bc_checkpoint=/absolute/path/to/bc/checkpoints/best
 
+# 参照Actorを別のBC/PPO checkpointに固定する場合は上のコマンドに追加
+#   ppo.reference_checkpoint=/absolute/path/to/checkpoints/step_100
+
 # criticを除外してCPU提出用Torch checkpointへ変換
 uv run python -m kaggriculture.training.export_policy \
   /path/to/checkpoints/step_1000 /path/to/model_weights.pt
@@ -127,6 +136,10 @@ uv run python -m kaggriculture.training.export_policy \
 # batch別の定常推論throughput
 uv run python -m kaggriculture.training.benchmark_policy --batch-sizes 64 128 256
 ```
+
+PPOの`reference_checkpoint`はActor重みの保持項専用です。未指定なら固定BC対戦相手の
+checkpointを使い、再開時は元runの参照先を引き継ぎます。`anchor_bc_checkpoint`は対戦相手、
+`init_bc_checkpoint`は学習の初期重みとして別に扱います。参照先はBC/PPOのどちらでも指定できます。
 
 モデル構造は`training/conf/model/default.yaml`、ゲーム規則は`training/conf/rules/default.yaml`、
 学習固有設定は`bc.yaml`と`ppo.yaml`が正本です。

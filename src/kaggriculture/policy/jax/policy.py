@@ -9,6 +9,7 @@ from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax import executor as E
 from kaggriculture.policy.jax import model as M
+from kaggriculture.policy.jax import strategy as S
 from kaggriculture.policy.jax import tokenize as T
 from kaggriculture.policy.jax.types import EvaluationOutput, Intent, PolicyOutput
 from kaggriculture.rules import constants as C
@@ -93,12 +94,14 @@ def _logits(
     )
     unit_hidden = queries[:, : M.N_UNIT_SLOTS]
     market_hidden = queries[:, M.N_UNIT_SLOTS :]
-    batch = players.shape[0]
     units = jnp.arange(M.N_UNIT_SLOTS)
     unit_mask = jax.vmap(
         lambda state, player: jax.vmap(
-            lambda unit: A.legal_unit_mask(
-                state, player, unit, turns_per_day=turns_per_day, shed_capacity=shed_capacity
+            lambda unit: (
+                A.legal_unit_mask(
+                    state, player, unit, turns_per_day=turns_per_day, shed_capacity=shed_capacity
+                )
+                & S.unit_mask(state, player, unit)
             )
         )(units)
     )(states, players)
@@ -112,8 +115,8 @@ def _logits(
         A.UNIT_CANDIDATES.value[None, None],
         unit_mask,
     )
-    # 市場の後続slotは、前のSELL/HIREで合法になり得るため構造上の全候補を許す。
-    market_mask = jnp.ones((batch, C.MAX_MARKET_ORDERS, len(A.MARKET_CANDIDATES.op)), dtype=bool)
+    # 先行注文で合法化し得る候補は残し、状態に依存しない戦略規則だけ適用する。
+    market_mask = jax.vmap(S.market_mask)(states, players)
     market_logits = _candidate_logits(
         model,
         variables,
@@ -307,11 +310,17 @@ def evaluate_intent(
     mql = _quantity_logits(model, variables, mh, intent.market, A.MARKET_CANDIDATES, mqmask)
     _, mqlp, mqe = _distribution(mql / temperature, choices=intent.market_quantity)
     slot_lp = jnp.concatenate(
-        [jnp.where(active, ulp + jnp.where(uneeds, uqlp, 0), 0), mlp + jnp.where(mneeds, mqlp, 0)],
+        [
+            jnp.where(active, ulp + jnp.where(uneeds, uqlp, 0), 0),
+            jnp.where(mactive, mlp + jnp.where(mneeds, mqlp, 0), 0),
+        ],
         axis=1,
     )
     entropy = jnp.concatenate(
-        [jnp.where(active, ue + jnp.where(uneeds, uqe, 0), 0), me + jnp.where(mneeds, mqe, 0)],
+        [
+            jnp.where(active, ue + jnp.where(uneeds, uqe, 0), 0),
+            jnp.where(mactive, me + jnp.where(mneeds, mqe, 0), 0),
+        ],
         axis=1,
     )
     slot_mask = jnp.concatenate([active, mactive], axis=1)
