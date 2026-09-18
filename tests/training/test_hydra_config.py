@@ -50,3 +50,5 @@ def test_ppo_stability_defaults() -> None:
     assert cfg.ppo.anchor_sample_prob == 0.5
     assert cfg.ppo.pool_sample_prob == 0.5
     assert cfg.ppo.anchor_promotion_win_rate == 0.5
+    assert cfg.ppo.reference_actor_l2_coef == 0.1
+    assert cfg.ppo.reference_checkpoint is None

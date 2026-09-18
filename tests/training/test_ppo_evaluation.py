@@ -1,6 +1,7 @@
 """異なるvariables同士の対戦・座席バイアス除去の契約テスト。"""
 
 import jax
+import pytest
 
 from kaggriculture.policy.common.config import ModelConfig
 from kaggriculture.policy.jax import model as M
@@ -36,11 +37,15 @@ def test_combine_seats_flips_and_negates_the_second_assignment() -> None:
         cash=jax.numpy.asarray([[10.0, 2.0]]),
         outcome=jax.numpy.asarray([1.0]),
         win_rate=jax.numpy.asarray(1.0),
+        pass_rate=jax.numpy.asarray([0.1]),
+        opponent_pass_rate=jax.numpy.asarray([0.2]),
     )
     seat1 = EvaluationResult(
         cash=jax.numpy.asarray([[3.0, 9.0]]),
         outcome=jax.numpy.asarray([1.0]),  # seat1視点でopponent(候補側player1)が勝った
         win_rate=jax.numpy.asarray(1.0),
+        pass_rate=jax.numpy.asarray([0.3]),
+        opponent_pass_rate=jax.numpy.asarray([0.4]),
     )
 
     combined = _combine_seats(seat0, seat1)
@@ -49,6 +54,9 @@ def test_combine_seats_flips_and_negates_the_second_assignment() -> None:
     assert combined.cash.tolist() == [[10.0, 2.0], [9.0, 3.0]]
     assert combined.outcome.tolist() == [1.0, -1.0]
     assert float(combined.win_rate) == 0.5
+    # pass_rateもcashと同様、候補視点(seat1側はopponent_pass_rateが候補)に揃える。
+    assert combined.pass_rate.tolist() == pytest.approx([0.1, 0.4])
+    assert combined.opponent_pass_rate.tolist() == pytest.approx([0.2, 0.3])
 
 
 def test_combine_seats_gives_half_credit_for_an_exact_tie() -> None:
@@ -59,6 +67,8 @@ def test_combine_seats_gives_half_credit_for_an_exact_tie() -> None:
         cash=jax.numpy.asarray([[5.0, 5.0]]),
         outcome=jax.numpy.asarray([0.0]),
         win_rate=jax.numpy.asarray(0.0),
+        pass_rate=jax.numpy.asarray([0.0]),
+        opponent_pass_rate=jax.numpy.asarray([0.0]),
     )
 
     combined = _combine_seats(tie, tie)

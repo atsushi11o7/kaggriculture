@@ -200,20 +200,26 @@ def test_evaluation_summary_reports_outcomes_seats_and_cash() -> None:
         cash=jnp.asarray([[10.0, 2.0], [5.0, 5.0], [3.0, 9.0], [8.0, 4.0]]),
         outcome=jnp.asarray([1.0, 0.0, -1.0, 1.0]),
         win_rate=jnp.asarray(0.625),
+        pass_rate=jnp.asarray([0.1, 0.2, 0.3, 0.4]),
+        opponent_pass_rate=jnp.asarray([0.5, 0.6, 0.7, 0.8]),
     )
 
     summary = _evaluation_summary(result)
 
-    assert summary == {
-        "win_rate": 0.625,
-        "wins": 2,
-        "draws": 1,
-        "losses": 1,
-        "seat0_win_rate": 0.75,
-        "seat1_win_rate": 0.5,
-        "candidate_cash": 6.5,
-        "opponent_cash": 5.0,
-    }
+    assert summary == pytest.approx(
+        {
+            "win_rate": 0.625,
+            "wins": 2,
+            "draws": 1,
+            "losses": 1,
+            "seat0_win_rate": 0.75,
+            "seat1_win_rate": 0.5,
+            "candidate_cash": 6.5,
+            "opponent_cash": 5.0,
+            "candidate_pass_rate": 0.25,
+            "opponent_pass_rate": 0.65,
+        }
+    )
 
 
 def test_pool_members_are_sorted_by_numeric_suffix(tmp_path) -> None:
