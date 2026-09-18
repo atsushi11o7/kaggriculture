@@ -10,12 +10,9 @@ from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.common import vocab as V
 from kaggriculture.policy.torch import actions as A
 from kaggriculture.policy.torch import decode as DS
+from kaggriculture.policy.torch import strategy as S
 from kaggriculture.policy.torch import tokenize
-from kaggriculture.policy.torch.model import (
-    N_MARKET_SLOTS,
-    N_UNIT_SLOTS,
-    PolicyValueNet,
-)
+from kaggriculture.policy.torch.model import N_UNIT_SLOTS, PolicyValueNet
 from kaggriculture.rules import constants as C
 
 
@@ -264,7 +261,7 @@ def predict_action(
         market_hidden = queries[0, N_UNIT_SLOTS:]
 
         legal_masks = []
-        for position, inventory in zip(positions_xy, inventories, strict=True):
+        for slot, (position, inventory) in enumerate(zip(positions_xy, inventories, strict=True)):
             legal = {
                 _key(vector)
                 for vector in A.legal_unit_actions(
@@ -278,16 +275,20 @@ def predict_action(
                     defer_shared_resources=True,
                 )
             }
-            legal_masks.append([_key(vector) in legal for vector in UNIT_VECTORS])
+            strategic = S.unit_mask(obs, slot, UNIT_META)
+            legal_masks.append(
+                [
+                    _key(vector) in legal and strategic[index]
+                    for index, vector in enumerate(UNIT_VECTORS)
+                ]
+            )
         while len(legal_masks) < N_UNIT_SLOTS:
             legal_masks.append([index == 0 for index in range(len(UNIT_VECTORS))])
         unit_mask = torch.tensor(legal_masks, dtype=torch.bool, device=device)
         unit_logits = net.score_candidates(unit_hidden, unit_index, unit_value, unit_mask)
         selected_units = unit_logits.argmax(-1)
 
-        market_mask = torch.ones(
-            (N_MARKET_SLOTS, len(MARKET_VECTORS)), dtype=torch.bool, device=device
-        )
+        market_mask = torch.tensor(S.market_mask(obs, MARKET_META), dtype=torch.bool, device=device)
         market_logits = net.score_candidates(market_hidden, market_index, market_value, market_mask)
         selected_market = market_logits.argmax(-1)
 
