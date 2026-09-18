@@ -10,6 +10,7 @@ import jax.numpy as jnp
 
 from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
 from kaggriculture.simulator.reset import reset
 from kaggriculture.simulator.step import step_batch_lockstep
@@ -22,6 +23,17 @@ class EvaluationResult(NamedTuple):
     cash: jnp.ndarray
     outcome: jnp.ndarray
     win_rate: jnp.ndarray
+    pass_rate: jnp.ndarray
+    opponent_pass_rate: jnp.ndarray
+
+
+def _pass_and_total(action: Action, hands_active: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """farmer+hand行動のうちPASSの数と、活動中unit数を返す(1step分)。"""
+    farmer_pass = (action.farmer_op == C.FARMER_OP_PASS).astype(jnp.float32)
+    hands_pass = (action.hands_op == C.FARMER_OP_PASS).astype(jnp.float32) * hands_active
+    pass_count = farmer_pass + jnp.sum(hands_pass, axis=-1)
+    total_count = 1.0 + jnp.sum(hands_active, axis=-1)
+    return pass_count, total_count
 
 
 def _win_rate(outcome: jnp.ndarray) -> jnp.ndarray:
@@ -57,9 +69,10 @@ def evaluate_closed_loop(
     players1 = jnp.ones((batch_size,), jnp.int32)
     use_history = model.config.use_episode_history
     initial_counters = H.zeros(batch_size) if use_history else None
+    zero_counts = jnp.zeros((batch_size,), jnp.float32)
 
     def scan_step(carry, step_key):
-        state, counters = carry
+        state, counters, pass0, total0, pass1, total1 = carry
         key0, key1 = jax.random.split(step_key)
         out0 = P.sample_actions(
             model,
@@ -87,6 +100,13 @@ def evaluate_closed_loop(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
+        step_pass0, step_total0 = _pass_and_total(out0.action, state.hands_active[:, 0])
+        step_pass1, step_total1 = _pass_and_total(out1.action, state.hands_active[:, 1])
+        pass0 = pass0 + step_pass0
+        total0 = total0 + step_total0
+        pass1 = pass1 + step_pass1
+        total1 = total1 + step_total1
+
         action = _combine_seat_actions(out0.action, out1.action)
         next_state, _, _ = step_batch_lockstep(
             state,
@@ -114,20 +134,25 @@ def evaluate_closed_loop(
             if use_history
             else counters
         )
-        return (next_state, next_counters), None
+        return (next_state, next_counters, pass0, total0, pass1, total1), None
 
     keys = jax.random.split(run_key, config.episode_steps - 1)
-    (final_state, _), _ = jax.lax.scan(scan_step, (initial_state, initial_counters), keys)
+    init = (initial_state, initial_counters, zero_counts, zero_counts, zero_counts, zero_counts)
+    (final_state, _, pass0, total0, pass1, total1), _ = jax.lax.scan(scan_step, init, keys)
     cash = final_state.money
     outcome = jnp.sign(cash[:, 0] - cash[:, 1])
-    return EvaluationResult(cash, outcome, _win_rate(outcome))
+    rate0 = pass0 / jnp.maximum(total0, 1.0)
+    rate1 = pass1 / jnp.maximum(total1, 1.0)
+    return EvaluationResult(cash, outcome, _win_rate(outcome), rate0, rate1)
 
 
 def _combine_seats(seat0: EvaluationResult, seat1: EvaluationResult) -> EvaluationResult:
-    """候補がseat0だった回とseat1だった回を、候補視点1本のcash/outcomeへ揃える。"""
+    """候補がseat0だった回とseat1だった回を、候補視点1本のcash/outcome/pass_rateへ揃える。"""
     cash = jnp.concatenate([seat0.cash, seat1.cash[:, ::-1]], axis=0)
     outcome = jnp.concatenate([seat0.outcome, -seat1.outcome], axis=0)
-    return EvaluationResult(cash, outcome, _win_rate(outcome))
+    pass_rate = jnp.concatenate([seat0.pass_rate, seat1.opponent_pass_rate], axis=0)
+    opponent_pass_rate = jnp.concatenate([seat0.opponent_pass_rate, seat1.pass_rate], axis=0)
+    return EvaluationResult(cash, outcome, _win_rate(outcome), pass_rate, opponent_pass_rate)
 
 
 def evaluate_both_seats(

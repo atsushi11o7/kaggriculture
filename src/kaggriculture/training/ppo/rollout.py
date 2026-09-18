@@ -18,6 +18,7 @@ from kaggriculture.simulator.reset import reset
 from kaggriculture.simulator.state import State
 from kaggriculture.simulator.step import step_batch_lockstep
 from kaggriculture.training.ppo.core import PPOBatch, compute_gae, terminal_win_rewards
+from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, estimated_assets
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,9 @@ class RolloutConfig:
     episode_steps: int = 720
     starting_money: float = 3000.0
     temperature: float = 0.8
+    daily_reward_coefficient: float = 0.05
+    daily_reward_scale: float = 10000.0
+    daily_reward_maximum: float = 0.02
 
 
 class Rollout(NamedTuple):
@@ -44,6 +48,7 @@ class Rollout(NamedTuple):
     slot_log_prob: jnp.ndarray
     value: jnp.ndarray
     rewards: jnp.ndarray
+    daily_rewards: jnp.ndarray
     dones: jnp.ndarray
     counters: T.EpisodeCounters
     executor_invalid: jnp.ndarray
@@ -52,6 +57,7 @@ class Rollout(NamedTuple):
     executor_clamped_unit: jnp.ndarray
     final_state: State
     final_counters: T.EpisodeCounters
+    final_margin: jnp.ndarray
     bootstrap_value: jnp.ndarray
 
 
@@ -73,12 +79,20 @@ def _step(state, action, config):
 
 
 @partial(jax.jit, static_argnums=(0, 2))
-def collect_rollout(model, variables, config, initial_state, initial_counters, key):
+def collect_rollout(
+    model, variables, config, initial_state, initial_counters, key, initial_margin=None
+):
     """1回の方策forwardを含む環境stepを時間軸scanする。"""
     batch_size = initial_state.step.shape[0]
+    if initial_margin is None:
+        assets = estimated_assets(initial_state)
+        initial_margin = assets[:, 0] - assets[:, 1]
+    daily_config = DailyRewardConfig(
+        config.daily_reward_coefficient, config.daily_reward_scale, config.daily_reward_maximum
+    )
 
     def scan_step(carry, _):
-        state, counters, rng = carry
+        state, counters, margin, rng = carry
         rng, action_key, reset_key = jax.random.split(rng, 3)
         output = P.sample_self_play_actions(
             model,
@@ -92,7 +106,10 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
             hire_mult=config.hire_mult,
         )
         stepped, cash, done = _step(state, output.action, config)
-        rewards = terminal_win_rewards(cash, done)
+        daily_rewards, next_margin = daily_asset_rewards(
+            stepped, margin, done, config.turns_per_day, daily_config
+        )
+        rewards = terminal_win_rewards(cash, done) + daily_rewards
         updated_counters = (
             H.update_counters(
                 state,
@@ -113,6 +130,7 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
         )
         next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
         next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
+        next_margin = jnp.where(done, 0.0, next_margin)
         transition = (
             state,
             output.intent,
@@ -120,6 +138,7 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
             output.slot_log_prob,
             output.value,
             rewards,
+            daily_rewards,
             done,
             counters,
             output.stats.invalid_market,
@@ -127,10 +146,13 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
             output.stats.invalid_unit,
             output.stats.clamped_unit_quantity,
         )
-        return (next_state, next_counters, rng), transition
+        return (next_state, next_counters, next_margin, rng), transition
 
-    (final_state, final_counters, _), values = jax.lax.scan(
-        scan_step, (initial_state, initial_counters, key), xs=None, length=config.horizon
+    (final_state, final_counters, final_margin, _), values = jax.lax.scan(
+        scan_step,
+        (initial_state, initial_counters, initial_margin, key),
+        xs=None,
+        length=config.horizon,
     )
     bootstrap = P.state_values(
         model,
@@ -139,7 +161,7 @@ def collect_rollout(model, variables, config, initial_state, initial_counters, k
         final_counters if model.config.use_episode_history else None,
         config.turns_per_day,
     )
-    return Rollout(*values, final_state, final_counters, bootstrap)
+    return Rollout(*values, final_state, final_counters, final_margin, bootstrap)
 
 
 def _stack_seats(seat0, seat1):
@@ -156,6 +178,7 @@ def collect_rollout_vs_opponent(
     initial_state,
     initial_counters,
     key,
+    initial_margin=None,
 ):
     """learner_seat側だけlearner_variablesで行動し、もう片方は固定の
     opponent_variablesで行動する。opponentは学習対象ではないため、
@@ -167,9 +190,15 @@ def collect_rollout_vs_opponent(
     batch_size = initial_state.step.shape[0]
     opponent_seat = 1 - learner_seat
     use_history = model.config.use_episode_history
+    if initial_margin is None:
+        assets = estimated_assets(initial_state)
+        initial_margin = assets[:, 0] - assets[:, 1]
+    daily_config = DailyRewardConfig(
+        config.daily_reward_coefficient, config.daily_reward_scale, config.daily_reward_maximum
+    )
 
     def scan_step(carry, _):
-        state, counters, rng = carry
+        state, counters, margin, rng = carry
         rng, learner_key, opponent_key, reset_key = jax.random.split(rng, 4)
         learner_players = jnp.full((batch_size,), learner_seat, jnp.int32)
         opponent_players = jnp.full((batch_size,), opponent_seat, jnp.int32)
@@ -209,7 +238,10 @@ def collect_rollout_vs_opponent(
             )
         )
         stepped, cash, done = _step(state, action, config)
-        rewards = terminal_win_rewards(cash, done)
+        daily_rewards, next_margin = daily_asset_rewards(
+            stepped, margin, done, config.turns_per_day, daily_config
+        )
+        rewards = terminal_win_rewards(cash, done) + daily_rewards
         updated_counters = (
             H.update_counters(
                 state,
@@ -230,6 +262,7 @@ def collect_rollout_vs_opponent(
         )
         next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
         next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
+        next_margin = jnp.where(done, 0.0, next_margin)
         intent = _stack_seats(outputs[0].intent, outputs[1].intent)
         slot_masks = [outputs[0].slot_mask, outputs[1].slot_mask]
         slot_masks[opponent_seat] = jnp.zeros_like(slot_masks[opponent_seat])
@@ -257,6 +290,7 @@ def collect_rollout_vs_opponent(
             slot_log_prob,
             value,
             rewards,
+            daily_rewards,
             done,
             counters,
             invalid,
@@ -264,10 +298,13 @@ def collect_rollout_vs_opponent(
             invalid_unit,
             clamped_unit,
         )
-        return (next_state, next_counters, rng), transition
+        return (next_state, next_counters, next_margin, rng), transition
 
-    (final_state, final_counters, _), values = jax.lax.scan(
-        scan_step, (initial_state, initial_counters, key), xs=None, length=config.horizon
+    (final_state, final_counters, final_margin, _), values = jax.lax.scan(
+        scan_step,
+        (initial_state, initial_counters, initial_margin, key),
+        xs=None,
+        length=config.horizon,
     )
     bootstrap = P.state_values(
         model,
@@ -276,7 +313,7 @@ def collect_rollout_vs_opponent(
         final_counters if use_history else None,
         config.turns_per_day,
     )
-    return Rollout(*values, final_state, final_counters, bootstrap)
+    return Rollout(*values, final_state, final_counters, final_margin, bootstrap)
 
 
 def to_ppo_batch(rollout: Rollout, gamma=0.999, gae_lambda=0.95):

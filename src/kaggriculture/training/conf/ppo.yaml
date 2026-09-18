@@ -32,6 +32,12 @@ ppo:
   value_clip_epsilon: 0.2
   value_coef: 0.5
   entropy_coef: 0.0
+  # 日末・終端に前回評価時からの概算資産差改善を小さく加える。
+  daily_reward_coefficient: 0.05
+  daily_reward_scale: 10000.0
+  daily_reward_maximum: 0.02
+  # 固定した参照Actorからのパラメータ乖離を抑える係数(0で無効)。
+  reference_actor_l2_coef: 0.1
   # epoch平均KLが閾値を超えたら、そのrolloutに対する残りのepochを打ち切る。
   target_kl: 0.02
   max_grad_norm: 1.0
@@ -44,6 +50,8 @@ ppo:
   init_bc_checkpoint: null
   # nullならinit_bc_checkpoint、resume時は元runの設定から固定BCを復元する。
   anchor_bc_checkpoint: null
+  # 保持項の参照先。nullならanchor_bc_checkpoint/初期BCを使う。BC/PPO両対応。
+  reference_checkpoint: null
   resume_checkpoint: null
   # このupdate間隔でcandidateをchekcpoints/best/と対戦させ、昇格判定を行う。0以下で無効。
   eval_interval: 50

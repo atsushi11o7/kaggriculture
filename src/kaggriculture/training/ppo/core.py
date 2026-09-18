@@ -9,6 +9,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
+from flax import traverse_util
 from flax.training.train_state import TrainState
 
 from kaggriculture.policy.jax import model as M
@@ -27,6 +28,7 @@ class PPOConfig:
     value_clip_epsilon: float = 0.2
     value_coef: float = 0.5
     entropy_coef: float = 0.01
+    reference_actor_l2_coef: float = 0.0
     target_kl: float | None = 0.02
     max_grad_norm: float = 1.0
     learning_rate: float = 1e-4
@@ -55,6 +57,7 @@ class Metrics(NamedTuple):
     entropy: jnp.ndarray
     approx_kl: jnp.ndarray
     clip_fraction: jnp.ndarray
+    reference_actor_l2: jnp.ndarray
 
 
 def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig):
@@ -74,7 +77,23 @@ def _normalize_advantages(advantages: jnp.ndarray, sample_mask: jnp.ndarray) -> 
     return (advantages - mean) / jnp.sqrt(variance + 1e-8)
 
 
-def _loss(model, params, batch: PPOBatch, config: PPOConfig):
+def _reference_actor_l2(params, reference_params) -> jnp.ndarray:
+    """参照Actorと共有encoderの相対パラメータ距離を返す。"""
+    current = traverse_util.flatten_dict(params)
+    reference = traverse_util.flatten_dict(reference_params)
+    total = jnp.asarray(0.0)
+    count = 0
+    for path, value in current.items():
+        if path[0] in ("value_head", "privileged_encoder"):
+            continue
+        anchor = reference[path]
+        scale = jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(anchor))), 0.1)
+        total = total + jnp.sum(jnp.square((value - anchor) / scale))
+        count += value.size
+    return total / max(count, 1)
+
+
+def _loss(model, params, batch: PPOBatch, config: PPOConfig, reference_params=None):
     evaluation = P.evaluate_intent(
         model,
         {"params": params},
@@ -122,20 +141,34 @@ def _loss(model, params, batch: PPOBatch, config: PPOConfig):
         )
     )
     entropy = _sample_mean((evaluation.entropy * mask).sum(-1) / count)
-    loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
-    return loss, Metrics(loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction)
+    reference_actor_l2 = (
+        _reference_actor_l2(params, reference_params)
+        if config.reference_actor_l2_coef > 0 and reference_params is not None
+        else jnp.asarray(0.0)
+    )
+    loss = (
+        policy_loss
+        + config.value_coef * value_loss
+        - config.entropy_coef * entropy
+        + config.reference_actor_l2_coef * reference_actor_l2
+    )
+    return loss, Metrics(
+        loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction, reference_actor_l2
+    )
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def update_minibatch(model, train_state, batch, config):
+def update_minibatch(model, train_state, batch, config, reference_params=None):
     (_, metrics), gradients = jax.value_and_grad(_loss, argnums=1, has_aux=True)(
-        model, train_state.params, batch, config
+        model, train_state.params, batch, config, reference_params
     )
     return train_state.apply_gradients(grads=gradients), metrics
 
 
 @partial(jax.jit, static_argnums=(0, 4, 5, 6))
-def update_epochs(model, train_state, batch, key, config, num_epochs, minibatch_size):
+def update_epochs(
+    model, train_state, batch, key, config, num_epochs, minibatch_size, reference_params=None
+):
     sample_count = batch.players.shape[0]
     if sample_count % minibatch_size:
         raise ValueError("sample count must be divisible by minibatch_size")
@@ -158,7 +191,7 @@ def update_epochs(model, train_state, batch, key, config, num_epochs, minibatch_
                     batch,
                     is_leaf=lambda value: value is None,
                 )
-                return update_minibatch(model, inner_state, minibatch, config)
+                return update_minibatch(model, inner_state, minibatch, config, reference_params)
 
             updated, minibatch_metrics = jax.lax.scan(minibatch_step, current, indices)
             return updated, jax.tree.map(jnp.mean, minibatch_metrics)

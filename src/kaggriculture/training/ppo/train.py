@@ -10,8 +10,8 @@ from pathlib import Path
 
 import hydra
 import jax
-import optax
-from flax import traverse_util
+import jax.numpy as jnp
+from flax import serialization, traverse_util
 from flax.core import freeze, unfreeze
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -25,7 +25,6 @@ from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.simulator.reset import reset
-from kaggriculture.training.bc import core as bc_core
 from kaggriculture.training.checkpoint import (
     load_checkpoint,
     load_pytree,
@@ -41,30 +40,58 @@ from kaggriculture.training.ppo.rollout import (
     collect_rollout_vs_opponent,
     to_ppo_batch,
 )
+from kaggriculture.training.rl import estimated_assets
 
 logger = logging.getLogger(__name__)
 
+_ACTOR_CONFIG_FIELDS = (
+    "d_model",
+    "num_heads",
+    "d_feedforward",
+    "num_layers_encoder",
+    "num_layers_decoder",
+    "dropout",
+    "use_episode_history",
+)
 
-def _load_bc_actor(path: Path, variables: dict) -> dict:
-    """固定slot BCの同名・同shape Actor parameterだけを読み込む。"""
+
+def _load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConfig) -> dict:
+    """互換BC/PPO checkpointのActor重みを現在のモデルへ読み込む。
+
+    Args:
+        path: checkpointディレクトリ。
+        variables: criticを含む現在のモデルの初期variables。
+        target_config: 現在のモデル設定。
+
+    Returns:
+        Actorを復元し、criticを初期値のまま残したvariables。
+
+    Raises:
+        ValueError: Actorのパラメータ名または形状が一致しない場合。
+    """
     metadata = read_checkpoint_metadata(path)
     validate_checkpoint_metadata(metadata)
     source_config = ModelConfig(**metadata["model_config"])
-    source_model = M.PolicyValueNet(source_config)
-    source_variables = P.initialize(source_model, jax.random.key(0))
-    # bc/train.pyはlearning_rateを常にcosine decay schedule(callable)として
-    # optimizerへ渡すため、復元用テンプレートもoptax内部のstate構造(count等)を
-    # 合わせる必要がある(paramsだけ取り出してすぐ捨てるので値は使わない)。
-    dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
-    source_state = bc_core.create_train_state(
-        source_model, source_variables, bc_core.BCConfig(dummy_schedule)
-    )
-    source_state, _ = load_checkpoint(path, source_state)
+    if any(
+        getattr(source_config, field) != getattr(target_config, field)
+        for field in _ACTOR_CONFIG_FIELDS
+    ):
+        raise ValueError(f"incompatible actor checkpoint config: {path}")
+    saved = serialization.msgpack_restore((path / "state.msgpack").read_bytes())
+    source = traverse_util.flatten_dict(saved["params"])
     target = traverse_util.flatten_dict(unfreeze(variables["params"]))
-    source = traverse_util.flatten_dict(unfreeze(source_state.params))
-    for name, value in source.items():
-        if name in target and target[name].shape == value.shape and name[0] != "value_head":
-            target[name] = value
+
+    def actor(name):
+        return name[0] not in ("value_head", "privileged_encoder")
+
+    source_actor = {name for name in source if actor(name)}
+    target_actor = {name for name in target if actor(name)}
+    if source_actor != target_actor or any(
+        source[name].shape != target[name].shape for name in source_actor & target_actor
+    ):
+        raise ValueError(f"incompatible actor checkpoint: {path}")
+    for name in target_actor:
+        target[name] = jnp.asarray(source[name])
     return {"params": freeze(traverse_util.unflatten_dict(target))}
 
 
@@ -139,6 +166,8 @@ def _evaluation_summary(result) -> dict[str, float | int]:
         "seat1_win_rate": rate(outcome[games_per_seat:]),
         "candidate_cash": float(cash[:, 0].mean()),
         "opponent_cash": float(cash[:, 1].mean()),
+        "candidate_pass_rate": float(jax.device_get(result.pass_rate).mean()),
+        "opponent_pass_rate": float(jax.device_get(result.opponent_pass_rate).mean()),
     }
 
 
@@ -146,7 +175,8 @@ def _log_evaluation(update: int, opponent: str, result) -> dict[str, float | int
     summary = _evaluation_summary(result)
     logger.info(
         "update=%d eval_opponent=%s win_rate=%.3f wins=%d draws=%d losses=%d "
-        "seat0_win_rate=%.3f seat1_win_rate=%.3f candidate_cash=%.1f opponent_cash=%.1f",
+        "seat0_win_rate=%.3f seat1_win_rate=%.3f candidate_cash=%.1f opponent_cash=%.1f "
+        "candidate_pass_rate=%.3f opponent_pass_rate=%.3f",
         update,
         opponent,
         summary["win_rate"],
@@ -157,6 +187,8 @@ def _log_evaluation(update: int, opponent: str, result) -> dict[str, float | int
         summary["seat1_win_rate"],
         summary["candidate_cash"],
         summary["opponent_cash"],
+        summary["candidate_pass_rate"],
+        summary["opponent_pass_rate"],
     )
     return summary
 
@@ -189,6 +221,9 @@ def _rollout_config(cfg):
         episode_steps=rules.episode_steps,
         starting_money=rules.starting_money,
         temperature=cfg.ppo.temperature,
+        daily_reward_coefficient=cfg.ppo.daily_reward_coefficient,
+        daily_reward_scale=cfg.ppo.daily_reward_scale,
+        daily_reward_maximum=cfg.ppo.daily_reward_maximum,
     )
 
 
@@ -219,11 +254,22 @@ def main(cfg: DictConfig) -> None:
     if anchor_checkpoint is None:
         raise ValueError("PPO requires init_bc_checkpoint or anchor_bc_checkpoint")
     anchor_path = Path(to_absolute_path(anchor_checkpoint))
-    anchor_variables = _load_bc_actor(anchor_path, initial_variables)
+    anchor_variables = _load_actor_checkpoint(anchor_path, initial_variables, model_config)
     if cfg.ppo.init_bc_checkpoint:
-        variables = _load_bc_actor(
-            Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), initial_variables
+        variables = _load_actor_checkpoint(
+            Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), initial_variables, model_config
         )
+    reference_checkpoint = cfg.ppo.reference_checkpoint
+    if reference_checkpoint is None and resume_metadata is not None:
+        reference_checkpoint = resume_metadata.get(
+            "reference_checkpoint_resolved"
+        ) or resume_metadata.get("config", {}).get("ppo", {}).get("reference_checkpoint")
+    reference_path = Path(to_absolute_path(reference_checkpoint or anchor_checkpoint))
+    reference_variables = (
+        anchor_variables
+        if reference_path == anchor_path
+        else _load_actor_checkpoint(reference_path, initial_variables, model_config)
+    )
     ppo_config = core.PPOConfig(
         gamma=cfg.ppo.gamma,
         gae_lambda=cfg.ppo.gae_lambda,
@@ -231,6 +277,7 @@ def main(cfg: DictConfig) -> None:
         value_clip_epsilon=cfg.ppo.value_clip_epsilon,
         value_coef=cfg.ppo.value_coef,
         entropy_coef=cfg.ppo.entropy_coef,
+        reference_actor_l2_coef=cfg.ppo.reference_actor_l2_coef,
         target_kl=cfg.ppo.target_kl,
         max_grad_norm=cfg.ppo.max_grad_norm,
         learning_rate=cfg.ppo.learning_rate,
@@ -242,6 +289,7 @@ def main(cfg: DictConfig) -> None:
     train_state = core.create_train_state(model, variables, ppo_config)
     state = reset(reset_key, cfg.env.batch_size, starting_money=cfg.rules.starting_money)
     counters = H.zeros(cfg.env.batch_size)
+    daily_margin = jnp.zeros((cfg.env.batch_size,), dtype=jnp.float32)
     start_update = 0
     if cfg.ppo.resume_checkpoint:
         directory = Path(to_absolute_path(cfg.ppo.resume_checkpoint))
@@ -249,10 +297,17 @@ def main(cfg: DictConfig) -> None:
         validate_checkpoint_metadata(metadata)
         train_state, _ = load_checkpoint(directory, train_state)
         start_update = int(metadata["update"])
-        runtime = load_pytree(
-            directory / "runtime.msgpack", {"key": key, "state": state, "counters": counters}
-        )
+        runtime_target = {"key": key, "state": state, "counters": counters}
+        previous_ppo = metadata.get("config", {}).get("ppo", {})
+        if "daily_reward_coefficient" in previous_ppo:
+            runtime_target["daily_margin"] = daily_margin
+        runtime = load_pytree(directory / "runtime.msgpack", runtime_target)
         key, state, counters = runtime["key"], runtime["state"], runtime["counters"]
+        if "daily_margin" in runtime:
+            daily_margin = runtime["daily_margin"]
+        else:
+            assets = estimated_assets(state)
+            daily_margin = assets[:, 0] - assets[:, 1]
     rollout_config = _rollout_config(cfg)
     checkpoints_dir = Path("checkpoints")
     best_dir = checkpoints_dir / "best"
@@ -280,6 +335,7 @@ def main(cfg: DictConfig) -> None:
                 state,
                 counters,
                 rollout_key,
+                daily_margin,
             )
         else:
             if opponent == "anchor":
@@ -297,6 +353,7 @@ def main(cfg: DictConfig) -> None:
                 state,
                 counters,
                 rollout_key,
+                daily_margin,
             )
         batch = to_ppo_batch(rollout, ppo_config.gamma, ppo_config.gae_lambda)
         train_state, metrics, epochs_completed = core.update_epochs(
@@ -307,9 +364,14 @@ def main(cfg: DictConfig) -> None:
             ppo_config,
             cfg.ppo.update_epochs,
             cfg.ppo.minibatch_size,
+            reference_variables["params"],
         )
         jax.block_until_ready(metrics.loss)
-        state, counters = rollout.final_state, rollout.final_counters
+        state, counters, daily_margin = (
+            rollout.final_state,
+            rollout.final_counters,
+            rollout.final_margin,
+        )
         if update % cfg.ppo.log_interval == 0:
             elapsed = time.perf_counter() - started
             values = jax.device_get(metrics)
@@ -319,13 +381,19 @@ def main(cfg: DictConfig) -> None:
             clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
             dones = jax.device_get(rollout.dones)
             terminal_count = int(dones.sum())
+            daily_arr = jax.device_get(rollout.daily_rewards)
+            rollout_steps = jax.device_get(rollout.states.step)
+            daily_boundary = ((rollout_steps + 1) % cfg.rules.turns_per_day == 0) | dones
+            daily_events = int(daily_boundary.sum())
+            daily_abs_mean = float(abs(daily_arr[:, :, 0]).sum() / max(daily_events, 1))
             value_arr = jax.device_get(batch.old_value)
             return_arr = jax.device_get(batch.returns)
             advantage_arr = jax.device_get(batch.advantages)
             logger.info(
                 "update=%d seconds=%.1f samples/s=%.1f loss=%.4f policy_loss=%.4f "
-                "value_loss=%.4f entropy=%.4f approx_kl=%.4f clip_fraction=%.3f epochs=%d "
-                "terminal_count=%d "
+                "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
+                "approx_kl=%.4f clip_fraction=%.3f epochs=%d "
+                "terminal_count=%d daily_events=%d daily_abs_mean=%.4f "
                 "value_mean=%.4f value_std=%.4f return_mean=%.4f return_std=%.4f "
                 "advantage_mean=%.4f advantage_std=%.4f "
                 "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f opponent=%s",
@@ -336,10 +404,13 @@ def main(cfg: DictConfig) -> None:
                 values.policy_loss,
                 values.value_loss,
                 values.entropy,
+                values.reference_actor_l2,
                 values.approx_kl,
                 values.clip_fraction,
                 int(jax.device_get(epochs_completed)),
                 terminal_count,
+                daily_events,
+                daily_abs_mean,
                 value_arr.mean(),
                 value_arr.std(),
                 return_arr.mean(),
@@ -358,6 +429,7 @@ def main(cfg: DictConfig) -> None:
             "trainer": "ppo",
             "update": update,
             "model_config": asdict(model_config),
+            "reference_checkpoint_resolved": str(reference_path.resolve()),
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
         if cfg.ppo.eval_interval > 0 and update % cfg.ppo.eval_interval == 0:
@@ -408,7 +480,8 @@ def main(cfg: DictConfig) -> None:
             directory = checkpoints_dir / f"step_{update}"
             save_checkpoint(directory, train_state, metadata)
             save_pytree(
-                directory / "runtime.msgpack", {"key": key, "state": state, "counters": counters}
+                directory / "runtime.msgpack",
+                {"key": key, "state": state, "counters": counters, "daily_margin": daily_margin},
             )
             _prune_step_checkpoints(checkpoints_dir, cfg.ppo.keep_last_checkpoints)
 
