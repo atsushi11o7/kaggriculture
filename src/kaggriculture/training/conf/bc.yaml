@@ -20,6 +20,7 @@ data:
   val_fraction: 0.1
   split_seed: 0
   cache_dir: data/cache/bc
+  value_cache_dir: data/cache/bc_value
   min_player_reward: null
 
 train:
@@ -35,8 +36,16 @@ train:
   validation_batches: 100
   checkpoint_interval: 3000
   seed: 0
+  # 0なら従来どおりActorのみを学習する。正値なら非対称criticも同じ更新で学習する。
+  value_loss_coefficient: 0.0
+  value_gamma: 0.999
+  daily_reward_coefficient: 0.0
+  daily_reward_scale: 10000.0
+  daily_reward_maximum: 0.02
   resume_checkpoint: null
   # 別のBC checkpointからparamsだけを引き継いでゼロから学習を始める(step・
   # epoch・optimizer state・学習率scheduleの位置は引き継がない)。同じ実行を
   # 続きから再開したいだけならresume_checkpointを使うこと(両立不可)。
   init_checkpoint: null
+  # Actorとcriticを含むvalue_pretrainまたはjoint BC checkpointから初期化する。
+  init_value_checkpoint: null

@@ -17,7 +17,12 @@ from kaggriculture.simulator.action import Action
 from kaggriculture.simulator.reset import reset
 from kaggriculture.simulator.state import State
 from kaggriculture.simulator.step import step_batch_lockstep
-from kaggriculture.training.ppo.core import PPOBatch, compute_gae, terminal_win_rewards
+from kaggriculture.training.ppo.core import (
+    CriticBatch,
+    PPOBatch,
+    compute_gae,
+    terminal_win_rewards,
+)
 from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, estimated_assets
 
 
@@ -343,5 +348,65 @@ def to_ppo_batch(rollout: Rollout, gamma=0.999, gae_lambda=0.95):
         rollout.value.reshape(-1),
         advantages.reshape(-1),
         returns.reshape(-1),
+        counters,
+    )
+
+
+def monte_carlo_returns(
+    rewards: jnp.ndarray, dones: jnp.ndarray, gamma: float
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """rollout内で終端結果まで観測できた局面の割引returnを返す。
+
+    rollout末尾の未完了episodeはbootstrapせず、valid=Falseとしてcritic
+    warm-upから除外する。終端後にresetされた新episodeの途中も同様に除外する。
+
+    Args:
+        rewards: [horizon, batch, 2]の報酬。
+        dones: [horizon, batch]の終端フラグ。
+        gamma: 割引率。
+
+    Returns:
+        (returns, valid)。returnsはrewardsと同shape、validは[horizon, batch]。
+    """
+
+    def reverse_step(carry, transition):
+        running, has_terminal = carry
+        reward, done = transition
+        running = reward + gamma * jnp.where(done[:, None], 0.0, running)
+        has_terminal = done | (~done & has_terminal)
+        return (running, has_terminal), (running, has_terminal)
+
+    initial = (
+        jnp.zeros_like(rewards[0]),
+        jnp.zeros_like(dones[0], dtype=bool),
+    )
+    _, (returns, valid) = jax.lax.scan(
+        reverse_step,
+        initial,
+        (rewards, dones),
+        reverse=True,
+    )
+    return returns, valid
+
+
+def to_critic_batch(rollout: Rollout, gamma: float = 0.999) -> CriticBatch:
+    """rolloutを状態単位のcritic warm-up batchへ変換する。"""
+    returns, valid = monte_carlo_returns(rollout.rewards, rollout.dones, gamma)
+    horizon, batch_size = rollout.dones.shape
+    samples = horizon * batch_size
+    states = jax.tree.map(
+        lambda value: value.reshape((samples,) + value.shape[2:]),
+        rollout.states,
+    )
+    counters = jax.tree.map(
+        lambda value: value.reshape((samples,) + value.shape[2:]),
+        rollout.counters,
+    )
+    learner = rollout.slot_mask.any(axis=-1)
+    mask = learner & valid[..., None]
+    return CriticBatch(
+        states,
+        returns.reshape(samples, 2),
+        mask.reshape(samples, 2),
         counters,
     )

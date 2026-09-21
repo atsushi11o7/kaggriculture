@@ -17,6 +17,8 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
+    CRITIC_ARCHITECTURE_VERSION,
+    CRITIC_PARAMETER_MODULES,
     ModelConfig,
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
@@ -38,11 +40,18 @@ from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
     collect_rollout,
     collect_rollout_vs_opponent,
+    to_critic_batch,
     to_ppo_batch,
 )
-from kaggriculture.training.rl import estimated_assets
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_critic_architecture(metadata: dict, path: Path) -> None:
+    """完全なcritic checkpointが現行構造と一致することを確認する。"""
+    if metadata.get("critic_architecture_version") != CRITIC_ARCHITECTURE_VERSION:
+        raise ValueError(f"incompatible critic architecture: {path}")
+
 
 _ACTOR_CONFIG_FIELDS = (
     "d_model",
@@ -82,7 +91,7 @@ def _load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConf
     target = traverse_util.flatten_dict(unfreeze(variables["params"]))
 
     def actor(name):
-        return name[0] not in ("value_head", "privileged_encoder")
+        return name[0] not in CRITIC_PARAMETER_MODULES
 
     source_actor = {name for name in source if actor(name)}
     target_actor = {name for name in target if actor(name)}
@@ -95,10 +104,77 @@ def _load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConf
     return {"params": freeze(traverse_util.unflatten_dict(target))}
 
 
+def _load_value_checkpoint(
+    path: Path,
+    variables: dict,
+    target_config: ModelConfig,
+    gamma: float,
+    daily_reward_coefficient: float,
+    daily_reward_scale: float,
+    daily_reward_maximum: float,
+    *,
+    allow_reward_mismatch: bool = False,
+) -> dict:
+    """事前学習済みActorとcriticをPPOへ読み込む。
+
+    報酬不一致は、直後にcritic-only warm-upで再適応する場合だけ許可する。
+    """
+    metadata = read_checkpoint_metadata(path)
+    validate_checkpoint_metadata(metadata)
+    is_value_checkpoint = metadata.get("trainer") == "value_pretrain" or (
+        metadata.get("trainer") == "bc" and metadata.get("joint_value_training") is True
+    )
+    if not is_value_checkpoint:
+        raise ValueError(f"not a value-pretraining checkpoint: {path}")
+    if metadata.get("critic_architecture_version") != CRITIC_ARCHITECTURE_VERSION:
+        raise ValueError(f"incompatible critic architecture: {path}")
+    reward_mode = metadata.get("reward_mode")
+    if reward_mode == "terminal_win":
+        source_reward = (0.0, 10000.0, 0.02)
+    elif reward_mode == "terminal_win_daily_asset":
+        source_reward = (
+            float(metadata["daily_reward_coefficient"]),
+            float(metadata["daily_reward_scale"]),
+            float(metadata["daily_reward_maximum"]),
+        )
+    else:
+        raise ValueError(f"unsupported value checkpoint reward: {path}")
+    target_reward = (
+        daily_reward_coefficient,
+        daily_reward_scale,
+        daily_reward_maximum,
+    )
+    if abs(float(metadata["gamma"]) - gamma) > 1e-9:
+        raise ValueError("value checkpoint gamma differs from PPO")
+    reward_mismatch = any(
+        abs(source - target) > 1e-9
+        for source, target in zip(source_reward, target_reward, strict=True)
+    )
+    if reward_mismatch and not allow_reward_mismatch:
+        raise ValueError("value checkpoint reward configuration differs from PPO")
+    if ModelConfig(**metadata["model_config"]) != target_config:
+        raise ValueError(f"incompatible value checkpoint model config: {path}")
+    saved = serialization.msgpack_restore((path / "state.msgpack").read_bytes())
+    source = traverse_util.flatten_dict(saved["params"])
+    target = traverse_util.flatten_dict(unfreeze(variables["params"]))
+    if source.keys() != target.keys() or any(
+        source[name].shape != target[name].shape for name in target
+    ):
+        raise ValueError(f"incompatible value checkpoint parameters: {path}")
+    return {
+        "params": freeze(
+            traverse_util.unflatten_dict(
+                {name: jnp.asarray(value) for name, value in source.items()}
+            )
+        )
+    }
+
+
 def _opponent_variables(directory: Path, train_state) -> dict:
     """train_stateと同じ構造をtemplateにして、checkpointのparamsだけを取り出す。"""
     metadata = read_checkpoint_metadata(directory)
     validate_checkpoint_metadata(metadata)
+    _validate_critic_architecture(metadata, directory)
     restored, _ = load_checkpoint(directory, train_state)
     return {"params": restored.params}
 
@@ -229,6 +305,18 @@ def _rollout_config(cfg):
 
 @hydra.main(version_base=None, config_path="../conf", config_name="ppo")
 def main(cfg: DictConfig) -> None:
+    if cfg.ppo.critic_warmup_updates < 0:
+        raise ValueError("critic_warmup_updates must be nonnegative")
+    if cfg.ppo.critic_warmup_updates > 0:
+        if cfg.ppo.critic_warmup_epochs <= 0:
+            raise ValueError("critic_warmup_epochs must be positive")
+        if cfg.ppo.rollout_horizon < cfg.rules.episode_steps:
+            raise ValueError("critic warm-up requires rollout_horizon >= episode_steps")
+        critic_samples = cfg.env.batch_size * cfg.ppo.rollout_horizon
+        if critic_samples % cfg.ppo.minibatch_size:
+            raise ValueError(
+                "minibatch_size must divide batch_size * horizon during critic warm-up"
+            )
     samples = cfg.env.batch_size * cfg.ppo.rollout_horizon * 2
     if samples % cfg.ppo.minibatch_size:
         raise ValueError("minibatch_size must divide batch_size * horizon * 2")
@@ -238,8 +326,20 @@ def main(cfg: DictConfig) -> None:
     key, init_key, reset_key = jax.random.split(key, 3)
     initial_variables = P.initialize(model, init_key)
     variables = initial_variables
-    if cfg.ppo.init_bc_checkpoint and cfg.ppo.resume_checkpoint:
-        raise ValueError("init_bc_checkpoint and resume_checkpoint are mutually exclusive")
+    if (
+        sum(
+            bool(path)
+            for path in (
+                cfg.ppo.init_bc_checkpoint,
+                cfg.ppo.init_value_checkpoint,
+                cfg.ppo.resume_checkpoint,
+            )
+        )
+        > 1
+    ):
+        raise ValueError(
+            "init_bc_checkpoint, init_value_checkpoint and resume_checkpoint are mutually exclusive"
+        )
     resume_metadata = None
     if cfg.ppo.resume_checkpoint:
         resume_metadata = read_checkpoint_metadata(
@@ -258,6 +358,17 @@ def main(cfg: DictConfig) -> None:
     if cfg.ppo.init_bc_checkpoint:
         variables = _load_actor_checkpoint(
             Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), initial_variables, model_config
+        )
+    if cfg.ppo.init_value_checkpoint:
+        variables = _load_value_checkpoint(
+            Path(to_absolute_path(cfg.ppo.init_value_checkpoint)),
+            initial_variables,
+            model_config,
+            cfg.ppo.gamma,
+            cfg.ppo.daily_reward_coefficient,
+            cfg.ppo.daily_reward_scale,
+            cfg.ppo.daily_reward_maximum,
+            allow_reward_mismatch=cfg.ppo.critic_warmup_updates > 0,
         )
     reference_checkpoint = cfg.ppo.reference_checkpoint
     if reference_checkpoint is None and resume_metadata is not None:
@@ -286,31 +397,154 @@ def main(cfg: DictConfig) -> None:
         turns_per_day=cfg.rules.turns_per_day,
         shed_capacity=cfg.rules.shed_capacity,
     )
-    train_state = core.create_train_state(model, variables, ppo_config)
     state = reset(reset_key, cfg.env.batch_size, starting_money=cfg.rules.starting_money)
     counters = H.zeros(cfg.env.batch_size)
     daily_margin = jnp.zeros((cfg.env.batch_size,), dtype=jnp.float32)
     start_update = 0
+    warmup_start = 0
+    train_state = None
+    warmup_state = None
+    resume_phase = resume_metadata.get("phase", "ppo") if resume_metadata else None
     if cfg.ppo.resume_checkpoint:
         directory = Path(to_absolute_path(cfg.ppo.resume_checkpoint))
         metadata = resume_metadata
         validate_checkpoint_metadata(metadata)
-        train_state, _ = load_checkpoint(directory, train_state)
-        start_update = int(metadata["update"])
-        runtime_target = {"key": key, "state": state, "counters": counters}
-        previous_ppo = metadata.get("config", {}).get("ppo", {})
-        if "daily_reward_coefficient" in previous_ppo:
-            runtime_target["daily_margin"] = daily_margin
-        runtime = load_pytree(directory / "runtime.msgpack", runtime_target)
-        key, state, counters = runtime["key"], runtime["state"], runtime["counters"]
-        if "daily_margin" in runtime:
-            daily_margin = runtime["daily_margin"]
+        _validate_critic_architecture(metadata, directory)
+        if resume_phase == "critic_warmup":
+            warmup_state = core.create_critic_train_state(
+                model,
+                initial_variables,
+                learning_rate=cfg.ppo.critic_warmup_learning_rate,
+                max_grad_norm=cfg.ppo.max_grad_norm,
+            )
+            warmup_state, _ = load_checkpoint(directory, warmup_state)
+            warmup_start = int(metadata["warmup_update"])
         else:
-            assets = estimated_assets(state)
-            daily_margin = assets[:, 0] - assets[:, 1]
+            train_state = core.create_train_state(model, variables, ppo_config)
+            train_state, _ = load_checkpoint(directory, train_state)
+            start_update = int(metadata["update"])
+        runtime_target = {
+            "key": key,
+            "state": state,
+            "counters": counters,
+            "daily_margin": daily_margin,
+        }
+        runtime = load_pytree(directory / "runtime.msgpack", runtime_target)
+        key, state, counters, daily_margin = (
+            runtime["key"],
+            runtime["state"],
+            runtime["counters"],
+            runtime["daily_margin"],
+        )
+
     rollout_config = _rollout_config(cfg)
     checkpoints_dir = Path("checkpoints")
     best_dir = checkpoints_dir / "best"
+    run_warmup = resume_phase == "critic_warmup" or (
+        resume_metadata is None and cfg.ppo.critic_warmup_updates > 0
+    )
+    if run_warmup:
+        if warmup_state is None:
+            warmup_state = core.create_critic_train_state(
+                model,
+                variables,
+                learning_rate=cfg.ppo.critic_warmup_learning_rate,
+                max_grad_norm=cfg.ppo.max_grad_norm,
+            )
+        rollout = critic_batch = metrics = before = None
+        for warmup_update in range(warmup_start + 1, cfg.ppo.critic_warmup_updates + 1):
+            key, rollout_key, update_key, seat_key = jax.random.split(key, 4)
+            started = time.perf_counter()
+            learner_seat = int(jax.random.bernoulli(seat_key))
+            rollout = collect_rollout_vs_opponent(
+                model,
+                {"params": warmup_state.params},
+                anchor_variables,
+                learner_seat,
+                rollout_config,
+                state,
+                counters,
+                rollout_key,
+                daily_margin,
+            )
+            critic_batch = to_critic_batch(rollout, ppo_config.gamma)
+            valid_values = int(jax.device_get(critic_batch.mask.sum()))
+            if valid_values == 0:
+                raise ValueError("critic warm-up rollout contains no completed episode")
+            before = core.evaluate_critic(
+                model,
+                warmup_state.params,
+                critic_batch,
+                cfg.rules.turns_per_day,
+                cfg.ppo.minibatch_size,
+            )
+            warmup_state, _ = core.update_critic_epochs(
+                model,
+                warmup_state,
+                critic_batch,
+                update_key,
+                cfg.ppo.critic_warmup_epochs,
+                cfg.ppo.minibatch_size,
+                cfg.rules.turns_per_day,
+            )
+            metrics = core.evaluate_critic(
+                model,
+                warmup_state.params,
+                critic_batch,
+                cfg.rules.turns_per_day,
+                cfg.ppo.minibatch_size,
+            )
+            jax.block_until_ready(metrics.loss)
+            state, counters, daily_margin = (
+                rollout.final_state,
+                rollout.final_counters,
+                rollout.final_margin,
+            )
+            elapsed = time.perf_counter() - started
+            values, values_before = jax.device_get((metrics, before))
+            logger.info(
+                "phase=critic_warmup update=%d/%d seconds=%.1f samples/s=%.1f "
+                "valid_values=%d loss=%.4f r2=%.4f correlation=%.4f "
+                "r2_before_update=%.4f correlation_before_update=%.4f",
+                warmup_update,
+                cfg.ppo.critic_warmup_updates,
+                elapsed,
+                valid_values / elapsed,
+                valid_values,
+                values.loss,
+                values.r2,
+                values.correlation,
+                values_before.r2,
+                values_before.correlation,
+            )
+            metadata = {
+                **checkpoint_shape_metadata(),
+                "trainer": "ppo",
+                "phase": "critic_warmup",
+                "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+                "warmup_update": warmup_update,
+                "update": 0,
+                "model_config": asdict(model_config),
+                "reference_checkpoint_resolved": str(reference_path.resolve()),
+                "config": OmegaConf.to_container(cfg, resolve=True),
+            }
+            directory = checkpoints_dir / "warmup_last"
+            save_checkpoint(directory, warmup_state, metadata)
+            save_pytree(
+                directory / "runtime.msgpack",
+                {
+                    "key": key,
+                    "state": state,
+                    "counters": counters,
+                    "daily_margin": daily_margin,
+                },
+            )
+        # 720ステップ分の全局面を保持したままPPO本体へ進むとGPUメモリを圧迫する。
+        del rollout, critic_batch, metrics, before
+        train_state = core.create_train_state(model, {"params": warmup_state.params}, ppo_config)
+    elif train_state is None:
+        train_state = core.create_train_state(model, variables, ppo_config)
+
     # best/step_*と同じくHydraの実行ディレクトリ配下の相対名として扱う
     # (to_absolute_pathでchdir前の元cwd基準にすると、実行のたびに共有される
     # 固定パスになってしまい、別runのpool対戦相手が混ざり込む)。
@@ -381,6 +615,11 @@ def main(cfg: DictConfig) -> None:
             clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
             dones = jax.device_get(rollout.dones)
             terminal_count = int(dones.sum())
+            terminal_win = terminal_loss = float("nan")
+            if opponent != "self" and terminal_count:
+                finished = jax.device_get(rollout.rewards)[..., learner_seat][dones]
+                terminal_win = float((finished > 0.5).mean())
+                terminal_loss = float((finished < -0.5).mean())
             daily_arr = jax.device_get(rollout.daily_rewards)
             rollout_steps = jax.device_get(rollout.states.step)
             daily_boundary = ((rollout_steps + 1) % cfg.rules.turns_per_day == 0) | dones
@@ -393,7 +632,8 @@ def main(cfg: DictConfig) -> None:
                 "update=%d seconds=%.1f samples/s=%.1f loss=%.4f policy_loss=%.4f "
                 "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
                 "approx_kl=%.4f clip_fraction=%.3f epochs=%d "
-                "terminal_count=%d daily_events=%d daily_abs_mean=%.4f "
+                "terminal_count=%d terminal_win=%.3f terminal_loss=%.3f "
+                "daily_events=%d daily_abs_mean=%.4f "
                 "value_mean=%.4f value_std=%.4f return_mean=%.4f return_std=%.4f "
                 "advantage_mean=%.4f advantage_std=%.4f "
                 "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f opponent=%s",
@@ -409,6 +649,8 @@ def main(cfg: DictConfig) -> None:
                 values.clip_fraction,
                 int(jax.device_get(epochs_completed)),
                 terminal_count,
+                terminal_win,
+                terminal_loss,
                 daily_events,
                 daily_abs_mean,
                 value_arr.mean(),
@@ -427,6 +669,8 @@ def main(cfg: DictConfig) -> None:
         metadata = {
             **checkpoint_shape_metadata(),
             "trainer": "ppo",
+            "phase": "ppo",
+            "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
             "update": update,
             "model_config": asdict(model_config),
             "reference_checkpoint_resolved": str(reference_path.resolve()),

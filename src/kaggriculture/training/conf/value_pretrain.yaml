@@ -1,0 +1,48 @@
+defaults:
+  - model: default
+  - rules: default
+  - _self_
+
+experiment:
+  name: baseline
+
+hydra:
+  job:
+    name: value_pretrain
+    chdir: true
+  run:
+    dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+model:
+  use_asymmetric_critic: true
+
+data:
+  data_dir: data/replays
+  selection_dir: null
+  num_episodes: null
+  val_fraction: 0.1
+  split_seed: 0
+  cache_dir: data/cache/value_pretrain
+
+train:
+  actor_checkpoint: null
+  gamma: 0.999
+  # PPO開始時と同じ複合報酬。0にすると終端勝敗のみを学習する。
+  daily_reward_coefficient: 0.05
+  daily_reward_scale: 10000.0
+  daily_reward_maximum: 0.02
+  batch_size: 64
+  learning_rate: 1.0e-4
+  # cosine decayの最終学習率はlearning_rate * lr_decay_alpha。
+  lr_decay_alpha: 0.1
+  max_grad_norm: 1.0
+  max_epochs: 5
+  max_steps: -1
+  log_interval: 50
+  seed: 0
+
+validation:
+  # 検証局面は試合単位で固定サンプリングし、epochを跨いで同じ集合を使う。
+  episodes: 128
+  states_per_episode: 32
+  seed: 0

@@ -7,7 +7,10 @@ import jax.numpy as jnp
 import pytest
 from flax.core import freeze, unfreeze
 
-from kaggriculture.policy.common.config import checkpoint_shape_metadata
+from kaggriculture.policy.common.config import (
+    CRITIC_ARCHITECTURE_VERSION,
+    checkpoint_shape_metadata,
+)
 from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
@@ -16,8 +19,13 @@ from kaggriculture.simulator.reset import reset
 from kaggriculture.training.bc import core as bc_core
 from kaggriculture.training.checkpoint import save_checkpoint
 from kaggriculture.training.ppo import core
-from kaggriculture.training.ppo.rollout import RolloutConfig, collect_rollout, to_ppo_batch
-from kaggriculture.training.ppo.train import _load_actor_checkpoint
+from kaggriculture.training.ppo.rollout import (
+    RolloutConfig,
+    collect_rollout,
+    monte_carlo_returns,
+    to_ppo_batch,
+)
+from kaggriculture.training.ppo.train import _load_actor_checkpoint, _load_value_checkpoint
 from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, estimated_assets
 from tests.policy.test_policy import _model
 
@@ -113,6 +121,78 @@ def test_ppo_update_accepts_bc_actor_anchor() -> None:
     assert jnp.isfinite(metrics.loss)
 
 
+def test_monte_carlo_returns_exclude_unfinished_tail() -> None:
+    rewards = jnp.asarray(
+        [
+            [[0.0, 0.0]],
+            [[1.0, -1.0]],
+            [[0.0, 0.0]],
+            [[0.0, 0.0]],
+        ]
+    )
+    dones = jnp.asarray([[False], [True], [False], [False]])
+
+    returns, valid = monte_carlo_returns(rewards, dones, gamma=0.5)
+
+    assert jnp.allclose(returns[:2, 0], jnp.asarray([[0.5, -0.5], [1.0, -1.0]]))
+    assert jnp.array_equal(valid[:, 0], jnp.asarray([True, True, False, False]))
+
+
+def test_critic_warmup_keeps_actor_parameters_frozen() -> None:
+    base_model, _ = _model()
+    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    variables = P.initialize(model, jax.random.key(20), batch_size=2)
+    state = core.create_critic_train_state(
+        model,
+        variables,
+        learning_rate=1e-3,
+        max_grad_norm=1.0,
+    )
+    batch = core.CriticBatch(
+        reset(jax.random.key(21), 2),
+        jnp.asarray([[1.0, -1.0], [-1.0, 1.0]]),
+        jnp.ones((2, 2), dtype=bool),
+        H.zeros(2),
+    )
+    before = state.params
+    updated, _ = core.update_critic_minibatch(model, state, batch, 24)
+
+    before_flat = jax.tree_util.tree_flatten_with_path(before)[0]
+    after = dict(jax.tree_util.tree_flatten_with_path(updated.params)[0])
+    critic_changed = False
+    for path, value in before_flat:
+        name = path[0].key
+        if name in core.CRITIC_PARAMETER_MODULES:
+            critic_changed |= not jnp.array_equal(value, after[path])
+        else:
+            assert jnp.array_equal(value, after[path])
+    assert critic_changed
+
+
+def test_evaluate_critic_chunks_match_a_direct_computation() -> None:
+    base_model, _ = _model()
+    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    variables = P.initialize(model, jax.random.key(30), batch_size=4)
+    batch = core.CriticBatch(
+        reset(jax.random.key(31), 4),
+        jnp.asarray([[1.0, -1.0], [-1.0, 1.0], [0.5, -0.5], [-0.25, 0.25]]),
+        jnp.asarray([[True, True], [True, False], [True, True], [False, False]]),
+        H.zeros(4),
+    )
+
+    chunked = core.evaluate_critic(model, variables["params"], batch, 24, 2)
+
+    predictions = core._critic_predictions(model, variables["params"], batch, 24)
+    mask = batch.mask.astype(jnp.float32)
+    sse = jnp.sum(jnp.square(predictions - batch.targets) * mask)
+    mean = jnp.sum(batch.targets * mask) / mask.sum()
+    target_ss = jnp.sum(jnp.square(batch.targets - mean) * mask)
+    assert jnp.allclose(chunked.loss, sse / mask.sum(), atol=1e-5)
+    assert jnp.allclose(chunked.r2, 1 - sse / target_ss, atol=1e-4)
+    with pytest.raises(ValueError, match="divisible"):
+        core.evaluate_critic(model, variables["params"], batch, 24, 3)
+
+
 def test_daily_reward_config_rejects_invalid_scale() -> None:
     try:
         DailyRewardConfig(scale=0)
@@ -149,6 +229,86 @@ def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) ->
         loaded["value_head"]["layers_0"]["kernel"],
         target_variables["params"]["value_head"]["layers_0"]["kernel"],
     )
+    if "critic_macro_encoder" in target_variables["params"]:
+        assert jnp.array_equal(
+            loaded["critic_macro_encoder"]["layers_0"]["kernel"],
+            target_variables["params"]["critic_macro_encoder"]["layers_0"]["kernel"],
+        )
+    if trainer == "bc":
+        states = reset(jax.random.key(8), 2)
+        players = jnp.asarray([0, 1], dtype=jnp.int32)
+        source_output = P.sample_actions(
+            model,
+            {"params": source_state.params},
+            states,
+            players,
+            jax.random.key(9),
+            greedy=True,
+        )
+        target_output = P.sample_actions(
+            target_model,
+            {"params": loaded},
+            states,
+            players,
+            jax.random.key(9),
+            greedy=True,
+        )
+        assert jax.tree.all(
+            jax.tree.map(jnp.array_equal, source_output.intent, target_output.intent)
+        )
+        assert jnp.allclose(source_output.slot_log_prob, target_output.slot_log_prob)
+
+
+def test_value_checkpoint_reward_mismatch_requires_warmup(tmp_path) -> None:
+    base_model, _ = _model()
+    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    variables = P.initialize(model, jax.random.key(30))
+    state = core.create_train_state(model, variables, core.PPOConfig())
+    checkpoint = tmp_path / "value"
+    save_checkpoint(
+        checkpoint,
+        state,
+        {
+            **checkpoint_shape_metadata(),
+            "trainer": "value_pretrain",
+            "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+            "model_config": asdict(model.config),
+            "reward_mode": "terminal_win_daily_asset",
+            "gamma": 0.999,
+            "daily_reward_coefficient": 0.02,
+            "daily_reward_scale": 10000.0,
+            "daily_reward_maximum": 0.02,
+        },
+    )
+
+    with pytest.raises(ValueError, match="reward configuration differs"):
+        _load_value_checkpoint(checkpoint, variables, model.config, 0.999, 0.0, 10000.0, 0.02)
+
+    loaded = _load_value_checkpoint(
+        checkpoint,
+        variables,
+        model.config,
+        0.999,
+        0.0,
+        10000.0,
+        0.02,
+        allow_reward_mismatch=True,
+    )
+    assert jax.tree.all(
+        jax.tree.map(jnp.array_equal, loaded["params"], freeze(variables["params"]))
+    )
+
+    with pytest.raises(ValueError, match="gamma differs"):
+        _load_value_checkpoint(
+            checkpoint,
+            variables,
+            model.config,
+            0.95,
+            0.0,
+            10000.0,
+            0.02,
+            allow_reward_mismatch=True,
+        )
 
 
 def test_reference_actor_rejects_incompatible_checkpoint(tmp_path) -> None:

@@ -71,6 +71,59 @@ def test_jax_to_torch_outputs_match() -> None:
     np.testing.assert_allclose(np.asarray(jv), tv.numpy(), atol=3e-3, rtol=3e-3)
 
 
+def test_jax_to_torch_asymmetric_critic_outputs_match() -> None:
+    config = ModelConfig(
+        d_model=8,
+        num_heads=1,
+        d_feedforward=16,
+        num_layers_encoder=1,
+        num_layers_decoder=1,
+        num_layers_critic=1,
+        dropout=0.0,
+        use_episode_history=False,
+        use_asymmetric_critic=True,
+    )
+    jax_net = JaxNet(config)
+    variables = initialize(jax_net, jax.random.key(10), batch_size=2)
+    torch_net = TorchNet(config).eval()
+    jax_to_torch(variables, torch_net)
+
+    index = np.zeros((2, L.NUM_WORDS_ENCODER, F.MAX_ENCODER_FEATURES), np.int32)
+    value = np.zeros_like(index, dtype=np.float32)
+    positions = np.full((2, N_UNIT_SLOTS), L.NO_POSITION, np.int32)
+    active = np.zeros((2, N_UNIT_SLOTS), bool)
+    active[:, 0] = True
+    inventory_index = np.zeros((2, N_UNIT_SLOTS, F.MAX_ENCODER_FEATURES), np.int32)
+    inventory_value = np.zeros_like(inventory_index, dtype=np.float32)
+
+    count = len(L.PRIVILEGED_OWNER_ZONE_WITH_CLS) - 1
+    privileged_index = np.zeros((2, count, F.MAX_PRIVILEGED_FEATURES), np.int32)
+    privileged_value = np.zeros_like(privileged_index, dtype=np.float32)
+    privileged_positions = np.full((2, count), L.NO_POSITION, np.int32)
+    privileged_padding = np.zeros((2, count), bool)
+    critic_macro = np.linspace(-0.5, 0.5, 24, dtype=np.float32).reshape(2, 12)
+
+    args = (
+        index,
+        value,
+        positions,
+        active,
+        inventory_index,
+        inventory_value,
+        privileged_index,
+        privileged_value,
+        privileged_positions,
+        privileged_padding,
+        critic_macro,
+    )
+    jq, jv = jax_net.apply(variables, *(jnp.asarray(item) for item in args))
+    with torch.no_grad():
+        tq, tv = torch_net(*(torch.from_numpy(item) for item in args))
+
+    np.testing.assert_allclose(np.asarray(jq), tq.numpy(), atol=3e-3, rtol=3e-3)
+    np.testing.assert_allclose(np.asarray(jv), tv.numpy(), atol=3e-3, rtol=3e-3)
+
+
 def test_torch_predicts_complete_action() -> None:
     config = ModelConfig(
         d_model=8,

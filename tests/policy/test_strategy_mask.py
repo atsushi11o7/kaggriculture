@@ -55,3 +55,23 @@ def test_strategy_mask_is_shared_by_sampling_and_re_evaluation() -> None:
     )
     wait = int(jnp.nonzero(A.MARKET_CANDIDATES.op == A.MARKET_WAIT)[0][0])
     assert not np.asarray(output.intent.market[:, -1] == wait).any()
+
+
+def test_evaluate_intent_flags_a_teacher_label_masked_by_strategy_rules() -> None:
+    """教師データがstrategy maskで禁止された候補(最終slotのWAIT)を指す場合、
+    slot_validはFalseになり、-1e9 logitがそのままBC lossへ入らないことを
+    確認する回帰テスト。"""
+    model, variables = _model()
+    states = reset(jax.random.key(5), 1)
+    players = jnp.asarray([0], dtype=jnp.int32)
+    output = P.sample_actions(model, variables, states, players, jax.random.key(6))
+    wait = int(jnp.nonzero(A.MARKET_CANDIDATES.op == A.MARKET_WAIT)[0][0])
+    # 全slotをWAIT(STOPではない)にして、最終slotまで確実にmactive=Trueにする。
+    forced_intent = output.intent._replace(market=jnp.full_like(output.intent.market, wait))
+
+    evaluated = P.evaluate_intent(model, variables, states, players, forced_intent)
+
+    assert not bool(evaluated.slot_valid[0, -1])
+    # maskされた候補のlogitは-1e9(model.pyのscore_candidates)なので、除外しなければ
+    # そのslotのlog_probが極端に負になり、平均lossを崩壊させる。
+    assert float(evaluated.slot_log_prob[0, -1]) < -1000

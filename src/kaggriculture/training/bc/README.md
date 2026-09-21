@@ -27,6 +27,25 @@ uv run python -m kaggriculture.training.bc.train \
 cacheは`data.cache_dir`へepisode単位で保存します。同じリプレイ・rulesなら実験間で再利用できます。
 定期checkpointは`checkpoints/step_<n>`、validation lossが最小の重みは`checkpoints/best`です。
 
+## Actorとcriticの共同学習
+
+`value_loss_coefficient`を正値にすると、BCの方策lossと完了試合のreturnに対するvalue MSEを
+一つのoptimizer更新で学習します。共有embedding/Transformerには両方の勾配が流れ、方策headには
+BCだけ、privileged/macro/value branchにはvalue lossだけが流れます。モデル構造はPPOと共通です。
+
+```bash
+uv run python -m kaggriculture.training.bc.train \
+  experiment.name=joint_bc_value \
+  model.use_asymmetric_critic=true \
+  train.init_value_checkpoint=outputs/value_pretrain/<run>/checkpoints/best \
+  train.value_loss_coefficient=0.01 \
+  train.daily_reward_coefficient=0.0 \
+  data.value_cache_dir=data/cache/bc_value_terminal
+```
+
+方策教師とvalue教師は同じtrain/validation試合集合から独立にbatch化します。joint checkpointには
+両方の重みと報酬設定を保存するため、PPOの`ppo.init_value_checkpoint`へ直接渡せます。
+
 PPOへはcheckpointディレクトリを直接渡します。
 
 ```bash

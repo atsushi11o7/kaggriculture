@@ -6,11 +6,13 @@ import jax
 import jax.numpy as jnp
 
 from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common.config import NUM_CRITIC_MACRO_FEATURES
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax import executor as E
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import strategy as S
 from kaggriculture.policy.jax import tokenize as T
+from kaggriculture.policy.jax import value_features as VF
 from kaggriculture.policy.jax.types import EvaluationOutput, Intent, PolicyOutput
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
@@ -80,6 +82,7 @@ def _logits(
             "privileged_value": features.value,
             "privileged_positions": privileged_positions,
             "privileged_padding": privileged_padding,
+            "critic_macro": jax.vmap(VF.critic_macro_features)(states, players),
         }
     queries, value = model.apply(
         variables,
@@ -125,7 +128,16 @@ def _logits(
         A.MARKET_CANDIDATES.value[None, None],
         market_mask,
     )
-    return value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, unit_mask
+    return (
+        value,
+        unit_hidden,
+        market_hidden,
+        unit_logits,
+        market_logits,
+        unit_active,
+        unit_mask,
+        market_mask,
+    )
 
 
 def _market_active(choices: jnp.ndarray) -> jnp.ndarray:
@@ -169,7 +181,7 @@ def sample_actions(
     hire_mult: float = 1.0,
 ) -> PolicyOutput:
     """全slotを1回のTransformer計算で共同生成する。"""
-    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _ = _logits(
+    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _, _ = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     keys = jax.random.split(key, 4)
@@ -264,7 +276,7 @@ def evaluate_intent(
     shed_capacity: int = 100,
 ) -> EvaluationOutput:
     """保存したintentを一括再評価する。PPO用の逐次traceは不要。"""
-    value, uh, mh, ul, ml, active, unit_mask = _logits(
+    value, uh, mh, ul, ml, active, unit_mask, market_mask = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     _, ulp, ue = _distribution(ul / temperature, choices=intent.unit)
@@ -323,8 +335,11 @@ def evaluate_intent(
         ],
         axis=1,
     )
+    market_candidate_valid = jnp.take_along_axis(market_mask, intent.market[..., None], axis=-1)[
+        ..., 0
+    ]
     slot_mask = jnp.concatenate([active, mactive], axis=1)
-    slot_valid = jnp.concatenate([unit_valid, jnp.ones_like(mactive)], axis=1)
+    slot_valid = jnp.concatenate([unit_valid, market_candidate_valid], axis=1)
     return EvaluationOutput(slot_lp.sum(-1), slot_lp, slot_mask, slot_valid, entropy, value)
 
 
@@ -376,6 +391,7 @@ def state_values(model, variables, states, counters=None, turns_per_day=24):
             "privileged_value": features.value,
             "privileged_positions": privileged_positions,
             "privileged_padding": privileged_padding,
+            "critic_macro": jax.vmap(VF.critic_macro_features)(doubled, players),
         }
     _, values = model.apply(
         variables,
@@ -417,6 +433,7 @@ def initialize(model: M.PolicyValueNet, key, batch_size: int = 1):
             ),
             "privileged_positions": jnp.full((batch_size, count), L.NO_POSITION, jnp.int32),
             "privileged_padding": jnp.zeros((batch_size, count), bool),
+            "critic_macro": jnp.zeros((batch_size, NUM_CRITIC_MACRO_FEATURES), dtype=jnp.float32),
         }
     return model.init(
         key,
