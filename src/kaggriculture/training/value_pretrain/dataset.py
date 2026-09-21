@@ -77,9 +77,37 @@ def load_episode(
     Raises:
         ValueError: 報酬設定が不正、またはリプレイが不完全な場合。
     """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return episode_from_data(
+        data,
+        path,
+        gamma=gamma,
+        episode_steps=episode_steps,
+        turns_per_day=turns_per_day,
+        daily_reward_coefficient=daily_reward_coefficient,
+        daily_reward_scale=daily_reward_scale,
+        daily_reward_maximum=daily_reward_maximum,
+    )
+
+
+def episode_from_data(
+    data: dict,
+    path: Path,
+    *,
+    gamma: float,
+    episode_steps: int,
+    turns_per_day: int,
+    daily_reward_coefficient: float = 0.0,
+    daily_reward_scale: float = 10000.0,
+    daily_reward_maximum: float = 0.02,
+):
+    """解析済みepisodeから、行動前Stateの系列と両席のreturnを作る。
+
+    BCとvalueを同じ局面で共同学習するとき、episodeを二重に解析しないための入口。
+    返すStateの位置`i`は、`iter_replay_actions`が返す観測のstep位置`i`と一致する。
+    """
     if daily_reward_coefficient < 0 or daily_reward_scale <= 0 or daily_reward_maximum <= 0:
         raise ValueError("invalid daily reward configuration")
-    data = json.loads(path.read_text(encoding="utf-8"))
     steps = data["steps"]
     rewards = data.get("rewards")
     if (

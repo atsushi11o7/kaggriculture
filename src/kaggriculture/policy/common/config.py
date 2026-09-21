@@ -8,7 +8,16 @@ POLICY_ARCHITECTURE = "fixed_slot"
 POLICY_ARCHITECTURE_VERSION = 2
 CRITIC_ARCHITECTURE_VERSION = 2
 NUM_CRITIC_MACRO_FEATURES = 12
-CRITIC_PARAMETER_MODULES = frozenset({"value_head", "privileged_encoder", "critic_macro_encoder"})
+CRITIC_PARAMETER_MODULES = frozenset(
+    {
+        "value_head",
+        "privileged_encoder",
+        "critic_macro_encoder",
+        "critic_token_embedding",
+        "critic_board_position_embedding",
+        "critic_encoder",
+    }
+)
 
 
 def checkpoint_shape_metadata() -> dict[str, int | str]:

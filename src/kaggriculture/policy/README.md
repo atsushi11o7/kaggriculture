@@ -143,3 +143,37 @@ checkpointを使い、再開時は元runの参照先を引き継ぎます。`anc
 
 モデル構造は`training/conf/model/default.yaml`、ゲーム規則は`training/conf/rules/default.yaml`、
 学習固有設定は`bc.yaml`と`ppo.yaml`が正本です。
+
+## 完全分離critic
+
+既存の共有Encoder版は既定の`shared`として維持する。比較実験では
+`model_variant=separated`を指定すると、Actorとパラメータを一切共有しないcriticを使える。
+
+```text
+Actor:  token embedding → public encoder → query/policy heads
+Critic: critic token embedding → critic public encoder ┐
+        privileged encoder                             ├→ value head
+        macro encoder                                  ┘
+```
+
+従来のshared value checkpointを`init_value_checkpoint`へ指定した場合、Actor重みはそのまま読み込み、
+critic専用のtoken embedding・位置embedding・公開Encoderには対応する共有重みを複製する。このため
+切替直後の方策とvalue予測を維持したまま、以後の勾配だけを完全に分離できる。
+
+```bash
+# BC + value共同学習
+uv run python -m kaggriculture.training.bc.train \
+  train.model_variant=separated \
+  model.use_asymmetric_critic=true \
+  train.value_loss_coefficient=0.5 \
+  train.init_value_checkpoint=/path/to/shared/checkpoints/best
+
+# PPO
+uv run python -m kaggriculture.training.ppo.train \
+  ppo.model_variant=separated \
+  model.use_asymmetric_critic=true \
+  ppo.init_value_checkpoint=/path/to/shared/or/separated/checkpoints/best
+```
+
+分離版は公開EncoderをActor用とcritic用に各1回実行するため、共有版より計算時間とVRAM使用量が増える。
+提出用Actorの構造は変わらず、export時にはcritic専用パラメータを除外する。

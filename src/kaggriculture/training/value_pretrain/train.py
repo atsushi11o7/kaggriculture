@@ -14,12 +14,11 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
-    CRITIC_ARCHITECTURE_VERSION,
     ModelConfig,
     checkpoint_shape_metadata,
 )
-from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.checkpoint import save_checkpoint
 from kaggriculture.training.ppo.train import _load_actor_checkpoint
 from kaggriculture.training.replays import (
@@ -112,7 +111,7 @@ def main(cfg: DictConfig) -> None:
     )
     if not train_shards or not validation_shards:
         raise ValueError("training and validation both require completed episodes")
-    model = M.PolicyValueNet(model_config)
+    model = create_model(model_config, cfg.train.model_variant)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     variables = _load_actor_checkpoint(
         Path(to_absolute_path(cfg.train.actor_checkpoint)), variables, model_config
@@ -184,7 +183,8 @@ def main(cfg: DictConfig) -> None:
         validation = metrics["model_mse"]
         metadata = {
             "trainer": "value_pretrain",
-            "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+            "model_variant": cfg.train.model_variant,
+            "critic_architecture_version": critic_version(cfg.train.model_variant),
             "model_config": asdict(model_config),
             **checkpoint_shape_metadata(),
             "reward_mode": "terminal_win_daily_asset",

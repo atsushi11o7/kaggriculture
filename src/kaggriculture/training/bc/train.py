@@ -16,13 +16,12 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
-    CRITIC_ARCHITECTURE_VERSION,
     ModelConfig,
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
 )
-from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.bc import core
 from kaggriculture.training.bc.cache import iter_batches, prepare_episodes
 from kaggriculture.training.checkpoint import (
@@ -38,7 +37,6 @@ from kaggriculture.training.replays import (
 )
 from kaggriculture.training.replays.state import CacheRules
 from kaggriculture.training.rl import DailyRewardConfig
-from kaggriculture.training.value_pretrain import cache as value_cache
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +62,6 @@ def _sources(cfg):
     if cfg.data.num_episodes is not None:
         files = files[: cfg.data.num_episodes]
     return split_episode_files(files, cfg.data.val_fraction, cfg.data.split_seed)
-
-
-def _episode_files(sources) -> list[Path]:
-    """Return unique replay paths from plain or player-selected BC sources."""
-    return list(
-        dict.fromkeys(
-            Path(source[0] if isinstance(source, tuple) else source) for source in sources
-        )
-    )
 
 
 def _steps_per_epoch(paths, batch_size: int) -> int:
@@ -114,24 +103,17 @@ def _checkpoint(
     cfg,
     model_config,
     validation_paths,
-    value_validation_paths,
     bc_config,
     best,
 ):
-    metrics = _validate(
-        model,
-        state.params,
-        validation_paths,
-        value_validation_paths,
-        cfg,
-        bc_config,
-    )
+    metrics = _validate(model, state.params, validation_paths, cfg, bc_config)
     validation = float(metrics.loss) if metrics is not None else None
     improved = validation is not None and validation < best
     updated_best = validation if improved else best
     metadata = {
         **checkpoint_shape_metadata(),
         "trainer": "bc",
+        "model_variant": cfg.train.model_variant,
         "step": step,
         "epoch": epoch,
         "validation_loss": validation,
@@ -145,7 +127,7 @@ def _checkpoint(
         metadata.update(
             {
                 "joint_value_training": True,
-                "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+                "critic_architecture_version": critic_version(cfg.train.model_variant),
                 "reward_mode": "terminal_win_daily_asset",
                 "gamma": float(cfg.train.value_gamma),
                 "daily_reward_coefficient": float(cfg.train.daily_reward_coefficient),
@@ -164,58 +146,42 @@ def _load_bc_checkpoint_params(path: Path, variables: dict, model_config: ModelC
     return _load_actor_checkpoint(path, variables, model_config)
 
 
-def _repeat_value_batches(paths, batch_size: int, *, seed: int, shuffle: bool):
-    cycle = 0
-    while True:
-        yielded = False
-        for batch in value_cache.iter_batches(
-            paths,
-            batch_size,
-            seed=seed + cycle,
-            shuffle=shuffle,
-            drop_last=True,
-        ):
-            yielded = True
-            yield batch
-        if not yielded:
-            raise ValueError("value training data must contain at least one complete batch")
-        cycle += 1
+def _update_ema(ema, metrics, decay: float = 0.98):
+    """ログ間隔ごとの1バッチ値は振れが大きいので、方策・value lossの移動平均も出す。"""
+    values = (float(metrics.policy_loss), float(metrics.value_loss))
+    if ema is None:
+        return values
+    return tuple(decay * old + (1 - decay) * new for old, new in zip(ema, values, strict=True))
 
 
-def _validate(model, params, paths, value_paths, cfg, bc_config):
-    policy_total = 0.0
-    policy_count = 0.0
-    value_total = 0.0
-    value_count = 0
+def _spread_subset(paths, batch_size: int, batches: int):
+    """検証に使うshardを、先頭ではなく全体から等間隔に選ぶ(1 shardは約700サンプル)。"""
+    needed = max(1, -(-batches * batch_size // 700))
+    stride = max(1, len(paths) // needed)
+    return list(paths)[::stride][:needed]
+
+
+def _validate(model, params, paths, cfg, bc_config):
+    policy_total = policy_count = 0.0
+    value_total = value_count = 0.0
     excluded = 0.0
-    batches = iter_batches(paths, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
-    value_batches = (
-        _repeat_value_batches(value_paths, cfg.train.batch_size, seed=0, shuffle=False)
-        if bc_config.value_loss_coefficient > 0
-        else None
-    )
+    subset = _spread_subset(paths, cfg.train.batch_size, cfg.train.validation_batches)
+    batches = iter_batches(subset, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
     for batch in islice(batches, cfg.train.validation_batches):
-        value_batch = next(value_batches) if value_batches is not None else None
-        metrics = core.evaluate_minibatch(
-            model,
-            params,
-            jax.device_put(batch),
-            bc_config,
-            None if value_batch is None else jax.device_put(value_batch),
+        metrics = jax.device_get(
+            core.evaluate_minibatch(model, params, jax.device_put(batch), bc_config)
         )
-        metrics = jax.device_get(metrics)
         weight = float(metrics.count)
         policy_total += float(metrics.policy_loss) * weight
         policy_count += weight
         excluded += float(metrics.excluded)
-        if value_batch is not None:
-            batch_value_count = len(value_batch[1])
-            value_total += float(metrics.value_loss) * batch_value_count
-            value_count += batch_value_count
+        samples = len(batch.players)
+        value_total += float(metrics.value_loss) * samples
+        value_count += samples
     if policy_count == 0:
         return None
     policy_loss = policy_total / policy_count
-    value_loss = value_total / value_count if value_count else 0.0
+    value_loss = value_total / value_count
     loss = policy_loss + bc_config.value_loss_coefficient * value_loss
     return core.BCMetrics(loss, policy_loss, value_loss, policy_count, excluded)
 
@@ -259,14 +225,8 @@ def main(cfg: DictConfig) -> None:
         min_player_reward=cfg.data.min_player_reward,
     )
     cache = Path(to_absolute_path(cfg.data.cache_dir))
-    train_paths = prepare_episodes(train_sources, cache / "train", rules)
-    validation_paths = prepare_episodes(validation_sources, cache / "validation", rules)
-
-    value_train_paths = []
-    value_validation_paths = []
-    if joint_value_training:
-        value_cache_directory = Path(to_absolute_path(cfg.data.value_cache_dir))
-        reward_kwargs = {
+    reward = (
+        {
             "gamma": cfg.train.value_gamma,
             "episode_steps": cfg.rules.episode_steps,
             "turns_per_day": cfg.rules.turns_per_day,
@@ -274,18 +234,15 @@ def main(cfg: DictConfig) -> None:
             "daily_reward_scale": cfg.train.daily_reward_scale,
             "daily_reward_maximum": cfg.train.daily_reward_maximum,
         }
-        value_train_paths = value_cache.prepare_episodes(
-            _episode_files(train_sources), value_cache_directory / "train", **reward_kwargs
-        )
-        value_validation_paths = value_cache.prepare_episodes(
-            _episode_files(validation_sources),
-            value_cache_directory / "validation",
-            **reward_kwargs,
-        )
-        if not value_train_paths or not value_validation_paths:
-            raise ValueError("joint BC/value training requires complete train and validation games")
+        if joint_value_training
+        else None
+    )
+    train_paths = prepare_episodes(train_sources, cache / "train", rules, reward)
+    validation_paths = prepare_episodes(validation_sources, cache / "validation", rules, reward)
+    if joint_value_training and not (train_paths and validation_paths):
+        raise ValueError("joint BC/value training requires complete train and validation games")
 
-    model = M.PolicyValueNet(model_config)
+    model = create_model(model_config, cfg.train.model_variant)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     if cfg.train.init_checkpoint:
         variables = _load_bc_checkpoint_params(
@@ -337,6 +294,7 @@ def main(cfg: DictConfig) -> None:
 
     last_saved_step = step
     epoch = start_epoch
+    ema = None
     for epoch in range(start_epoch, cfg.train.max_epochs):
         if 0 < cfg.train.max_steps <= step:
             break
@@ -346,39 +304,27 @@ def main(cfg: DictConfig) -> None:
             seed=cfg.train.seed + epoch,
             shuffle=True,
             drop_last=True,
-        )
-        value_batches = (
-            _repeat_value_batches(
-                value_train_paths,
-                cfg.train.batch_size,
-                seed=cfg.train.seed + epoch,
-                shuffle=True,
-            )
-            if joint_value_training
-            else None
+            mix_shards=cfg.train.shuffle_shards,
         )
         for batch in batches:
             if 0 < cfg.train.max_steps <= step:
                 break
-            value_batch = next(value_batches) if value_batches is not None else None
-            state, metrics = core.update_minibatch(
-                model,
-                state,
-                jax.device_put(batch),
-                bc_config,
-                None if value_batch is None else jax.device_put(value_batch),
-            )
+            state, metrics = core.update_minibatch(model, state, jax.device_put(batch), bc_config)
             step += 1
             if step % cfg.train.log_interval == 0:
                 metrics = jax.device_get(metrics)
+                ema = _update_ema(ema, metrics)
                 logger.info(
-                    "epoch=%d step=%d loss=%.4f policy_loss=%.4f value_loss=%.4f excluded=%d",
+                    "epoch=%d step=%d loss=%.4f policy_loss=%.4f value_loss=%.4f excluded=%d "
+                    "policy_ema=%.4f value_ema=%.4f",
                     epoch,
                     step,
                     float(metrics.loss),
                     float(metrics.policy_loss),
                     float(metrics.value_loss),
                     int(metrics.excluded),
+                    ema[0],
+                    ema[1],
                 )
             if step % cfg.train.checkpoint_interval == 0:
                 best = _checkpoint(
@@ -389,7 +335,6 @@ def main(cfg: DictConfig) -> None:
                     cfg,
                     model_config,
                     validation_paths,
-                    value_validation_paths,
                     bc_config,
                     best,
                 )
@@ -403,7 +348,6 @@ def main(cfg: DictConfig) -> None:
             cfg,
             model_config,
             validation_paths,
-            value_validation_paths,
             bc_config,
             best,
         )

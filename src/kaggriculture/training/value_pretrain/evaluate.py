@@ -20,9 +20,9 @@ from pathlib import Path
 import jax
 import optax
 
-from kaggriculture.policy.common.config import CRITIC_ARCHITECTURE_VERSION, ModelConfig
-from kaggriculture.policy.jax import model as M
+from kaggriculture.policy.common.config import ModelConfig
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.checkpoint import load_checkpoint, read_checkpoint_metadata
 from kaggriculture.training.ppo.train import _load_actor_checkpoint
 from kaggriculture.training.value_pretrain import core
@@ -86,7 +86,7 @@ def main() -> None:
         actor_metadata = read_checkpoint_metadata(Path(args.actor_checkpoint))
         model_config = ModelConfig(**actor_metadata["model_config"])
         model_config = replace(model_config, use_asymmetric_critic=True)
-        model = M.PolicyValueNet(model_config)
+        model = create_model(model_config, "shared")
         variables = P.initialize(model, jax.random.key(args.seed))
         variables = _load_actor_checkpoint(Path(args.actor_checkpoint), variables, model_config)
         params = variables["params"]
@@ -96,10 +96,11 @@ def main() -> None:
             raise ValueError("checkpoint path is required unless --untrained is given")
         ckpt = Path(args.checkpoint)
         metadata = json.loads((ckpt / "metadata.json").read_text())
-        if metadata.get("critic_architecture_version") != CRITIC_ARCHITECTURE_VERSION:
+        variant = metadata.get("model_variant", "shared")
+        if metadata.get("critic_architecture_version") != critic_version(variant):
             raise ValueError(f"incompatible critic architecture: {ckpt}")
         model_config = ModelConfig(**metadata["model_config"])
-        model = M.PolicyValueNet(model_config)
+        model = create_model(model_config, variant)
         variables = P.initialize(model, jax.random.key(args.seed))
         dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
         state = core.create_train_state(

@@ -11,7 +11,9 @@ import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
 
+from kaggriculture.policy.common.config import CRITIC_PARAMETER_MODULES
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.separated_model import SeparatedPolicyValueNet
 
 
 @dataclass(frozen=True)
@@ -33,14 +35,24 @@ class BCMetrics(NamedTuple):
 
 
 def create_train_state(model, variables, config: BCConfig):
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
-    )
+    def transform():
+        return optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+        )
+
+    if isinstance(model, SeparatedPolicyValueNet):
+        labels = jax.tree_util.tree_map_with_path(
+            lambda path, _: "critic" if path[0].key in CRITIC_PARAMETER_MODULES else "actor",
+            variables["params"],
+        )
+        optimizer = optax.multi_transform({"actor": transform(), "critic": transform()}, labels)
+    else:
+        optimizer = transform()
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 
-def loss(model, params, batch, config: BCConfig, value_batch=None):
+def loss(model, params, batch, config: BCConfig):
     evaluation = P.evaluate_intent(
         model,
         {"params": params},
@@ -57,27 +69,19 @@ def loss(model, params, batch, config: BCConfig, value_batch=None):
     count = jnp.maximum(mask.sum(), 1)
     policy_loss = -jnp.sum(jnp.where(mask > 0, evaluation.slot_log_prob, 0.0)) / count
 
+    # 同じ1回の順伝播で得たcritic出力を、同じ(試合・step・プレイヤー)の教師と比べる。
     value_loss = jnp.asarray(0.0)
     if config.value_loss_coefficient > 0:
-        if value_batch is None:
-            raise ValueError("value_batch is required when value loss is enabled")
-        value_states, value_targets = value_batch
-        predictions = P.state_values(
-            model,
-            {"params": params},
-            value_states,
-            turns_per_day=config.turns_per_day,
-        )
-        value_loss = jnp.mean(jnp.square(predictions - value_targets))
+        value_loss = jnp.mean(jnp.square(evaluation.value - batch.value_target))
 
     total = policy_loss + config.value_loss_coefficient * value_loss
     return BCMetrics(total, policy_loss, value_loss, count, excluded)
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def update_minibatch(model, train_state, batch, config, value_batch=None):
+def update_minibatch(model, train_state, batch, config):
     def objective(params):
-        metrics = loss(model, params, batch, config, value_batch)
+        metrics = loss(model, params, batch, config)
         return metrics.loss, metrics
 
     (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(train_state.params)
@@ -85,5 +89,5 @@ def update_minibatch(model, train_state, batch, config, value_batch=None):
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def evaluate_minibatch(model, params, batch, config, value_batch=None):
-    return loss(model, params, batch, config, value_batch)
+def evaluate_minibatch(model, params, batch, config):
+    return loss(model, params, batch, config)
