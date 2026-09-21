@@ -125,7 +125,16 @@ def _logits(
         A.MARKET_CANDIDATES.value[None, None],
         market_mask,
     )
-    return value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, unit_mask
+    return (
+        value,
+        unit_hidden,
+        market_hidden,
+        unit_logits,
+        market_logits,
+        unit_active,
+        unit_mask,
+        market_mask,
+    )
 
 
 def _market_active(choices: jnp.ndarray) -> jnp.ndarray:
@@ -169,7 +178,7 @@ def sample_actions(
     hire_mult: float = 1.0,
 ) -> PolicyOutput:
     """全slotを1回のTransformer計算で共同生成する。"""
-    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _ = _logits(
+    value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _, _ = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     keys = jax.random.split(key, 4)
@@ -264,7 +273,7 @@ def evaluate_intent(
     shed_capacity: int = 100,
 ) -> EvaluationOutput:
     """保存したintentを一括再評価する。PPO用の逐次traceは不要。"""
-    value, uh, mh, ul, ml, active, unit_mask = _logits(
+    value, uh, mh, ul, ml, active, unit_mask, market_mask = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
     _, ulp, ue = _distribution(ul / temperature, choices=intent.unit)
@@ -323,8 +332,11 @@ def evaluate_intent(
         ],
         axis=1,
     )
+    market_candidate_valid = jnp.take_along_axis(market_mask, intent.market[..., None], axis=-1)[
+        ..., 0
+    ]
     slot_mask = jnp.concatenate([active, mactive], axis=1)
-    slot_valid = jnp.concatenate([unit_valid, jnp.ones_like(mactive)], axis=1)
+    slot_valid = jnp.concatenate([unit_valid, market_candidate_valid], axis=1)
     return EvaluationOutput(slot_lp.sum(-1), slot_lp, slot_mask, slot_valid, entropy, value)
 
 
