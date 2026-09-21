@@ -141,3 +141,42 @@ def observation_to_state(
         step=np.asarray(obs.get("step", obs["day"] * turns_per_day + obs["hour"]), dtype=np.int32),
         rng_key=np.zeros(2, dtype=np.uint32),
     )
+
+
+def paired_observations_to_state(
+    observations: Sequence[dict], board_size: int = V.BOARD_SIZE, turns_per_day: int = 24
+) -> State:
+    """同一時点の両プレイヤー観測から完全なcritic用Stateを作る。
+
+    Args:
+        observations: プレイヤー0、1の順の観測。
+        board_size: 盤面の一辺の長さ。
+        turns_per_day: 1日あたりのターン数。
+
+    Returns:
+        両者のprivate情報を含むState。
+
+    Raises:
+        ValueError: 観測のプレイヤーまたは時点が一致しない場合。
+    """
+    if len(observations) != 2 or [int(obs["player"]) for obs in observations] != [0, 1]:
+        raise ValueError("expected player 0 and player 1 observations")
+    steps = [obs.get("step", obs["day"] * turns_per_day + obs["hour"]) for obs in observations]
+    if steps[0] != steps[1]:
+        raise ValueError("paired observations must describe the same step")
+    obs = observations[0]
+    farms = [
+        _parse_farm(obs["farms"][player], observations[player]["private"], board_size)
+        for player in range(2)
+    ]
+    stacked = {name: np.stack([farm[name] for farm in farms]) for name in farms[0]}
+    town = np.zeros(C.N_SHOPS, dtype=np.int32)
+    for shop in obs["town"]["unlocked_shops"]:
+        town[C.SHOPS.index(shop)] += 1
+    return State(
+        **stacked,
+        market_inventory=_dict_vector(obs["market"]["inventory"], C.PRODUCTS),
+        town_shop_counts=town,
+        step=np.asarray(obs.get("step", obs["day"] * turns_per_day + obs["hour"]), dtype=np.int32),
+        rng_key=np.zeros(2, dtype=np.uint32),
+    )
