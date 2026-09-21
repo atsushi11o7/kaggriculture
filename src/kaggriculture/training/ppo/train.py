@@ -17,15 +17,17 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
-    CRITIC_ARCHITECTURE_VERSION,
     CRITIC_PARAMETER_MODULES,
     ModelConfig,
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
 )
 from kaggriculture.policy.jax import history as H
-from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import (
+    create_model,
+    critic_version,
+)
 from kaggriculture.simulator.reset import reset
 from kaggriculture.training.checkpoint import (
     load_checkpoint,
@@ -48,8 +50,9 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_critic_architecture(metadata: dict, path: Path) -> None:
-    """完全なcritic checkpointが現行構造と一致することを確認する。"""
-    if metadata.get("critic_architecture_version") != CRITIC_ARCHITECTURE_VERSION:
+    """checkpointに記録されたcritic実装とversionの組み合わせを検証する。"""
+    variant = metadata.get("model_variant", "shared")
+    if metadata.get("critic_architecture_version") != critic_version(variant):
         raise ValueError(f"incompatible critic architecture: {path}")
 
 
@@ -101,6 +104,21 @@ def _load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConf
         raise ValueError(f"incompatible actor checkpoint: {path}")
     for name in target_actor:
         target[name] = jnp.asarray(source[name])
+
+    # 分離版のcritic公開Encoderは、Actor checkpointの公開Encoderを複製して始める。
+    # value head等は初期値のままなので、actor-only loadの意味は維持される。
+    aliases = {
+        "critic_token_embedding": "token_embedding",
+        "critic_board_position_embedding": "board_position_embedding",
+        "critic_encoder": "encoder",
+    }
+    for name in target:
+        if name[0] not in aliases:
+            continue
+        source_name = (aliases[name[0]], *name[1:])
+        if source_name not in source or source[source_name].shape != target[name].shape:
+            raise ValueError(f"incompatible separated critic initialization: {path}")
+        target[name] = jnp.asarray(source[source_name])
     return {"params": freeze(traverse_util.unflatten_dict(target))}
 
 
@@ -126,8 +144,7 @@ def _load_value_checkpoint(
     )
     if not is_value_checkpoint:
         raise ValueError(f"not a value-pretraining checkpoint: {path}")
-    if metadata.get("critic_architecture_version") != CRITIC_ARCHITECTURE_VERSION:
-        raise ValueError(f"incompatible critic architecture: {path}")
+    _validate_critic_architecture(metadata, path)
     reward_mode = metadata.get("reward_mode")
     if reward_mode == "terminal_win":
         source_reward = (0.0, 10000.0, 0.02)
@@ -157,17 +174,20 @@ def _load_value_checkpoint(
     saved = serialization.msgpack_restore((path / "state.msgpack").read_bytes())
     source = traverse_util.flatten_dict(saved["params"])
     target = traverse_util.flatten_dict(unfreeze(variables["params"]))
-    if source.keys() != target.keys() or any(
-        source[name].shape != target[name].shape for name in target
-    ):
-        raise ValueError(f"incompatible value checkpoint parameters: {path}")
-    return {
-        "params": freeze(
-            traverse_util.unflatten_dict(
-                {name: jnp.asarray(value) for name, value in source.items()}
-            )
-        )
+    aliases = {
+        "critic_token_embedding": "token_embedding",
+        "critic_board_position_embedding": "board_position_embedding",
+        "critic_encoder": "encoder",
     }
+    restored = {}
+    for name, target_value in target.items():
+        source_name = name
+        if source_name not in source and name[0] in aliases:
+            source_name = (aliases[name[0]], *name[1:])
+        if source_name not in source or source[source_name].shape != target_value.shape:
+            raise ValueError(f"incompatible value checkpoint parameters: {path}")
+        restored[name] = jnp.asarray(source[source_name])
+    return {"params": freeze(traverse_util.unflatten_dict(restored))}
 
 
 def _opponent_variables(directory: Path, train_state) -> dict:
@@ -321,7 +341,7 @@ def main(cfg: DictConfig) -> None:
     if samples % cfg.ppo.minibatch_size:
         raise ValueError("minibatch_size must divide batch_size * horizon * 2")
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
-    model = M.PolicyValueNet(model_config)
+    model = create_model(model_config, cfg.ppo.model_variant)
     key = jax.random.key(cfg.ppo.seed)
     key, init_key, reset_key = jax.random.split(key, 3)
     initial_variables = P.initialize(model, init_key)
@@ -520,8 +540,9 @@ def main(cfg: DictConfig) -> None:
             metadata = {
                 **checkpoint_shape_metadata(),
                 "trainer": "ppo",
+                "model_variant": cfg.ppo.model_variant,
                 "phase": "critic_warmup",
-                "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+                "critic_architecture_version": critic_version(cfg.ppo.model_variant),
                 "warmup_update": warmup_update,
                 "update": 0,
                 "model_config": asdict(model_config),
@@ -669,8 +690,9 @@ def main(cfg: DictConfig) -> None:
         metadata = {
             **checkpoint_shape_metadata(),
             "trainer": "ppo",
+            "model_variant": cfg.ppo.model_variant,
             "phase": "ppo",
-            "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+            "critic_architecture_version": critic_version(cfg.ppo.model_variant),
             "update": update,
             "model_config": asdict(model_config),
             "reference_checkpoint_resolved": str(reference_path.resolve()),

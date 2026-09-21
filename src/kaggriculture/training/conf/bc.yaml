@@ -23,6 +23,7 @@ data:
   min_player_reward: null
 
 train:
+  model_variant: shared
   learning_rate: 3.0e-4
   # cosine decayの最終学習率はlearning_rate * lr_decay_alpha。
   lr_decay_alpha: 0.1

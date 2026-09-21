@@ -16,13 +16,12 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
-    CRITIC_ARCHITECTURE_VERSION,
     ModelConfig,
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
 )
-from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.bc import core
 from kaggriculture.training.bc.cache import iter_batches, prepare_episodes
 from kaggriculture.training.checkpoint import (
@@ -114,6 +113,7 @@ def _checkpoint(
     metadata = {
         **checkpoint_shape_metadata(),
         "trainer": "bc",
+        "model_variant": cfg.train.model_variant,
         "step": step,
         "epoch": epoch,
         "validation_loss": validation,
@@ -127,7 +127,7 @@ def _checkpoint(
         metadata.update(
             {
                 "joint_value_training": True,
-                "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+                "critic_architecture_version": critic_version(cfg.train.model_variant),
                 "reward_mode": "terminal_win_daily_asset",
                 "gamma": float(cfg.train.value_gamma),
                 "daily_reward_coefficient": float(cfg.train.daily_reward_coefficient),
@@ -242,7 +242,7 @@ def main(cfg: DictConfig) -> None:
     if joint_value_training and not (train_paths and validation_paths):
         raise ValueError("joint BC/value training requires complete train and validation games")
 
-    model = M.PolicyValueNet(model_config)
+    model = create_model(model_config, cfg.train.model_variant)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     if cfg.train.init_checkpoint:
         variables = _load_bc_checkpoint_params(

@@ -21,8 +21,8 @@ from pathlib import Path
 import jax
 
 from kaggriculture.policy.common.config import ModelConfig, validate_checkpoint_metadata
-from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
+from kaggriculture.policy.jax.model_factory import create_model
 from kaggriculture.training.ppo import core
 from kaggriculture.training.ppo.evaluation import evaluate_both_seats
 from kaggriculture.training.ppo.rollout import RolloutConfig
@@ -32,7 +32,7 @@ def _load(directory: Path) -> tuple[dict, ModelConfig, dict]:
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     validate_checkpoint_metadata(metadata)
     model_config = ModelConfig(**metadata["model_config"])
-    model = M.PolicyValueNet(model_config)
+    model = create_model(model_config, metadata.get("model_variant", "shared"))
     variables = P.initialize(model, jax.random.key(0))
     ppo_config = core.PPOConfig(turns_per_day=24, shed_capacity=100)
     train_state = core.create_train_state(model, variables, ppo_config)
@@ -52,10 +52,15 @@ def main() -> None:
 
     loaded = {}
     model = None
+    variant = None
     for directory in args.checkpoints:
         variables, model_config, metadata = _load(directory)
+        current_variant = metadata.get("model_variant", "shared")
+        if variant is not None and current_variant != variant:
+            raise ValueError("rate_checkpoints requires one model variant per invocation")
+        variant = current_variant
         if model is None:
-            model = M.PolicyValueNet(model_config)
+            model = create_model(model_config, variant)
         loaded[str(directory)] = variables
 
     rollout_config = RolloutConfig(temperature=0.8)

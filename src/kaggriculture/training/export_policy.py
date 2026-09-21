@@ -16,7 +16,7 @@ from kaggriculture.policy.common.config import (
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
 )
-from kaggriculture.policy.jax.model import PolicyValueNet as JaxNet
+from kaggriculture.policy.jax.model_factory import create_model
 from kaggriculture.policy.jax.policy import initialize
 from kaggriculture.policy.torch.model import PolicyValueNet as TorchNet
 from kaggriculture.training.bc import core as bc_core
@@ -30,7 +30,7 @@ def export_policy(source: Path, destination: Path) -> None:
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     validate_checkpoint_metadata(metadata)
     training_config = ModelConfig(**metadata["model_config"])
-    training_model = JaxNet(training_config)
+    training_model = create_model(training_config, metadata.get("model_variant", "shared"))
     variables = initialize(training_model, jax.random.key(0))
     config = metadata["config"]
     rules = config["rules"]

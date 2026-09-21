@@ -20,6 +20,7 @@ env:
   batch_size: 128
 
 ppo:
+  model_variant: shared
   total_updates: 1000
   rollout_horizon: 128
   update_epochs: 4
