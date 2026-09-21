@@ -105,9 +105,17 @@ class PolicyValueNet(nn.Module):
         self.privileged_encoder = (
             PrivilegedEncoder(cfg, name="privileged_encoder") if cfg.use_asymmetric_critic else None
         )
+        self.critic_macro_encoder = (
+            nn.Sequential(
+                [nn.Dense(cfg.d_model), nn.relu, nn.Dense(cfg.d_model)],
+                name="critic_macro_encoder",
+            )
+            if cfg.use_asymmetric_critic
+            else None
+        )
         self.policy_proj = nn.Dense(cfg.d_model, name="policy_proj")
         self.quantity_condition = nn.Dense(cfg.d_model, name="quantity_condition")
-        value_width = cfg.d_model * (2 if cfg.use_asymmetric_critic else 1)
+        value_width = cfg.d_model * (3 if cfg.use_asymmetric_critic else 1)
         self.value_head = nn.Sequential(
             [nn.Dense(value_width // 2), nn.relu, nn.Dense(1)], name="value_head"
         )
@@ -124,6 +132,7 @@ class PolicyValueNet(nn.Module):
         privileged_value: jnp.ndarray | None = None,
         privileged_positions: jnp.ndarray | None = None,
         privileged_padding: jnp.ndarray | None = None,
+        critic_macro: jnp.ndarray | None = None,
         *,
         deterministic: bool = True,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -155,6 +164,7 @@ class PolicyValueNet(nn.Module):
                     privileged_value,
                     privileged_positions,
                     privileged_padding,
+                    critic_macro,
                 )
             ):
                 raise ValueError("asymmetric critic requires privileged inputs")
@@ -166,7 +176,8 @@ class PolicyValueNet(nn.Module):
                 self.board_position_embedding,
                 deterministic=deterministic,
             )
-            value_input = jnp.concatenate([value_input, privileged[:, 0]], axis=-1)
+            macro = self.critic_macro_encoder(critic_macro)
+            value_input = jnp.concatenate([value_input, privileged[:, 0], macro], axis=-1)
         return queries, self.value_head(value_input)[:, 0]
 
     def score_candidates(

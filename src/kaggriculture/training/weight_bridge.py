@@ -120,6 +120,17 @@ def jax_to_torch(
         _copy(state, f"{name}.weight", np.asarray(params[name]["kernel"]).T)
         _copy(state, f"{name}.bias", np.asarray(params[name]["bias"]))
 
+    if net.uses_asymmetric_critic and not actor_only:
+        macro = params["critic_macro_encoder"]
+        for index in (0, 2):
+            source = macro[f"layers_{index}"]
+            _copy(
+                state,
+                f"critic_macro_encoder.{index}.weight",
+                np.asarray(source["kernel"]).T,
+            )
+            _copy(state, f"critic_macro_encoder.{index}.bias", np.asarray(source["bias"]))
+
     if not actor_only:
         value = params["value_head"]
         _copy(state, "value_head.0.weight", np.asarray(value["layers_0"]["kernel"]).T)

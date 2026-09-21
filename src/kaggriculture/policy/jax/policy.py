@@ -6,11 +6,13 @@ import jax
 import jax.numpy as jnp
 
 from kaggriculture.policy.common import layout as L
+from kaggriculture.policy.common.config import NUM_CRITIC_MACRO_FEATURES
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax import executor as E
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import strategy as S
 from kaggriculture.policy.jax import tokenize as T
+from kaggriculture.policy.jax import value_features as VF
 from kaggriculture.policy.jax.types import EvaluationOutput, Intent, PolicyOutput
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
@@ -80,6 +82,7 @@ def _logits(
             "privileged_value": features.value,
             "privileged_positions": privileged_positions,
             "privileged_padding": privileged_padding,
+            "critic_macro": jax.vmap(VF.critic_macro_features)(states, players),
         }
     queries, value = model.apply(
         variables,
@@ -388,6 +391,7 @@ def state_values(model, variables, states, counters=None, turns_per_day=24):
             "privileged_value": features.value,
             "privileged_positions": privileged_positions,
             "privileged_padding": privileged_padding,
+            "critic_macro": jax.vmap(VF.critic_macro_features)(doubled, players),
         }
     _, values = model.apply(
         variables,
@@ -429,6 +433,7 @@ def initialize(model: M.PolicyValueNet, key, batch_size: int = 1):
             ),
             "privileged_positions": jnp.full((batch_size, count), L.NO_POSITION, jnp.int32),
             "privileged_padding": jnp.zeros((batch_size, count), bool),
+            "critic_macro": jnp.zeros((batch_size, NUM_CRITIC_MACRO_FEATURES), dtype=jnp.float32),
         }
     return model.init(
         key,

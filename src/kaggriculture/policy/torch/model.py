@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from kaggriculture.policy.common import layout as L
-from kaggriculture.policy.common.config import ModelConfig
+from kaggriculture.policy.common.config import NUM_CRITIC_MACRO_FEATURES, ModelConfig
 from kaggriculture.policy.torch.network import Encoder, PrivilegedEncoder, TokenEmbedding
 from kaggriculture.rules import constants as C
 
@@ -131,7 +131,16 @@ class PolicyValueNet(nn.Module):
             )
         else:
             self.privileged_encoder = None
-        value_width = config.d_model * (2 if config.use_asymmetric_critic else 1)
+        self.critic_macro_encoder = (
+            nn.Sequential(
+                nn.Linear(NUM_CRITIC_MACRO_FEATURES, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            if config.use_asymmetric_critic
+            else None
+        )
+        value_width = config.d_model * (3 if config.use_asymmetric_critic else 1)
         self.value_head = nn.Sequential(
             nn.Linear(value_width, value_width // 2), nn.ReLU(), nn.Linear(value_width // 2, 1)
         )
@@ -153,6 +162,7 @@ class PolicyValueNet(nn.Module):
         privileged_value: torch.Tensor | None = None,
         privileged_positions: torch.Tensor | None = None,
         privileged_padding: torch.Tensor | None = None,
+        critic_macro: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         embedded = self.embed_dense(encoder_index, encoder_value)
         memory = self.encoder.forward_embedded(embedded)
@@ -167,6 +177,7 @@ class PolicyValueNet(nn.Module):
                     privileged_value,
                     privileged_positions,
                     privileged_padding,
+                    critic_macro,
                 )
             ):
                 raise ValueError("asymmetric critic requires privileged inputs")
@@ -195,7 +206,8 @@ class PolicyValueNet(nn.Module):
             privileged = self.privileged_encoder.transformer(
                 privileged, src_key_padding_mask=padding
             )
-            value_input = torch.cat([value_input, privileged[:, 0]], dim=-1)
+            macro = self.critic_macro_encoder(critic_macro)
+            value_input = torch.cat([value_input, privileged[:, 0], macro], dim=-1)
         return queries, self.value_head(value_input)[:, 0]
 
     def score_candidates(

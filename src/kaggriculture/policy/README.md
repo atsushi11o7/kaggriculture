@@ -89,9 +89,9 @@ log probabilityへ通常の行動選択と同様に含められます。
 
 ## 非対称critic
 
-`use_asymmetric_critic=true`では、価値headだけが両プレイヤーの非公開shed・seeds・inventoryを
-参照します。Actorは公開memoryしか使いません。したがって非対称criticは学習時だけ有効で、
-提出時はcritic全体を安全に除外できます。
+`use_asymmetric_critic=true`では、価値headだけが両プレイヤーの非公開shed・seeds・inventoryと、
+現金・概算資産・土地・hand数の明示的なマクロ特徴を参照します。Actorは公開memoryしか使いません。
+したがって非対称criticは学習時だけ有効で、提出時はcritic全体を安全に除外できます。
 
 ## API
 
