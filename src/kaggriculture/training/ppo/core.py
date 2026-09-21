@@ -12,6 +12,7 @@ import optax
 from flax import traverse_util
 from flax.training.train_state import TrainState
 
+from kaggriculture.policy.common.config import CRITIC_PARAMETER_MODULES
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.tokenize import EpisodeCounters
@@ -50,6 +51,19 @@ class PPOBatch(NamedTuple):
     counters: EpisodeCounters | None
 
 
+class CriticBatch(NamedTuple):
+    states: State
+    targets: jnp.ndarray
+    mask: jnp.ndarray
+    counters: EpisodeCounters | None
+
+
+class CriticMetrics(NamedTuple):
+    loss: jnp.ndarray
+    r2: jnp.ndarray
+    correlation: jnp.ndarray
+
+
 class Metrics(NamedTuple):
     loss: jnp.ndarray
     policy_loss: jnp.ndarray
@@ -60,12 +74,143 @@ class Metrics(NamedTuple):
     reference_actor_l2: jnp.ndarray
 
 
+def create_critic_train_state(
+    model: M.PolicyValueNet,
+    variables: dict,
+    *,
+    learning_rate: float,
+    max_grad_norm: float,
+):
+    """Actorを固定し、critic moduleだけを更新するTrainStateを作る。"""
+    labels = jax.tree_util.tree_map_with_path(
+        lambda path, _: "critic" if path[0].key in CRITIC_PARAMETER_MODULES else "actor",
+        variables["params"],
+    )
+    optimizer = optax.multi_transform(
+        {
+            "critic": optax.chain(
+                optax.clip_by_global_norm(max_grad_norm),
+                optax.adam(learning_rate),
+            ),
+            "actor": optax.set_to_zero(),
+        },
+        labels,
+    )
+    return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
+
+
 def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig):
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
     )
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
+
+
+def _critic_predictions(model, params, batch: CriticBatch, turns_per_day: int):
+    return P.state_values(
+        model,
+        {"params": params},
+        batch.states,
+        counters=batch.counters,
+        turns_per_day=turns_per_day,
+    )
+
+
+def _critic_loss(model, params, batch: CriticBatch, turns_per_day: int):
+    predictions = _critic_predictions(model, params, batch, turns_per_day)
+    mask = batch.mask.astype(jnp.float32)
+    count = jnp.maximum(mask.sum(), 1)
+    return jnp.sum(jnp.square(predictions - batch.targets) * mask) / count
+
+
+@partial(jax.jit, static_argnums=(0, 3))
+def update_critic_minibatch(model, train_state, batch: CriticBatch, turns_per_day: int):
+    loss, gradients = jax.value_and_grad(_critic_loss, argnums=1)(
+        model, train_state.params, batch, turns_per_day
+    )
+    return train_state.apply_gradients(grads=gradients), loss
+
+
+@partial(jax.jit, static_argnums=(0, 4, 5, 6))
+def update_critic_epochs(
+    model,
+    train_state,
+    batch: CriticBatch,
+    key,
+    num_epochs: int,
+    minibatch_size: int,
+    turns_per_day: int,
+):
+    """固定したMonte Carlo教師でcriticだけを複数epoch更新する。"""
+    sample_count = batch.targets.shape[0]
+    if sample_count % minibatch_size:
+        raise ValueError("critic sample count must be divisible by minibatch_size")
+    minibatches = sample_count // minibatch_size
+
+    def epoch_step(carry, _):
+        state, rng = carry
+        rng, permutation_key = jax.random.split(rng)
+        indices = jax.random.permutation(permutation_key, sample_count).reshape(
+            minibatches, minibatch_size
+        )
+
+        def minibatch_step(current, selected):
+            minibatch = jax.tree.map(
+                lambda value: value[selected] if value is not None else None,
+                batch,
+                is_leaf=lambda value: value is None,
+            )
+            return update_critic_minibatch(model, current, minibatch, turns_per_day)
+
+        state, losses = jax.lax.scan(minibatch_step, state, indices)
+        return (state, rng), jnp.mean(losses)
+
+    (train_state, _), losses = jax.lax.scan(
+        epoch_step, (train_state, key), xs=None, length=num_epochs
+    )
+    return train_state, jnp.mean(losses)
+
+
+@partial(jax.jit, static_argnums=(0, 3, 4))
+def evaluate_critic(
+    model, params, batch: CriticBatch, turns_per_day: int, minibatch_size: int
+) -> CriticMetrics:
+    """masked Monte Carlo教師に対するMSE・R²・相関を返す。
+
+    全局面を一度に順伝播するとメモリを超えるため、minibatch単位で予測する。
+    """
+    sample_count = batch.targets.shape[0]
+    if sample_count % minibatch_size:
+        raise ValueError("critic sample count must be divisible by minibatch_size")
+    chunks = sample_count // minibatch_size
+    chunked = jax.tree.map(
+        lambda value: value.reshape((chunks, minibatch_size) + value.shape[1:]),
+        (batch.states, batch.counters),
+    )
+
+    def predict(item):
+        states, counters = item
+        return _critic_predictions(
+            model, params, CriticBatch(states, None, None, counters), turns_per_day
+        )
+
+    predictions = jax.lax.map(predict, chunked).reshape(batch.targets.shape)
+    mask = batch.mask.astype(jnp.float32)
+    count = jnp.maximum(mask.sum(), 1)
+    target_mean = jnp.sum(batch.targets * mask) / count
+    prediction_mean = jnp.sum(predictions * mask) / count
+    target_delta = batch.targets - target_mean
+    prediction_delta = predictions - prediction_mean
+    residual = predictions - batch.targets
+    sse = jnp.sum(jnp.square(residual) * mask)
+    target_ss = jnp.sum(jnp.square(target_delta) * mask)
+    prediction_ss = jnp.sum(jnp.square(prediction_delta) * mask)
+    covariance = jnp.sum(target_delta * prediction_delta * mask)
+    loss = sse / count
+    r2 = 1 - sse / jnp.maximum(target_ss, 1e-8)
+    correlation = covariance / jnp.sqrt(jnp.maximum(target_ss * prediction_ss, 1e-8))
+    return CriticMetrics(loss, r2, correlation)
 
 
 def _normalize_advantages(advantages: jnp.ndarray, sample_mask: jnp.ndarray) -> jnp.ndarray:
@@ -84,7 +229,7 @@ def _reference_actor_l2(params, reference_params) -> jnp.ndarray:
     total = jnp.asarray(0.0)
     count = 0
     for path, value in current.items():
-        if path[0] in ("value_head", "privileged_encoder"):
+        if path[0] in CRITIC_PARAMETER_MODULES:
             continue
         anchor = reference[path]
         scale = jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(anchor))), 0.1)
@@ -217,4 +362,4 @@ def update_epochs(
     return train_state, metrics, epochs_completed
 
 
-__all__ = ["PPOBatch", "PPOConfig", "compute_gae", "terminal_win_rewards"]
+__all__ = ["CriticBatch", "PPOBatch", "PPOConfig", "compute_gae", "terminal_win_rewards"]

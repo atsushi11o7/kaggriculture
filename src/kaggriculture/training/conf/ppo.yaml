@@ -26,6 +26,10 @@ ppo:
   minibatch_size: 256
   learning_rate: 5.0e-5
   weight_decay: 0.0
+  # PPO更新前にActorを固定し、on-policyの完了試合でcriticだけを適応させる。
+  critic_warmup_updates: 0
+  critic_warmup_epochs: 4
+  critic_warmup_learning_rate: 5.0e-5
   gamma: 0.999
   gae_lambda: 0.95
   clip_epsilon: 0.2
@@ -48,6 +52,8 @@ ppo:
   # step_*だけ古い順に削除する(best/poolは対象外)。0以下で無効。
   keep_last_checkpoints: 5
   init_bc_checkpoint: null
+  # 事前学習したActor+criticを読み込む。報酬変更時はcritic warm-upが必須。
+  init_value_checkpoint: null
   # nullならinit_bc_checkpoint、resume時は元runの設定から固定BCを復元する。
   anchor_bc_checkpoint: null
   # 保持項の参照先。nullならanchor_bc_checkpoint/初期BCを使う。BC/PPO両対応。
