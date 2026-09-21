@@ -16,6 +16,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from kaggriculture.policy.common.config import (
+    CRITIC_ARCHITECTURE_VERSION,
     ModelConfig,
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
@@ -29,12 +30,15 @@ from kaggriculture.training.checkpoint import (
     read_checkpoint_metadata,
     save_checkpoint,
 )
+from kaggriculture.training.ppo.train import _load_actor_checkpoint, _load_value_checkpoint
 from kaggriculture.training.replays import (
     list_episode_files,
     load_selected_sources,
     split_episode_files,
 )
 from kaggriculture.training.replays.state import CacheRules
+from kaggriculture.training.rl import DailyRewardConfig
+from kaggriculture.training.value_pretrain import cache as value_cache
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,15 @@ def _sources(cfg):
     if cfg.data.num_episodes is not None:
         files = files[: cfg.data.num_episodes]
     return split_episode_files(files, cfg.data.val_fraction, cfg.data.split_seed)
+
+
+def _episode_files(sources) -> list[Path]:
+    """Return unique replay paths from plain or player-selected BC sources."""
+    return list(
+        dict.fromkeys(
+            Path(source[0] if isinstance(source, tuple) else source) for source in sources
+        )
+    )
 
 
 def _steps_per_epoch(paths, batch_size: int) -> int:
@@ -93,9 +106,27 @@ def _schedule_steps(steps_per_epoch: int, max_epochs: int, max_steps: int) -> in
     return min(epoch_steps, max_steps) if max_steps > 0 else epoch_steps
 
 
-def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best):
-    """step_<n>を保存し、validationがこれまでの最良ならbestも更新する。"""
-    validation = _validate(model, state.params, validation_paths, cfg, bc_config)
+def _checkpoint(
+    model,
+    state,
+    step,
+    epoch,
+    cfg,
+    model_config,
+    validation_paths,
+    value_validation_paths,
+    bc_config,
+    best,
+):
+    metrics = _validate(
+        model,
+        state.params,
+        validation_paths,
+        value_validation_paths,
+        cfg,
+        bc_config,
+    )
+    validation = float(metrics.loss) if metrics is not None else None
     improved = validation is not None and validation < best
     updated_best = validation if improved else best
     metadata = {
@@ -104,10 +135,24 @@ def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, 
         "step": step,
         "epoch": epoch,
         "validation_loss": validation,
+        "validation_policy_loss": None if metrics is None else float(metrics.policy_loss),
+        "validation_value_loss": None if metrics is None else float(metrics.value_loss),
         "best_validation_loss": None if updated_best == float("inf") else updated_best,
         "model_config": asdict(model_config),
         "config": OmegaConf.to_container(cfg, resolve=True),
     }
+    if bc_config.value_loss_coefficient > 0:
+        metadata.update(
+            {
+                "joint_value_training": True,
+                "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+                "reward_mode": "terminal_win_daily_asset",
+                "gamma": float(cfg.train.value_gamma),
+                "daily_reward_coefficient": float(cfg.train.daily_reward_coefficient),
+                "daily_reward_scale": float(cfg.train.daily_reward_scale),
+                "daily_reward_maximum": float(cfg.train.daily_reward_maximum),
+            }
+        )
     directory = Path("checkpoints") / f"step_{step}"
     save_checkpoint(directory, state, metadata)
     if improved:
@@ -115,45 +160,96 @@ def _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, 
     return updated_best
 
 
-def _load_bc_checkpoint_params(path: Path, model_config: ModelConfig) -> dict:
-    """別のBC checkpointからparamsだけを読み込む(optimizer state・step・epoch・
-    学習率scheduleの位置は一切引き継がず、新しいrunをゼロから始める)。"""
-    metadata = read_checkpoint_metadata(path)
-    validate_checkpoint_metadata(metadata)
-    source_config = ModelConfig(**metadata["model_config"])
-    if source_config != model_config:
-        raise ValueError(
-            f"init_checkpoint's model_config does not match cfg.model: "
-            f"{source_config} != {model_config}"
-        )
-    source_model = M.PolicyValueNet(source_config)
-    source_variables = P.initialize(source_model, jax.random.key(0))
-    # optax内部のstate構造(count等)をcheckpoint保存時のschedule形状に合わせる
-    # ためのダミー(値は使わない、paramsだけ取り出してすぐ捨てる)。
-    dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
-    source_state = core.create_train_state(
-        source_model, source_variables, core.BCConfig(dummy_schedule)
-    )
-    source_state, _ = load_checkpoint(path, source_state)
-    return {"params": source_state.params}
+def _load_bc_checkpoint_params(path: Path, variables: dict, model_config: ModelConfig) -> dict:
+    return _load_actor_checkpoint(path, variables, model_config)
 
 
-def _validate(model, params, paths, cfg, bc_config):
-    total = tokens = 0.0
+def _repeat_value_batches(paths, batch_size: int, *, seed: int, shuffle: bool):
+    cycle = 0
+    while True:
+        yielded = False
+        for batch in value_cache.iter_batches(
+            paths,
+            batch_size,
+            seed=seed + cycle,
+            shuffle=shuffle,
+            drop_last=True,
+        ):
+            yielded = True
+            yield batch
+        if not yielded:
+            raise ValueError("value training data must contain at least one complete batch")
+        cycle += 1
+
+
+def _validate(model, params, paths, value_paths, cfg, bc_config):
+    policy_total = 0.0
+    policy_count = 0.0
+    value_total = 0.0
+    value_count = 0
+    excluded = 0.0
     batches = iter_batches(paths, cfg.train.batch_size, seed=0, shuffle=False, drop_last=False)
+    value_batches = (
+        _repeat_value_batches(value_paths, cfg.train.batch_size, seed=0, shuffle=False)
+        if bc_config.value_loss_coefficient > 0
+        else None
+    )
     for batch in islice(batches, cfg.train.validation_batches):
-        loss, count, _ = core.evaluate_minibatch(model, params, jax.device_put(batch), bc_config)
-        loss, count = jax.device_get((loss, count))
-        total += float(loss * count)
-        tokens += float(count)
-    return total / tokens if tokens else None
+        value_batch = next(value_batches) if value_batches is not None else None
+        metrics = core.evaluate_minibatch(
+            model,
+            params,
+            jax.device_put(batch),
+            bc_config,
+            None if value_batch is None else jax.device_put(value_batch),
+        )
+        metrics = jax.device_get(metrics)
+        weight = float(metrics.count)
+        policy_total += float(metrics.policy_loss) * weight
+        policy_count += weight
+        excluded += float(metrics.excluded)
+        if value_batch is not None:
+            batch_value_count = len(value_batch[1])
+            value_total += float(metrics.value_loss) * batch_value_count
+            value_count += batch_value_count
+    if policy_count == 0:
+        return None
+    policy_loss = policy_total / policy_count
+    value_loss = value_total / value_count if value_count else 0.0
+    loss = policy_loss + bc_config.value_loss_coefficient * value_loss
+    return core.BCMetrics(loss, policy_loss, value_loss, policy_count, excluded)
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="bc")
 def main(cfg: DictConfig) -> None:
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
-    if model_config.use_asymmetric_critic:
-        raise ValueError("BC trains actor only; use_asymmetric_critic must be false")
+    joint_value_training = cfg.train.value_loss_coefficient > 0
+    if model_config.use_asymmetric_critic != joint_value_training:
+        raise ValueError(
+            "use_asymmetric_critic must be true exactly when value_loss_coefficient is positive"
+        )
+    if cfg.train.value_gamma <= 0 or cfg.train.value_gamma > 1:
+        raise ValueError("value_gamma must be in (0, 1]")
+    DailyRewardConfig(
+        cfg.train.daily_reward_coefficient,
+        cfg.train.daily_reward_scale,
+        cfg.train.daily_reward_maximum,
+    )
+    if (
+        sum(
+            bool(path)
+            for path in (
+                cfg.train.init_checkpoint,
+                cfg.train.init_value_checkpoint,
+                cfg.train.resume_checkpoint,
+            )
+        )
+        > 1
+    ):
+        raise ValueError(
+            "init_checkpoint, init_value_checkpoint and resume_checkpoint are mutually exclusive"
+        )
+
     train_sources, validation_sources = _sources(cfg)
     rules = CacheRules(
         turns_per_day=cfg.rules.turns_per_day,
@@ -165,24 +261,58 @@ def main(cfg: DictConfig) -> None:
     cache = Path(to_absolute_path(cfg.data.cache_dir))
     train_paths = prepare_episodes(train_sources, cache / "train", rules)
     validation_paths = prepare_episodes(validation_sources, cache / "validation", rules)
+
+    value_train_paths = []
+    value_validation_paths = []
+    if joint_value_training:
+        value_cache_directory = Path(to_absolute_path(cfg.data.value_cache_dir))
+        reward_kwargs = {
+            "gamma": cfg.train.value_gamma,
+            "episode_steps": cfg.rules.episode_steps,
+            "turns_per_day": cfg.rules.turns_per_day,
+            "daily_reward_coefficient": cfg.train.daily_reward_coefficient,
+            "daily_reward_scale": cfg.train.daily_reward_scale,
+            "daily_reward_maximum": cfg.train.daily_reward_maximum,
+        }
+        value_train_paths = value_cache.prepare_episodes(
+            _episode_files(train_sources), value_cache_directory / "train", **reward_kwargs
+        )
+        value_validation_paths = value_cache.prepare_episodes(
+            _episode_files(validation_sources),
+            value_cache_directory / "validation",
+            **reward_kwargs,
+        )
+        if not value_train_paths or not value_validation_paths:
+            raise ValueError("joint BC/value training requires complete train and validation games")
+
     model = M.PolicyValueNet(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     if cfg.train.init_checkpoint:
-        if cfg.train.resume_checkpoint:
-            raise ValueError("init_checkpoint and resume_checkpoint are mutually exclusive")
         variables = _load_bc_checkpoint_params(
-            Path(to_absolute_path(cfg.train.init_checkpoint)), model_config
+            Path(to_absolute_path(cfg.train.init_checkpoint)), variables, model_config
         )
+    if cfg.train.init_value_checkpoint:
+        variables = _load_value_checkpoint(
+            Path(to_absolute_path(cfg.train.init_value_checkpoint)),
+            variables,
+            model_config,
+            cfg.train.value_gamma,
+            cfg.train.daily_reward_coefficient,
+            cfg.train.daily_reward_scale,
+            cfg.train.daily_reward_maximum,
+        )
+
     steps_per_epoch = _steps_per_epoch(train_paths, cfg.train.batch_size)
     total_steps = _schedule_steps(steps_per_epoch, cfg.train.max_epochs, cfg.train.max_steps)
     learning_rate = optax.cosine_decay_schedule(
         cfg.train.learning_rate, total_steps, alpha=cfg.train.lr_decay_alpha
     )
     logger.info(
-        "steps_per_epoch=%d total_steps=%d (max_epochs=%d)",
+        "steps_per_epoch=%d total_steps=%d (max_epochs=%d) joint_value_training=%s",
         steps_per_epoch,
         total_steps,
         cfg.train.max_epochs,
+        joint_value_training,
     )
     bc_config = core.BCConfig(
         learning_rate,
@@ -190,6 +320,7 @@ def main(cfg: DictConfig) -> None:
         cfg.train.max_grad_norm,
         cfg.rules.turns_per_day,
         cfg.rules.shed_capacity,
+        cfg.train.value_loss_coefficient,
     )
     state = core.create_train_state(model, variables, bc_config)
     step = 0
@@ -203,6 +334,7 @@ def main(cfg: DictConfig) -> None:
         step = int(metadata["step"])
         start_epoch = int(metadata.get("epoch", 0))
         best = _restored_best(metadata)
+
     last_saved_step = step
     epoch = start_epoch
     for epoch in range(start_epoch, cfg.train.max_epochs):
@@ -215,29 +347,66 @@ def main(cfg: DictConfig) -> None:
             shuffle=True,
             drop_last=True,
         )
+        value_batches = (
+            _repeat_value_batches(
+                value_train_paths,
+                cfg.train.batch_size,
+                seed=cfg.train.seed + epoch,
+                shuffle=True,
+            )
+            if joint_value_training
+            else None
+        )
         for batch in batches:
             if 0 < cfg.train.max_steps <= step:
                 break
-            state, (loss, _, excluded) = core.update_minibatch(
-                model, state, jax.device_put(batch), bc_config
+            value_batch = next(value_batches) if value_batches is not None else None
+            state, metrics = core.update_minibatch(
+                model,
+                state,
+                jax.device_put(batch),
+                bc_config,
+                None if value_batch is None else jax.device_put(value_batch),
             )
             step += 1
             if step % cfg.train.log_interval == 0:
-                loss, excluded = jax.device_get((loss, excluded))
+                metrics = jax.device_get(metrics)
                 logger.info(
-                    "epoch=%d step=%d loss=%.4f excluded=%d",
+                    "epoch=%d step=%d loss=%.4f policy_loss=%.4f value_loss=%.4f excluded=%d",
                     epoch,
                     step,
-                    float(loss),
-                    int(excluded),
+                    float(metrics.loss),
+                    float(metrics.policy_loss),
+                    float(metrics.value_loss),
+                    int(metrics.excluded),
                 )
             if step % cfg.train.checkpoint_interval == 0:
                 best = _checkpoint(
-                    model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best
+                    model,
+                    state,
+                    step,
+                    epoch,
+                    cfg,
+                    model_config,
+                    validation_paths,
+                    value_validation_paths,
+                    bc_config,
+                    best,
                 )
                 last_saved_step = step
     if step > last_saved_step:
-        _checkpoint(model, state, step, epoch, cfg, model_config, validation_paths, bc_config, best)
+        _checkpoint(
+            model,
+            state,
+            step,
+            epoch,
+            cfg,
+            model_config,
+            validation_paths,
+            value_validation_paths,
+            bc_config,
+            best,
+        )
 
 
 if __name__ == "__main__":

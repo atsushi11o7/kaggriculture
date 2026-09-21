@@ -60,13 +60,69 @@ def test_bc_update() -> None:
 
     batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
     train_state = bc_core.create_train_state(model, variables, bc_core.BCConfig())
-    train_state, (loss, count, excluded) = bc_core.update_minibatch(
+    train_state, metrics = bc_core.update_minibatch(
         model, train_state, jax.device_put(batch), bc_core.BCConfig()
     )
 
-    assert jnp.isfinite(loss)
-    assert count == 2
-    assert excluded == 0
+    assert jnp.isfinite(metrics.loss)
+    assert metrics.count == 2
+    assert metrics.excluded == 0
+
+
+def test_joint_bc_value_update_trains_policy_and_critic() -> None:
+    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, True, 1)
+    model = M.PolicyValueNet(config)
+    variables = P.initialize(model, jax.random.key(0))
+    obs = make_fresh_observation()
+    intent, mask = action_to_intent(
+        obs, {"farmer": ["PASS"], "hands": [], "market": []}, CacheRules()
+    )
+    from kaggriculture.training.replays.state import observation_to_state
+
+    policy_batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
+    value_states = reset(jax.random.key(1), 1)
+    value_targets = jnp.asarray([[1.0, -1.0]])
+    joint_config = bc_core.BCConfig(weight_decay=0.0, value_loss_coefficient=0.01)
+    train_state = bc_core.create_train_state(model, variables, joint_config)
+    updated, metrics = bc_core.update_minibatch(
+        model,
+        train_state,
+        jax.device_put(policy_batch),
+        joint_config,
+        jax.device_put((value_states, value_targets)),
+    )
+
+    def changed(module):
+        before = jax.tree.leaves(train_state.params[module])
+        after = jax.tree.leaves(updated.params[module])
+        return any(
+            not bool(jnp.array_equal(left, right))
+            for left, right in zip(before, after, strict=True)
+        )
+
+    assert jnp.isfinite(metrics.loss)
+    assert metrics.value_loss > 0
+    assert changed("policy_proj")
+    assert changed("value_head")
+    assert changed("encoder")
+
+
+def test_joint_bc_value_loss_requires_value_batch() -> None:
+    model, variables = _model()
+    obs = make_fresh_observation()
+    intent, mask = action_to_intent(
+        obs, {"farmer": ["PASS"], "hands": [], "market": []}, CacheRules()
+    )
+    from kaggriculture.training.replays.state import observation_to_state
+
+    batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
+    with pytest.raises(ValueError, match="value_batch is required"):
+        bc_core.loss(
+            model,
+            variables["params"],
+            batch,
+            bc_core.BCConfig(value_loss_coefficient=0.01),
+        )
 
 
 def test_bc_loss_excludes_structurally_illegal_labels() -> None:
@@ -88,13 +144,13 @@ def test_bc_loss_excludes_structurally_illegal_labels() -> None:
 
     batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
     train_state = bc_core.create_train_state(model, variables, bc_core.BCConfig())
-    train_state, (loss, count, excluded) = bc_core.update_minibatch(
+    train_state, metrics = bc_core.update_minibatch(
         model, train_state, jax.device_put(batch), bc_core.BCConfig()
     )
 
-    assert excluded == 1
-    assert count == 1  # farmer slot(illegal)が除外され、市場STOP slotだけ残る
-    assert jnp.isfinite(loss)
+    assert metrics.excluded == 1
+    assert metrics.count == 1  # farmer slot(illegal)が除外され、市場STOP slotだけ残る
+    assert jnp.isfinite(metrics.loss)
 
 
 def test_ppo_rollout_and_update() -> None:

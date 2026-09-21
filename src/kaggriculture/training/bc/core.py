@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +21,15 @@ class BCConfig:
     max_grad_norm: float = 1.0
     turns_per_day: int = 24
     shed_capacity: int = 100
+    value_loss_coefficient: float = 0.0
+
+
+class BCMetrics(NamedTuple):
+    loss: jnp.ndarray
+    policy_loss: jnp.ndarray
+    value_loss: jnp.ndarray
+    count: jnp.ndarray
+    excluded: jnp.ndarray
 
 
 def create_train_state(model, variables, config: BCConfig):
@@ -30,7 +40,7 @@ def create_train_state(model, variables, config: BCConfig):
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 
-def loss(model, params, batch, config: BCConfig):
+def loss(model, params, batch, config: BCConfig, value_batch=None):
     evaluation = P.evaluate_intent(
         model,
         {"params": params},
@@ -45,22 +55,35 @@ def loss(model, params, batch, config: BCConfig):
     excluded = jnp.sum(excluded_mask.astype(jnp.float32))
     mask = mask * evaluation.slot_valid.astype(jnp.float32)
     count = jnp.maximum(mask.sum(), 1)
-    nll = -jnp.sum(jnp.where(mask > 0, evaluation.slot_log_prob, 0.0)) / count
-    return nll, count, excluded
+    policy_loss = -jnp.sum(jnp.where(mask > 0, evaluation.slot_log_prob, 0.0)) / count
+
+    value_loss = jnp.asarray(0.0)
+    if config.value_loss_coefficient > 0:
+        if value_batch is None:
+            raise ValueError("value_batch is required when value loss is enabled")
+        value_states, value_targets = value_batch
+        predictions = P.state_values(
+            model,
+            {"params": params},
+            value_states,
+            turns_per_day=config.turns_per_day,
+        )
+        value_loss = jnp.mean(jnp.square(predictions - value_targets))
+
+    total = policy_loss + config.value_loss_coefficient * value_loss
+    return BCMetrics(total, policy_loss, value_loss, count, excluded)
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def update_minibatch(model, train_state, batch, config):
+def update_minibatch(model, train_state, batch, config, value_batch=None):
     def objective(params):
-        value, count, excluded = loss(model, params, batch, config)
-        return value, (count, excluded)
+        metrics = loss(model, params, batch, config, value_batch)
+        return metrics.loss, metrics
 
-    (value, (count, excluded)), gradients = jax.value_and_grad(objective, has_aux=True)(
-        train_state.params
-    )
-    return train_state.apply_gradients(grads=gradients), (value, count, excluded)
+    (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(train_state.params)
+    return train_state.apply_gradients(grads=gradients), metrics
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def evaluate_minibatch(model, params, batch, config):
-    return loss(model, params, batch, config)
+def evaluate_minibatch(model, params, batch, config, value_batch=None):
+    return loss(model, params, batch, config, value_batch)
