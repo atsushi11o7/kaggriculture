@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
+import jax
 import numpy as np
 
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.state import State
-from kaggriculture.training.replays.io import iter_replay_samples
+from kaggriculture.training.replays.io import iter_replay_actions
 from kaggriculture.training.replays.state import CacheRules, observation_to_state
+from kaggriculture.training.value_pretrain.dataset import episode_from_data
 
 
 class BCBatch(NamedTuple):
@@ -22,6 +25,7 @@ class BCBatch(NamedTuple):
     players: np.ndarray
     intent: Intent
     slot_mask: np.ndarray
+    value_target: np.ndarray
 
 
 @dataclass
@@ -111,24 +115,52 @@ def action_to_intent(obs: dict, action: dict, rules: CacheRules):
     )
 
 
-def iter_samples(sources, rules: CacheRules, stats: BuildStats):
-    """不正サンプルを理由別に集計して逐次変換する。"""
+def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | None = None):
+    """不正サンプルを理由別に集計して逐次変換する。
+
+    rewardを渡すと、方策教師と同じ(試合・step・プレイヤー)の価値教師を同時に作る。この場合の
+    Stateは両者のprivate情報を含む完全な局面で、Actorは公開情報と自席のprivateだけを読むため
+    入力は変わらず、criticは同じ1回の順伝播で価値を出せる。価値教師が作れない不完全な試合は
+    試合ごと捨てる。
+
+    Yields:
+        (State, プレイヤー, Intent, slot mask, 価値教師)。rewardなしの価値教師は0。
+    """
     for item in sources:
         path, selected_players = item if isinstance(item, tuple) else (item, None)
-        for obs, action in iter_replay_samples(
-            Path(path), rules.min_player_reward, set(selected_players) if selected_players else None
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+        states = targets = None
+        if reward is not None:
+            try:
+                states, targets = episode_from_data(data, Path(path), **reward)
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                stats.discarded += 1
+                stats.reasons["value_episode:" + type(error).__name__ + ":" + str(error)[:60]] += 1
+                continue
+        for index, player, obs, action in iter_replay_actions(
+            data,
+            Path(path),
+            rules.min_player_reward,
+            set(selected_players) if selected_players else None,
         ):
             try:
                 intent, mask = action_to_intent(obs, action, rules)
-                state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
+                if states is None:
+                    state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
+                    value = 0.0
+                else:
+                    state = jax.tree.map(lambda values, index=index: values[index], states)
+                    value = float(targets[index, player])
                 stats.accepted += 1
-                yield state, int(obs["player"]), intent, mask
+                yield state, int(obs["player"]), intent, mask, value
             except (KeyError, IndexError, TypeError, ValueError) as error:
                 stats.discarded += 1
                 stats.reasons[type(error).__name__ + ":" + str(error)[:80]] += 1
 
 
 def stack_samples(samples) -> BCBatch:
+    """(State, player, Intent, mask[, 価値教師])のリストを固定shapeのbatchへまとめる。"""
     samples = list(samples)
     if not samples:
         raise ValueError("empty BC batch")
@@ -149,4 +181,5 @@ def stack_samples(samples) -> BCBatch:
         np.asarray([sample[1] for sample in samples], np.int32),
         intent,
         np.stack([sample[3] for sample in samples]),
+        np.asarray([sample[4] if len(sample) > 4 else 0.0 for sample in samples], np.float32),
     )

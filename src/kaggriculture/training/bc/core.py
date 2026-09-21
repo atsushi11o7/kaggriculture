@@ -40,7 +40,7 @@ def create_train_state(model, variables, config: BCConfig):
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 
-def loss(model, params, batch, config: BCConfig, value_batch=None):
+def loss(model, params, batch, config: BCConfig):
     evaluation = P.evaluate_intent(
         model,
         {"params": params},
@@ -57,27 +57,19 @@ def loss(model, params, batch, config: BCConfig, value_batch=None):
     count = jnp.maximum(mask.sum(), 1)
     policy_loss = -jnp.sum(jnp.where(mask > 0, evaluation.slot_log_prob, 0.0)) / count
 
+    # 同じ1回の順伝播で得たcritic出力を、同じ(試合・step・プレイヤー)の教師と比べる。
     value_loss = jnp.asarray(0.0)
     if config.value_loss_coefficient > 0:
-        if value_batch is None:
-            raise ValueError("value_batch is required when value loss is enabled")
-        value_states, value_targets = value_batch
-        predictions = P.state_values(
-            model,
-            {"params": params},
-            value_states,
-            turns_per_day=config.turns_per_day,
-        )
-        value_loss = jnp.mean(jnp.square(predictions - value_targets))
+        value_loss = jnp.mean(jnp.square(evaluation.value - batch.value_target))
 
     total = policy_loss + config.value_loss_coefficient * value_loss
     return BCMetrics(total, policy_loss, value_loss, count, excluded)
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def update_minibatch(model, train_state, batch, config, value_batch=None):
+def update_minibatch(model, train_state, batch, config):
     def objective(params):
-        metrics = loss(model, params, batch, config, value_batch)
+        metrics = loss(model, params, batch, config)
         return metrics.loss, metrics
 
     (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(train_state.params)
@@ -85,5 +77,5 @@ def update_minibatch(model, train_state, batch, config, value_batch=None):
 
 
 @partial(jax.jit, static_argnums=(0, 3))
-def evaluate_minibatch(model, params, batch, config, value_batch=None):
-    return loss(model, params, batch, config, value_batch)
+def evaluate_minibatch(model, params, batch, config):
+    return loss(model, params, batch, config)

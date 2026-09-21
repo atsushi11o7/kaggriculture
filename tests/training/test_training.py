@@ -69,27 +69,25 @@ def test_bc_update() -> None:
     assert metrics.excluded == 0
 
 
-def test_joint_bc_value_update_trains_policy_and_critic() -> None:
+def _joint_model():
     config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, True, 1)
     model = M.PolicyValueNet(config)
-    variables = P.initialize(model, jax.random.key(0))
+    return model, P.initialize(model, jax.random.key(0))
+
+
+def test_joint_bc_value_update_trains_policy_and_critic() -> None:
+    model, variables = _joint_model()
     obs = make_fresh_observation()
     intent, mask = action_to_intent(
         obs, {"farmer": ["PASS"], "hands": [], "market": []}, CacheRules()
     )
     from kaggriculture.training.replays.state import observation_to_state
 
-    policy_batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
-    value_states = reset(jax.random.key(1), 1)
-    value_targets = jnp.asarray([[1.0, -1.0]])
-    joint_config = bc_core.BCConfig(weight_decay=0.0, value_loss_coefficient=0.01)
+    batch = stack_samples([(observation_to_state(obs), 0, intent, mask, 1.0)])
+    joint_config = bc_core.BCConfig(weight_decay=0.0, value_loss_coefficient=0.5)
     train_state = bc_core.create_train_state(model, variables, joint_config)
     updated, metrics = bc_core.update_minibatch(
-        model,
-        train_state,
-        jax.device_put(policy_batch),
-        joint_config,
-        jax.device_put((value_states, value_targets)),
+        model, train_state, jax.device_put(batch), joint_config
     )
 
     def changed(module):
@@ -107,22 +105,89 @@ def test_joint_bc_value_update_trains_policy_and_critic() -> None:
     assert changed("encoder")
 
 
-def test_joint_bc_value_loss_requires_value_batch() -> None:
-    model, variables = _model()
+def test_value_target_does_not_change_the_policy_loss() -> None:
+    model, variables = _joint_model()
     obs = make_fresh_observation()
     intent, mask = action_to_intent(
         obs, {"farmer": ["PASS"], "hands": [], "market": []}, CacheRules()
     )
     from kaggriculture.training.replays.state import observation_to_state
 
-    batch = stack_samples([(observation_to_state(obs), 0, intent, mask)])
-    with pytest.raises(ValueError, match="value_batch is required"):
-        bc_core.loss(
-            model,
-            variables["params"],
-            batch,
-            bc_core.BCConfig(value_loss_coefficient=0.01),
+    state = observation_to_state(obs)
+    config = bc_core.BCConfig(value_loss_coefficient=0.5)
+    low = bc_core.loss(
+        model, variables["params"], stack_samples([(state, 0, intent, mask, -1.0)]), config
+    )
+    high = bc_core.loss(
+        model, variables["params"], stack_samples([(state, 0, intent, mask, 1.0)]), config
+    )
+
+    assert jnp.allclose(low.policy_loss, high.policy_loss)
+    assert not jnp.allclose(low.value_loss, high.value_loss)
+
+
+def test_actor_logits_are_the_same_for_single_view_and_paired_states() -> None:
+    """完全な局面(両者のprivate情報あり)でも、Actorの入力は1人視点の局面と変わらない。"""
+    from kaggriculture.training.replays.state import (
+        observation_to_state,
+        paired_observations_to_state,
+    )
+
+    model, variables = _joint_model()
+    observations = [make_fresh_observation(player=0), make_fresh_observation(player=1)]
+    # 相手側のprivate情報を、単独視点には現れない値にして、混入していないことを確かめる
+    observations[1]["private"]["shed"]["WHEAT"] = 7
+    paired = paired_observations_to_state(observations)
+    single = observation_to_state(observations[0])
+
+    def logits(state):
+        batch = jax.tree.map(lambda value: jnp.asarray(value)[None], state)
+        result = P._logits(model, variables, batch, jnp.asarray([0]), None, 24, 100)
+        return result[3], result[4]
+
+    paired_unit, paired_market = logits(paired)
+    single_unit, single_market = logits(single)
+
+    assert jnp.allclose(paired_unit, single_unit, atol=1e-5)
+    assert jnp.allclose(paired_market, single_market, atol=1e-5)
+
+
+def test_joint_samples_align_value_targets_with_actions(tmp_path) -> None:
+    import json
+
+    from kaggriculture.training.bc.dataset import BuildStats, iter_samples
+
+    def observation(player: int, step: int) -> dict:
+        obs = make_fresh_observation(player=player)
+        obs["step"] = step
+        return obs
+
+    steps = []
+    for index in range(3):
+        steps.append(
+            [
+                {
+                    "observation": observation(player, index),
+                    "action": {"farmer": ["PASS"], "hands": [], "market": []},
+                    "status": "DONE" if index == 2 else "ACTIVE",
+                }
+                for player in range(2)
+            ]
         )
+    path = tmp_path / "episode.json"
+    path.write_text(json.dumps({"steps": steps, "rewards": [10.0, 3.0]}))
+    reward = {"gamma": 0.5, "episode_steps": 3, "turns_per_day": 24}
+
+    samples = list(iter_samples([path], CacheRules(), BuildStats(), reward))
+
+    # step 1・2の行動が、step 0・1の局面に対する教師になる。勝者(player0)のreturnは
+    # 終端で+1、その1つ前の局面は割引された0.5。敗者はその符号反転。
+    assert [(int(sample[1]), int(sample[0].step), sample[4]) for sample in samples] == [
+        (0, 0, 0.5),
+        (1, 0, -0.5),
+        (0, 1, 1.0),
+        (1, 1, -1.0),
+    ]
 
 
 def test_bc_loss_excludes_structurally_illegal_labels() -> None:

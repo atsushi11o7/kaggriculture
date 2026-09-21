@@ -20,7 +20,6 @@ data:
   val_fraction: 0.1
   split_seed: 0
   cache_dir: data/cache/bc
-  value_cache_dir: data/cache/bc_value
   min_player_reward: null
 
 train:
@@ -34,6 +33,8 @@ train:
   max_steps: -1
   log_interval: 50
   validation_batches: 100
+  # 学習時に、この数のshard(試合・プレイヤー)をまとめて混ぜてからbatch化する。
+  shuffle_shards: 32
   checkpoint_interval: 3000
   seed: 0
   # 0なら従来どおりActorのみを学習する。正値なら非対称criticも同じ更新で学習する。

@@ -28,14 +28,13 @@ def split_episode_files(
     return shuffled[count:], shuffled[:count]
 
 
-def iter_replay_samples(
+def iter_replay_actions(
+    data: dict,
     episode_path: Path,
     min_player_reward: float | None = None,
     selected_players: set[int] | None = None,
-) -> Iterator[tuple[dict, dict]]:
-    """1 episodeから指定プレイヤーの(観測, 行動)を時系列に列挙する。"""
-    with open(episode_path, encoding="utf-8") as stream:
-        data = json.load(stream)
+) -> Iterator[tuple[int, int, dict, dict]]:
+    """解析済みepisodeから、(観測のstep位置, プレイヤー, 観測, 行動)を時系列に列挙する。"""
     steps = data["steps"]
     player_count = len(steps[0])
     rewards = data.get("rewards")
@@ -54,4 +53,18 @@ def iter_replay_samples(
             observation = steps[step_index - 1][player]["observation"]
             action = steps[step_index][player]["action"]
             if action is not None:
-                yield observation, action
+                yield step_index - 1, player, observation, action
+
+
+def iter_replay_samples(
+    episode_path: Path,
+    min_player_reward: float | None = None,
+    selected_players: set[int] | None = None,
+) -> Iterator[tuple[dict, dict]]:
+    """1 episodeから指定プレイヤーの(観測, 行動)を時系列に列挙する。"""
+    with open(episode_path, encoding="utf-8") as stream:
+        data = json.load(stream)
+    for _, _, observation, action in iter_replay_actions(
+        data, episode_path, min_player_reward, selected_players
+    ):
+        yield observation, action
