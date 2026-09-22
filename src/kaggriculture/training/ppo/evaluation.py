@@ -51,7 +51,7 @@ def _combine_seat_actions(action0: Action, action1: Action) -> Action:
     return Action(*(jnp.stack([f0, f1], axis=1) for f0, f1 in zip(action0, action1, strict=True)))
 
 
-@partial(jax.jit, static_argnums=(0, 3, 5))
+@partial(jax.jit, static_argnums=(0, 3, 5), static_argnames=("greedy",))
 def evaluate_closed_loop(
     model,
     seat0_variables: dict,
@@ -59,8 +59,13 @@ def evaluate_closed_loop(
     config: RolloutConfig,
     key: jax.Array,
     batch_size: int,
+    greedy: bool = True,
 ) -> EvaluationResult:
-    """seat0/seat1それぞれ固定のvariablesで終端まで自走させる。"""
+    """seat0/seat1それぞれ固定のvariablesで終端まで自走させる。
+
+    greedy=Falseなら学習中のrolloutと同じ温度でサンプリングする。決定論的な方策どうしでは
+    初期盤面が同一のため試合が独立にならず、勝率の信頼区間が意味を持たない。
+    """
     reset_key, run_key = jax.random.split(key)
     initial_state = reset(
         reset_key, batch_size, board_size=config.board_size, starting_money=config.starting_money
@@ -82,7 +87,7 @@ def evaluate_closed_loop(
             key0,
             counters[:, 0] if use_history else None,
             temperature=config.temperature,
-            greedy=True,
+            greedy=greedy,
             turns_per_day=config.turns_per_day,
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
@@ -95,7 +100,7 @@ def evaluate_closed_loop(
             key1,
             counters[:, 1] if use_history else None,
             temperature=config.temperature,
-            greedy=True,
+            greedy=greedy,
             turns_per_day=config.turns_per_day,
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
