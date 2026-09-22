@@ -24,6 +24,13 @@ ppo:
   total_updates: 1000
   rollout_horizon: 128
   update_epochs: 4
+  # 0以外なら、完了試合をこのラウンド数だけ集め(1ラウンド=全環境が1試合を最後まで)、勾配を蓄積して
+  # 1回だけ更新する(full_game.py)。1 updateの試合数はラウンド数×env.batch_size。
+  full_game_rounds: 0
+  # 蓄積時に状態を再生成する区間の長さ(メモリと速度の兼ね合い)。
+  full_game_segment_length: 144
+  # 価値の教師のλ。1.0なら、criticの予測を含まない実際のreturn(モンテカルロ)。
+  value_lambda: 1.0
   minibatch_size: 256
   learning_rate: 5.0e-5
   weight_decay: 0.0
@@ -55,6 +62,8 @@ ppo:
   init_bc_checkpoint: null
   # 事前学習したActor+criticを読み込む。報酬変更時はcritic warm-upが必須。
   init_value_checkpoint: null
+  # trueなら、初期criticと報酬設定が違っても、warm-upなしで読み込む(criticはPPOの学習で適応する)。
+  allow_value_reward_mismatch: false
   # nullならinit_bc_checkpoint、resume時は元runの設定から固定BCを復元する。
   anchor_bc_checkpoint: null
   # 保持項の参照先。nullならanchor_bc_checkpoint/初期BCを使う。BC/PPO両対応。

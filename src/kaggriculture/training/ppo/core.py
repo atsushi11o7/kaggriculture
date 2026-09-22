@@ -38,6 +38,8 @@ class PPOConfig:
     temperature: float = 0.8
     turns_per_day: int = 24
     shed_capacity: int = 100
+    # falseなら、呼び出し側で全体を標準化済みとして、minibatchごとの標準化をしない。
+    normalize_advantages: bool = True
 
 
 class PPOBatch(NamedTuple):
@@ -263,7 +265,11 @@ def _loss(model, params, batch: PPOBatch, config: PPOConfig, reference_params=No
     )
     sample_mask = batch.slot_mask.any(-1).astype(jnp.float32)
     sample_count = jnp.maximum(sample_mask.sum(), 1)
-    advantage = _normalize_advantages(batch.advantages, sample_mask)
+    advantage = (
+        _normalize_advantages(batch.advantages, sample_mask)
+        if config.normalize_advantages
+        else batch.advantages
+    )
     log_ratio = evaluation.slot_log_prob - batch.old_slot_log_prob
     ratio = jnp.exp(jnp.clip(log_ratio, -20.0, 20.0))
     unclipped = ratio * advantage[:, None]

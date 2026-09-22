@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import hydra
@@ -36,7 +36,7 @@ from kaggriculture.training.checkpoint import (
     save_checkpoint,
     save_pytree,
 )
-from kaggriculture.training.ppo import core
+from kaggriculture.training.ppo import core, full_game
 from kaggriculture.training.ppo.evaluation import evaluate_both_seats
 from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
@@ -388,7 +388,9 @@ def main(cfg: DictConfig) -> None:
             cfg.ppo.daily_reward_coefficient,
             cfg.ppo.daily_reward_scale,
             cfg.ppo.daily_reward_maximum,
-            allow_reward_mismatch=cfg.ppo.critic_warmup_updates > 0,
+            allow_reward_mismatch=(
+                cfg.ppo.critic_warmup_updates > 0 or cfg.ppo.allow_value_reward_mismatch
+            ),
         )
     reference_checkpoint = cfg.ppo.reference_checkpoint
     if reference_checkpoint is None and resume_metadata is not None:
@@ -576,117 +578,180 @@ def main(cfg: DictConfig) -> None:
         )
         started = time.perf_counter()
         pool_members = _pool_members(pool_dir)
-        opponent = _select_opponent(
-            float(jax.random.uniform(opponent_key)),
-            bool(pool_members),
-            cfg.ppo.anchor_sample_prob,
-            cfg.ppo.pool_sample_prob,
-        )
-        if opponent == "self":
-            rollout = collect_rollout(
-                model,
-                {"params": train_state.params},
-                rollout_config,
-                state,
-                counters,
-                rollout_key,
-                daily_margin,
+        if cfg.ppo.full_game_rounds <= 0:
+            opponent = _select_opponent(
+                float(jax.random.uniform(opponent_key)),
+                bool(pool_members),
+                cfg.ppo.anchor_sample_prob,
+                cfg.ppo.pool_sample_prob,
             )
-        else:
-            if opponent == "anchor":
-                opponent_variables = anchor_variables
+            if opponent == "self":
+                rollout = collect_rollout(
+                    model,
+                    {"params": train_state.params},
+                    rollout_config,
+                    state,
+                    counters,
+                    rollout_key,
+                    daily_margin,
+                )
             else:
-                member = pool_members[int(jax.random.randint(member_key, (), 0, len(pool_members)))]
-                opponent_variables = _opponent_variables(member, train_state)
-            learner_seat = int(jax.random.bernoulli(seat_key))
-            rollout = collect_rollout_vs_opponent(
+                if opponent == "anchor":
+                    opponent_variables = anchor_variables
+                else:
+                    member = pool_members[
+                        int(jax.random.randint(member_key, (), 0, len(pool_members)))
+                    ]
+                    opponent_variables = _opponent_variables(member, train_state)
+                learner_seat = int(jax.random.bernoulli(seat_key))
+                rollout = collect_rollout_vs_opponent(
+                    model,
+                    {"params": train_state.params},
+                    opponent_variables,
+                    learner_seat,
+                    rollout_config,
+                    state,
+                    counters,
+                    rollout_key,
+                    daily_margin,
+                )
+            batch = to_ppo_batch(rollout, ppo_config.gamma, ppo_config.gae_lambda)
+            train_state, metrics, epochs_completed = core.update_epochs(
                 model,
-                {"params": train_state.params},
-                opponent_variables,
-                learner_seat,
-                rollout_config,
-                state,
-                counters,
-                rollout_key,
-                daily_margin,
+                train_state,
+                batch,
+                update_key,
+                ppo_config,
+                cfg.ppo.update_epochs,
+                cfg.ppo.minibatch_size,
+                reference_variables["params"],
             )
-        batch = to_ppo_batch(rollout, ppo_config.gamma, ppo_config.gae_lambda)
-        train_state, metrics, epochs_completed = core.update_epochs(
-            model,
-            train_state,
-            batch,
-            update_key,
-            ppo_config,
-            cfg.ppo.update_epochs,
-            cfg.ppo.minibatch_size,
-            reference_variables["params"],
-        )
-        jax.block_until_ready(metrics.loss)
-        state, counters, daily_margin = (
-            rollout.final_state,
-            rollout.final_counters,
-            rollout.final_margin,
-        )
-        if update % cfg.ppo.log_interval == 0:
-            elapsed = time.perf_counter() - started
-            values = jax.device_get(metrics)
-            invalid = float(jax.device_get(rollout.executor_invalid).mean())
-            clamped = float(jax.device_get(rollout.executor_clamped).mean())
-            invalid_unit = float(jax.device_get(rollout.executor_invalid_unit).mean())
-            clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
-            dones = jax.device_get(rollout.dones)
-            terminal_count = int(dones.sum())
-            terminal_win = terminal_loss = float("nan")
-            if opponent != "self" and terminal_count:
-                finished = jax.device_get(rollout.rewards)[..., learner_seat][dones]
-                terminal_win = float((finished > 0.5).mean())
-                terminal_loss = float((finished < -0.5).mean())
-            daily_arr = jax.device_get(rollout.daily_rewards)
-            rollout_steps = jax.device_get(rollout.states.step)
-            daily_boundary = ((rollout_steps + 1) % cfg.rules.turns_per_day == 0) | dones
-            daily_events = int(daily_boundary.sum())
-            daily_abs_mean = float(abs(daily_arr[:, :, 0]).sum() / max(daily_events, 1))
-            value_arr = jax.device_get(batch.old_value)
-            return_arr = jax.device_get(batch.returns)
-            advantage_arr = jax.device_get(batch.advantages)
-            logger.info(
-                "update=%d seconds=%.1f samples/s=%.1f loss=%.4f policy_loss=%.4f "
-                "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
-                "approx_kl=%.4f clip_fraction=%.3f epochs=%d "
-                "terminal_count=%d terminal_win=%.3f terminal_loss=%.3f "
-                "daily_events=%d daily_abs_mean=%.4f "
-                "value_mean=%.4f value_std=%.4f return_mean=%.4f return_std=%.4f "
-                "advantage_mean=%.4f advantage_std=%.4f "
-                "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f opponent=%s",
-                update,
-                elapsed,
-                samples / elapsed,
-                values.loss,
-                values.policy_loss,
-                values.value_loss,
-                values.entropy,
-                values.reference_actor_l2,
-                values.approx_kl,
-                values.clip_fraction,
-                int(jax.device_get(epochs_completed)),
-                terminal_count,
-                terminal_win,
-                terminal_loss,
-                daily_events,
-                daily_abs_mean,
-                value_arr.mean(),
-                value_arr.std(),
-                return_arr.mean(),
-                return_arr.std(),
-                advantage_arr.mean(),
-                advantage_arr.std(),
-                invalid,
-                clamped,
-                invalid_unit,
-                clamped_unit,
-                opponent,
+            jax.block_until_ready(metrics.loss)
+            state, counters, daily_margin = (
+                rollout.final_state,
+                rollout.final_counters,
+                rollout.final_margin,
             )
+            if update % cfg.ppo.log_interval == 0:
+                elapsed = time.perf_counter() - started
+                values = jax.device_get(metrics)
+                invalid = float(jax.device_get(rollout.executor_invalid).mean())
+                clamped = float(jax.device_get(rollout.executor_clamped).mean())
+                invalid_unit = float(jax.device_get(rollout.executor_invalid_unit).mean())
+                clamped_unit = float(jax.device_get(rollout.executor_clamped_unit).mean())
+                dones = jax.device_get(rollout.dones)
+                terminal_count = int(dones.sum())
+                terminal_win = terminal_loss = float("nan")
+                if opponent != "self" and terminal_count:
+                    finished = jax.device_get(rollout.rewards)[..., learner_seat][dones]
+                    terminal_win = float((finished > 0.5).mean())
+                    terminal_loss = float((finished < -0.5).mean())
+                daily_arr = jax.device_get(rollout.daily_rewards)
+                rollout_steps = jax.device_get(rollout.states.step)
+                daily_boundary = ((rollout_steps + 1) % cfg.rules.turns_per_day == 0) | dones
+                daily_events = int(daily_boundary.sum())
+                daily_abs_mean = float(abs(daily_arr[:, :, 0]).sum() / max(daily_events, 1))
+                value_arr = jax.device_get(batch.old_value)
+                return_arr = jax.device_get(batch.returns)
+                advantage_arr = jax.device_get(batch.advantages)
+                logger.info(
+                    "update=%d seconds=%.1f samples/s=%.1f loss=%.4f policy_loss=%.4f "
+                    "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
+                    "approx_kl=%.4f clip_fraction=%.3f epochs=%d "
+                    "terminal_count=%d terminal_win=%.3f terminal_loss=%.3f "
+                    "daily_events=%d daily_abs_mean=%.4f "
+                    "value_mean=%.4f value_std=%.4f return_mean=%.4f return_std=%.4f "
+                    "advantage_mean=%.4f advantage_std=%.4f "
+                    "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f opponent=%s",
+                    update,
+                    elapsed,
+                    samples / elapsed,
+                    values.loss,
+                    values.policy_loss,
+                    values.value_loss,
+                    values.entropy,
+                    values.reference_actor_l2,
+                    values.approx_kl,
+                    values.clip_fraction,
+                    int(jax.device_get(epochs_completed)),
+                    terminal_count,
+                    terminal_win,
+                    terminal_loss,
+                    daily_events,
+                    daily_abs_mean,
+                    value_arr.mean(),
+                    value_arr.std(),
+                    return_arr.mean(),
+                    return_arr.std(),
+                    advantage_arr.mean(),
+                    advantage_arr.std(),
+                    invalid,
+                    clamped,
+                    invalid_unit,
+                    clamped_unit,
+                    opponent,
+                )
 
+        else:
+            round_opponents = []
+            for _ in range(cfg.ppo.full_game_rounds):
+                key, round_opponent_key, round_member_key = jax.random.split(key, 3)
+                choice = _select_opponent(
+                    float(jax.random.uniform(round_opponent_key)),
+                    bool(pool_members),
+                    cfg.ppo.anchor_sample_prob,
+                    cfg.ppo.pool_sample_prob,
+                )
+                if choice == "pool":
+                    member = pool_members[
+                        int(jax.random.randint(round_member_key, (), 0, len(pool_members)))
+                    ]
+                    round_opponents.append(_opponent_variables(member, train_state))
+                else:
+                    round_opponents.append(anchor_variables)
+            train_state, diagnostics = full_game.full_game_update(
+                model,
+                train_state,
+                reference_variables["params"],
+                replace(ppo_config, normalize_advantages=False),
+                rollout_config,
+                round_opponents,
+                update_key,
+                batch_size=cfg.env.batch_size,
+                minibatch=cfg.ppo.minibatch_size,
+                segment_length=cfg.ppo.full_game_segment_length,
+                gamma=cfg.ppo.gamma,
+                gae_lambda=cfg.ppo.gae_lambda,
+                value_lambda=cfg.ppo.value_lambda,
+            )
+            if update % cfg.ppo.log_interval == 0:
+                logger.info(
+                    "update=%d seconds=%.1f games=%d loss=%.4f policy_loss=%.4f "
+                    "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
+                    "gradient_norm=%.4f round_cosine=%.3f win=%.3f lose=%.3f draw=%.3f "
+                    "daily_abs_mean=%.4f value_mean=%.4f return_mean=%.4f "
+                    "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f",
+                    update,
+                    time.perf_counter() - started,
+                    diagnostics["games"],
+                    diagnostics["loss"],
+                    diagnostics["policy_loss"],
+                    diagnostics["value_loss"],
+                    diagnostics["entropy"],
+                    diagnostics["reference_actor_l2"],
+                    diagnostics["gradient_norm"],
+                    diagnostics.get("round_gradient_cosine", float("nan")),
+                    diagnostics["win"],
+                    diagnostics["lose"],
+                    diagnostics["draw"],
+                    diagnostics["daily_abs_mean"],
+                    diagnostics["value_mean"],
+                    diagnostics["return_mean"],
+                    diagnostics["invalid"],
+                    diagnostics["clamped"],
+                    diagnostics["invalid_unit"],
+                    diagnostics["clamped_unit"],
+                )
         metadata = {
             **checkpoint_shape_metadata(),
             "trainer": "ppo",
