@@ -7,6 +7,7 @@ import jax.numpy as jnp
 
 from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.common.config import NUM_CRITIC_MACRO_FEATURES
+from kaggriculture.policy.endgame import jax as G
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax import executor as E
 from kaggriculture.policy.jax import model as M
@@ -206,7 +207,9 @@ def sample_actions(
         shed_capacity=shed_capacity,
         hire_mult=hire_mult,
     )
-    unit_valid = unit_active
+    action, unit_override, market_override = jax.vmap(G.apply)(states, players, action)
+    unit_valid = unit_active & ~unit_override
+    market_active = market_active & ~market_override
     slot_log_prob = jnp.concatenate(
         [
             jnp.where(unit_valid, unit_lp + jnp.where(unit_needs, unit_qlp, 0.0), 0.0),
@@ -305,8 +308,20 @@ def evaluate_intent(
     market_candidate_valid = jnp.take_along_axis(market_mask, intent.market[..., None], axis=-1)[
         ..., 0
     ]
-    slot_mask = jnp.concatenate([active, mactive], axis=1)
-    slot_valid = jnp.concatenate([unit_valid, market_candidate_valid], axis=1)
+    replay_action, _ = E.execute(
+        states,
+        players,
+        intent,
+        turns_per_day=turns_per_day,
+        shed_capacity=shed_capacity,
+    )
+    _, unit_override, market_override = jax.vmap(G.apply)(states, players, replay_action)
+    slot_mask = jnp.concatenate([active & ~unit_override, mactive & ~market_override], axis=1)
+    slot_lp = jnp.where(slot_mask, slot_lp, 0.0)
+    entropy = jnp.where(slot_mask, entropy, 0.0)
+    slot_valid = jnp.concatenate(
+        [unit_valid & ~unit_override, market_candidate_valid & ~market_override], axis=1
+    )
     return EvaluationOutput(slot_lp.sum(-1), slot_lp, slot_mask, slot_valid, entropy, value)
 
 

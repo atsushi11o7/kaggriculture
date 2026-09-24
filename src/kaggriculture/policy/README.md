@@ -69,6 +69,16 @@ maskし、市場は先行slot依存のため全数量を採点してExecutorで�
 市場注文列のold log probabilityは有効slotの対数確率の和です。更新時も保存した同じintentを
 一括再評価します。
 
+## 終盤コントローラ
+
+`policy/endgame/`はActorの出力後に、JAX rolloutとTorch提出推論へ同じ決定論的制約を適用します。
+売却可能な商品を運ぶunitは、shedへの移動とDROPに必要な残り手数へ入った時だけ最短帰還し、
+最終行動stepでは既存shedと同stepにDROPできる商品を全量SELLします。ルールで上書きしたslotは
+BC/PPOの方策lossから除外します。
+
+strategy maskは、終了までに初回生産が間に合わないPLANT・BUY_SEED・BUY_ANIMAL・BUY_LANDを
+JAX/Torch共通条件で候補から除外します。即時作業に使えるHIREなどは一律に禁止しません。
+
 ## 序盤コントローラの境界
 
 序盤をルールで固定する場合は、`policy/opening/`をActorの上位に置きます。ルールがactionを返す局面では

@@ -8,6 +8,7 @@ import torch
 
 from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.common import vocab as V
+from kaggriculture.policy.endgame import torch as G
 from kaggriculture.policy.torch import actions as A
 from kaggriculture.policy.torch import candidates as K
 from kaggriculture.policy.torch import executor as E
@@ -97,6 +98,8 @@ def predict_action(
     turns_per_day: int = 24,
     shed_capacity: int = 100,
     hire_mult: float = 1.0,
+    episode_steps: int = 720,
+    board_size: int = 10,
     counters: dict | None = None,
 ) -> dict:
     """Generate one simulator-compatible action with one Transformer forward pass.
@@ -107,6 +110,8 @@ def predict_action(
         turns_per_day: Number of turns in one game day.
         shed_capacity: Maximum total shed inventory.
         hire_mult: Multiplier applied to hand hiring costs.
+        episode_steps: Number of steps in one game.
+        board_size: Width and height of the square board.
         counters: Episode-history counters.
 
     Returns:
@@ -172,7 +177,7 @@ def predict_action(
         )
         selected_quantities = torch.cat([unit_quantities, market_quantities]).argmax(-1).add(1)
 
-    return E.resolve_action(
+    action = E.resolve_action(
         obs,
         selected_units.tolist(),
         selected_market.tolist(),
@@ -180,4 +185,11 @@ def predict_action(
         turns_per_day=turns_per_day,
         shed_capacity=shed_capacity,
         hire_mult=hire_mult,
+    )
+    return G.apply(
+        obs,
+        action,
+        episode_steps=episode_steps,
+        turns_per_day=turns_per_day,
+        board_size=board_size,
     )

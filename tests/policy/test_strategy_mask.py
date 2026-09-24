@@ -75,3 +75,21 @@ def test_evaluate_intent_flags_a_teacher_label_masked_by_strategy_rules() -> Non
     # maskされた候補のlogitは-1e9(model.pyのscore_candidates)なので、除外しなければ
     # そのslotのlog_probが極端に負になり、平均lossを崩壊させる。
     assert float(evaluated.slot_log_prob[0, -1]) < -1000
+
+
+def test_endgame_investment_masks_match_between_backends() -> None:
+    state = reset(jax.random.key(7), 1)._replace(step=jnp.asarray([28 * 24]))
+    obs = make_fresh_observation(day=28)
+
+    jax_unit = np.asarray(JS.unit_mask(state, jnp.asarray(0), jnp.asarray(0)))
+    torch_unit = np.asarray(TS.unit_mask(obs, 0, TC.UNIT_META))
+    np.testing.assert_array_equal(jax_unit, torch_unit)
+
+    jax_market = np.asarray(JS.market_mask(state, jnp.asarray(0)))
+    torch_market = np.asarray(TS.market_mask(obs, TC.MARKET_META))
+    np.testing.assert_array_equal(jax_market, torch_market)
+
+    plant = A.UNIT_CANDIDATES.op == C.FARMER_OP_PLANT
+    assert not jax_unit[plant].any()
+    for op in (C.MARKET_OP_BUY_SEED, C.MARKET_OP_BUY_ANIMAL, C.MARKET_OP_BUY_LAND):
+        assert not jax_market[:, np.asarray(A.MARKET_CANDIDATES.op) == op].any()
