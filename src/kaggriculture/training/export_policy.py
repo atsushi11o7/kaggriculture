@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 import jax
@@ -30,7 +30,7 @@ def export_policy(source: Path, destination: Path) -> None:
     metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
     validate_checkpoint_metadata(metadata)
     training_config = ModelConfig(**metadata["model_config"])
-    training_model = create_model(training_config, metadata.get("model_variant", "shared"))
+    training_model = create_model(training_config)
     variables = initialize(training_model, jax.random.key(0))
     config = metadata["config"]
     rules = config["rules"]
@@ -64,8 +64,8 @@ def export_policy(source: Path, destination: Path) -> None:
         raise ValueError(f"unsupported trainer: {metadata.get('trainer')!r}")
     restored, _ = load_checkpoint(source, target)
 
-    actor_config = replace(training_config, use_asymmetric_critic=False)
-    actor = TorchNet(actor_config)
+    actor_config = training_config
+    actor = TorchNet(actor_config, actor_only=True)
     jax_to_torch({"params": restored.params}, actor, actor_only=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -73,6 +73,7 @@ def export_policy(source: Path, destination: Path) -> None:
             **checkpoint_shape_metadata(),
             "model_state_dict": actor.state_dict(),
             "config": {"model": asdict(actor_config)},
+            "actor_only": True,
             "source_step": source_step,
         },
         destination,

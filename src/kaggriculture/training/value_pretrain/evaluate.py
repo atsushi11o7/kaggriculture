@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -85,8 +84,7 @@ def main() -> None:
             raise ValueError("--untrained requires --actor-checkpoint")
         actor_metadata = read_checkpoint_metadata(Path(args.actor_checkpoint))
         model_config = ModelConfig(**actor_metadata["model_config"])
-        model_config = replace(model_config, use_asymmetric_critic=True)
-        model = create_model(model_config, "shared")
+        model = create_model(model_config)
         variables = P.initialize(model, jax.random.key(args.seed))
         variables = _load_actor_checkpoint(Path(args.actor_checkpoint), variables, model_config)
         params = variables["params"]
@@ -96,11 +94,10 @@ def main() -> None:
             raise ValueError("checkpoint path is required unless --untrained is given")
         ckpt = Path(args.checkpoint)
         metadata = json.loads((ckpt / "metadata.json").read_text())
-        variant = metadata.get("model_variant", "shared")
-        if metadata.get("critic_architecture_version") != critic_version(variant):
+        if metadata.get("critic_architecture_version") != critic_version():
             raise ValueError(f"incompatible critic architecture: {ckpt}")
         model_config = ModelConfig(**metadata["model_config"])
-        model = create_model(model_config, variant)
+        model = create_model(model_config)
         variables = P.initialize(model, jax.random.key(args.seed))
         dummy_schedule = optax.cosine_decay_schedule(1.0, 1)
         state = core.create_train_state(

@@ -36,7 +36,7 @@ from tests.policy.conftest import make_fresh_observation
 
 
 def _model():
-    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, False, 1)
+    config = ModelConfig(8, 1, 16, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.key(0))
 
@@ -70,7 +70,7 @@ def test_bc_update() -> None:
 
 
 def _joint_model():
-    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, True, 1)
+    config = ModelConfig(8, 1, 16, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.key(0))
 
@@ -100,7 +100,7 @@ def test_joint_bc_value_update_trains_policy_and_critic() -> None:
 
     assert jnp.isfinite(metrics.loss)
     assert metrics.value_loss > 0
-    assert changed("policy_proj")
+    assert changed("unit_head")
     assert changed("value_head")
     assert changed("encoder")
 
@@ -142,8 +142,11 @@ def test_actor_logits_are_the_same_for_single_view_and_paired_states() -> None:
 
     def logits(state):
         batch = jax.tree.map(lambda value: jnp.asarray(value)[None], state)
-        result = P._logits(model, variables, batch, jnp.asarray([0]), None, 24, 100)
-        return result[3], result[4]
+        players = jnp.asarray([0])
+        _, _, _, unit_logits, market_logits, *_ = P._logits(
+            model, variables, batch, players, None, 24, 100
+        )
+        return unit_logits, market_logits
 
     paired_unit, paired_market = logits(paired)
     single_unit, single_market = logits(single)
@@ -378,3 +381,21 @@ def test_bc_schedule_respects_step_limit() -> None:
         _schedule_steps(0, 20, -1)
     with pytest.raises(ValueError, match="max_epochs"):
         _schedule_steps(100, 0, -1)
+
+
+def test_invalid_unit_noop_is_not_a_pass_teacher() -> None:
+    """A simulator-ignored expert command must not reinforce the PASS class."""
+    obs = make_fresh_observation()
+    rules = CacheRules()
+
+    explicit_intent, explicit_mask = action_to_intent(
+        obs, {"farmer": ["PASS"], "hands": [], "market": []}, rules
+    )
+    intent, invalid_mask = action_to_intent(
+        obs, {"farmer": ["FEED"], "hands": [], "market": []}, rules
+    )
+
+    assert explicit_mask[0]
+    assert not invalid_mask[0]
+    assert int(intent.unit[0]) == int(explicit_intent.unit[0])
+    assert invalid_mask[C.MAX_HANDS + 1]  # generated market STOP remains a teacher

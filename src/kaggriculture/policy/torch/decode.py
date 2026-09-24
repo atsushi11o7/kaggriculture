@@ -9,6 +9,7 @@ from kaggriculture.policy.torch.actions import (
     _market_price_one,
     _simulate_market_units,
     is_animal_placement,
+    is_legal_unit_action,
     max_executable_quantity,
     requires_quantity,
 )
@@ -84,6 +85,19 @@ def commit_unit_action(
     fx, fy = pos
     tile = farm["tiles"][fy][fx]
     produced: dict[str, int] = {}
+
+    if not is_legal_unit_action(
+        farm,
+        shed,
+        seeds,
+        inventory or {},
+        pos,
+        day,
+        op_name,
+        item_name,
+        shed_capacity,
+    ):
+        return {}
 
     if op_name == "PICKUP" and item_name is not None:
         taken = min(max(n, 0), shed.get(item_name, 0))

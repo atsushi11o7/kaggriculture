@@ -59,9 +59,10 @@ def jax_to_torch(
     """Load a parallel Flax checkpoint into its PyTorch counterpart."""
     params = jax.device_get(variables["params"])
     state = net.state_dict()
+    actor_only = actor_only or net.actor_only
     token = params["token_embedding"]
     token_prefixes = ["token_embedding", "encoder.token_embedding"]
-    if net.uses_asymmetric_critic and not actor_only:
+    if not actor_only:
         token_prefixes.append("privileged_encoder.token_embedding")
     for prefix in token_prefixes:
         _copy(state, f"{prefix}.bag.weight", np.asarray(token["embedding"]))
@@ -116,11 +117,19 @@ def jax_to_torch(
             _copy(state, f"{prefix}.{norm}.weight", np.asarray(source[norm]["scale"]))
             _copy(state, f"{prefix}.{norm}.bias", np.asarray(source[norm]["bias"]))
 
-    for name in ("policy_proj", "quantity_condition"):
+    for name in (
+        "unit_head",
+        "market_head",
+        "unit_quantity_condition",
+        "market_quantity_condition",
+        "quantity_head",
+    ):
         _copy(state, f"{name}.weight", np.asarray(params[name]["kernel"]).T)
         _copy(state, f"{name}.bias", np.asarray(params[name]["bias"]))
+    for name in ("unit_action_embedding", "market_action_embedding"):
+        _copy(state, f"{name}.weight", np.asarray(params[name]["embedding"]))
 
-    if net.uses_asymmetric_critic and not actor_only:
+    if not actor_only:
         macro = params["critic_macro_encoder"]
         for index in (0, 2):
             source = macro[f"layers_{index}"]
@@ -138,7 +147,7 @@ def jax_to_torch(
         _copy(state, "value_head.2.weight", np.asarray(value["layers_2"]["kernel"]).T)
         _copy(state, "value_head.2.bias", np.asarray(value["layers_2"]["bias"]))
 
-    if net.uses_asymmetric_critic and not actor_only:
+    if not actor_only:
         privileged = params["privileged_encoder"]
         _copy(state, "privileged_encoder.position_embedding.weight", board)
         _copy(state, "privileged_encoder.cls_token", np.asarray(privileged["cls_token"]))

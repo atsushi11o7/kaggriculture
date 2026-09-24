@@ -25,7 +25,11 @@ from kaggriculture.training.ppo.rollout import (
     monte_carlo_returns,
     to_ppo_batch,
 )
-from kaggriculture.training.ppo.train import _load_actor_checkpoint, _load_value_checkpoint
+from kaggriculture.training.ppo.train import (
+    _load_actor_checkpoint,
+    _load_initial_bc_checkpoint,
+    _load_value_checkpoint,
+)
 from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, estimated_assets
 from tests.policy.test_policy import _model
 
@@ -84,7 +88,7 @@ def test_bc_actor_penalty_ignores_critic_only_parameters() -> None:
     assert jnp.allclose(core._reference_actor_l2(reference, reference), 0)
 
     changed = unfreeze(reference)
-    changed["policy_proj"]["kernel"] += 0.1
+    changed["unit_head"]["kernel"] += 0.1
     assert core._reference_actor_l2(freeze(changed), reference) > 0
 
     critic_changed = unfreeze(reference)
@@ -106,7 +110,7 @@ def test_ppo_update_accepts_bc_actor_anchor() -> None:
     config = core.PPOConfig(reference_actor_l2_coef=0.1)
     state = core.create_train_state(model, variables, config)
     changed = unfreeze(state.params)
-    changed["policy_proj"]["kernel"] += 0.01
+    changed["unit_head"]["kernel"] += 0.01
     state = state.replace(params=changed)
     updated, metrics = core.update_minibatch(model, state, batch, config, variables["params"])
     assert updated.step == 1
@@ -140,7 +144,7 @@ def test_monte_carlo_returns_exclude_unfinished_tail() -> None:
 
 def test_critic_warmup_keeps_actor_parameters_frozen() -> None:
     base_model, _ = _model()
-    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    model = M.PolicyValueNet(base_model.config)
     variables = P.initialize(model, jax.random.key(20), batch_size=2)
     state = core.create_critic_train_state(
         model,
@@ -171,7 +175,7 @@ def test_critic_warmup_keeps_actor_parameters_frozen() -> None:
 
 def test_evaluate_critic_chunks_match_a_direct_computation() -> None:
     base_model, _ = _model()
-    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    model = M.PolicyValueNet(base_model.config)
     variables = P.initialize(model, jax.random.key(30), batch_size=4)
     batch = core.CriticBatch(
         reset(jax.random.key(31), 4),
@@ -205,7 +209,7 @@ def test_daily_reward_config_rejects_invalid_scale() -> None:
 @pytest.mark.parametrize("trainer", ["bc", "ppo"])
 def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) -> None:
     model, source_variables = _model()
-    target_model = M.PolicyValueNet(replace(model.config, use_asymmetric_critic=trainer == "bc"))
+    target_model = M.PolicyValueNet(model.config)
     target_variables = P.initialize(target_model, jax.random.key(7))
     source_state = (
         bc_core.create_train_state(model, source_variables, bc_core.BCConfig())
@@ -213,7 +217,7 @@ def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) ->
         else core.create_train_state(model, source_variables, core.PPOConfig())
     )
     changed = unfreeze(source_state.params)
-    changed["policy_proj"]["kernel"] += 0.1
+    changed["unit_head"]["kernel"] += 0.1
     changed["value_head"]["layers_0"]["kernel"] += 0.1
     source_state = source_state.replace(params=freeze(changed))
     checkpoint = tmp_path / trainer
@@ -224,7 +228,7 @@ def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) ->
     )
 
     loaded = _load_actor_checkpoint(checkpoint, target_variables, target_model.config)["params"]
-    assert jnp.allclose(loaded["policy_proj"]["kernel"], changed["policy_proj"]["kernel"])
+    assert jnp.allclose(loaded["unit_head"]["kernel"], changed["unit_head"]["kernel"])
     assert jnp.allclose(
         loaded["value_head"]["layers_0"]["kernel"],
         target_variables["params"]["value_head"]["layers_0"]["kernel"],
@@ -259,9 +263,41 @@ def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) ->
         assert jnp.allclose(source_output.slot_log_prob, target_output.slot_log_prob)
 
 
+def test_joint_bc_initialization_restores_actor_and_critic(tmp_path) -> None:
+    model, variables = _model()
+    state = bc_core.create_train_state(model, variables, bc_core.BCConfig())
+    changed = unfreeze(state.params)
+    changed["unit_head"]["kernel"] += 0.1
+    changed["value_head"]["layers_0"]["kernel"] += 0.1
+    state = state.replace(params=freeze(changed))
+    checkpoint = tmp_path / "joint_bc"
+    save_checkpoint(
+        checkpoint,
+        state,
+        {
+            **checkpoint_shape_metadata(),
+            "trainer": "bc",
+            "joint_value_training": True,
+            "critic_architecture_version": CRITIC_ARCHITECTURE_VERSION,
+            "model_config": asdict(model.config),
+            "reward_mode": "terminal_win",
+            "gamma": 0.999,
+        },
+    )
+
+    loaded = _load_initial_bc_checkpoint(
+        checkpoint, variables, model.config, 0.999, 0.0, 10000.0, 0.02
+    )["params"]
+    assert jnp.array_equal(loaded["unit_head"]["kernel"], changed["unit_head"]["kernel"])
+    assert jnp.array_equal(
+        loaded["value_head"]["layers_0"]["kernel"],
+        changed["value_head"]["layers_0"]["kernel"],
+    )
+
+
 def test_value_checkpoint_reward_mismatch_requires_warmup(tmp_path) -> None:
     base_model, _ = _model()
-    model = M.PolicyValueNet(replace(base_model.config, use_asymmetric_critic=True))
+    model = M.PolicyValueNet(base_model.config)
     variables = P.initialize(model, jax.random.key(30))
     state = core.create_train_state(model, variables, core.PPOConfig())
     checkpoint = tmp_path / "value"
@@ -321,12 +357,12 @@ def test_reference_actor_rejects_incompatible_checkpoint(tmp_path) -> None:
         {**checkpoint_shape_metadata(), "trainer": "ppo", "model_config": asdict(model.config)},
     )
     target = unfreeze(source_variables["params"])
-    target["policy_proj"]["kernel"] = jnp.zeros((1, 1))
+    target["unit_head"]["kernel"] = jnp.zeros((1, 1))
     with pytest.raises(ValueError, match="incompatible actor checkpoint"):
         _load_actor_checkpoint(checkpoint, {"params": freeze(target)}, model.config)
 
 
-@pytest.mark.parametrize("override", [{"num_heads": 4}, {"use_episode_history": True}])
+@pytest.mark.parametrize("override", [{"num_heads": 4}, {"num_layers_decoder": 2}])
 def test_reference_actor_rejects_semantically_incompatible_config(tmp_path, override) -> None:
     model, source_variables = _model()
     source_state = core.create_train_state(model, source_variables, core.PPOConfig())

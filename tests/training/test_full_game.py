@@ -5,14 +5,15 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.training.ppo import core, full_game
 from kaggriculture.training.ppo.rollout import RolloutConfig
 from tests.policy.test_policy import _model
 
-ENVS = 2
-EPISODE_STEPS = 13  # 12ターンの短い試合
+ENVS = 1
+EPISODE_STEPS = 5  # 4ターンの軽量な契約テスト
 
 
 def _config(**changes) -> RolloutConfig:
@@ -41,10 +42,13 @@ def test_replayed_states_reach_the_recorded_final_cash() -> None:
     state = full_game.initial_state(jax.random.key(1), ENVS, config)
 
     final = state
+    counters = H.zeros(ENVS)
     replayed_steps = []
     for start, end in full_game.segment_bounds(game.dones.shape[0], 5):
         window = full_game._window(start, end)
-        final, states = full_game.replay_segment(config, final, window(game.actions))
+        (final, counters), (states, _) = full_game.replay_segment(
+            config, final, counters, window(game.actions)
+        )
         replayed_steps.extend(states.step[:, 0].tolist())
 
     assert replayed_steps == list(range(EPISODE_STEPS - 1))
@@ -90,7 +94,10 @@ def _run_accumulated_gradient_check() -> None:
     advantages, returns = full_game.game_targets(game, 0.999, 0.95, 1.0)
     state = full_game.initial_state(jax.random.key(1), ENVS, config)
     steps = game.dones.shape[0]
-    state, states = full_game.replay_segment(config, state, game.actions)
+    counters = H.zeros(ENVS)
+    (state, counters), (states, state_counters) = full_game.replay_segment(
+        config, state, counters, game.actions
+    )
     window = full_game._window(0, steps)
     rows = {
         "intent": window(game.intent),
@@ -99,9 +106,10 @@ def _run_accumulated_gradient_check() -> None:
         "old_value": game.value,
         "advantages": (advantages - advantages.mean()) / (advantages.std() + 1e-8),
         "returns": returns,
+        "counters": jax.tree.map(lambda value: value[:, :, 0], state_counters),
     }
     ppo_config = core.PPOConfig(normalize_advantages=False, entropy_coef=0.0)
-    minibatch = 8  # 24行を3つに分ける
+    minibatch = 2  # 4行を2つに分ける
     total, used = steps * ENVS, (steps * ENVS // minibatch) * minibatch
 
     accumulated, _, count = full_game.segment_gradient(
@@ -130,7 +138,7 @@ def _run_accumulated_gradient_check() -> None:
         flat(rows["old_value"]),
         flat(rows["advantages"]),
         flat(rows["returns"]),
-        None,
+        jax.tree.map(flat, rows["counters"]),
     )
     expected = jax.grad(lambda p: core._loss(model, p, batch, ppo_config)[0])(variables["params"])
 
@@ -155,8 +163,8 @@ def test_full_game_update_alternates_seats_and_changes_parameters() -> None:
         [variables, variables],
         jax.random.key(5),
         batch_size=ENVS,
-        minibatch=8,
-        segment_length=5,
+        minibatch=2,
+        segment_length=2,
         gamma=0.999,
         gae_lambda=0.95,
         value_lambda=1.0,

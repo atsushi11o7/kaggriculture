@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from kaggriculture.policy.jax import tokenize as T
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.state import State
 from kaggriculture.training.bc.dataset import (
@@ -21,9 +22,10 @@ from kaggriculture.training.bc.dataset import (
 )
 from kaggriculture.training.replays.state import CacheRules
 
-_VERSION = 3
+_VERSION = 4
 _STATE_PREFIX = "state__"
 _INTENT_PREFIX = "intent__"
+_COUNTER_PREFIX = "counter__"
 
 
 def _path(source: Path, directory: Path, rules: CacheRules, players, reward=None) -> Path:
@@ -74,6 +76,10 @@ def prepare_episode(
         "players": batch.players,
         "slot_mask": batch.slot_mask,
         "value_target": batch.value_target,
+        **{
+            f"{_COUNTER_PREFIX}{name}": value
+            for name, value in zip(batch.counters._fields, batch.counters, strict=True)
+        },
     }
     temporary = destination.with_suffix(f".tmp-{os.getpid()}")
     try:
@@ -100,7 +106,12 @@ def load_shard(path: Path) -> BCBatch:
     with np.load(path, allow_pickle=False) as data:
         states = State(*(data[f"{_STATE_PREFIX}{name}"] for name in State._fields))
         intent = Intent(*(data[f"{_INTENT_PREFIX}{name}"] for name in Intent._fields))
-        return BCBatch(states, data["players"], intent, data["slot_mask"], data["value_target"])
+        counters = T.EpisodeCounters(
+            *(data[f"{_COUNTER_PREFIX}{name}"] for name in T.EpisodeCounters._fields)
+        )
+        return BCBatch(
+            states, data["players"], intent, data["slot_mask"], data["value_target"], counters
+        )
 
 
 def _take(batch: BCBatch, index) -> BCBatch:
@@ -110,6 +121,7 @@ def _take(batch: BCBatch, index) -> BCBatch:
         Intent(*(value[index] for value in batch.intent)),
         batch.slot_mask[index],
         batch.value_target[index],
+        T.EpisodeCounters(*(value[index] for value in batch.counters)),
     )
 
 
@@ -126,6 +138,9 @@ def _concat(left: BCBatch | None, right: BCBatch) -> BCBatch:
         Intent(*(join(a, b) for a, b in zip(left.intent, right.intent, strict=True))),
         join(left.slot_mask, right.slot_mask),
         join(left.value_target, right.value_target),
+        T.EpisodeCounters(
+            *(join(a, b) for a, b in zip(left.counters, right.counters, strict=True))
+        ),
     )
 
 

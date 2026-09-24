@@ -13,6 +13,9 @@ from kaggriculture.rules import constants as C
 N_UNIT_SLOTS = C.MAX_HANDS + 1
 N_MARKET_SLOTS = C.MAX_MARKET_ORDERS
 N_QUERY_SLOTS = N_UNIT_SLOTS + N_MARKET_SLOTS
+N_UNIT_ACTIONS = C.N_FARMER_OPS - 3 + C.N_CROPS + 2 * C.N_SHED_ITEMS
+N_MARKET_ACTIONS = 6 + C.N_CROPS + C.N_ANIMALS + C.N_PRODUCTS
+N_QUANTITIES = 100
 
 
 class QueryBlock(nn.Module):
@@ -21,10 +24,10 @@ class QueryBlock(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
-            config.d_model, config.num_heads, config.dropout, batch_first=True
+            config.d_model, config.num_heads, 0.0, batch_first=True
         )
         self.cross_attn = nn.MultiheadAttention(
-            config.d_model, config.num_heads, config.dropout, batch_first=True
+            config.d_model, config.num_heads, 0.0, batch_first=True
         )
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
@@ -35,12 +38,16 @@ class QueryBlock(nn.Module):
     def forward(
         self, query: torch.Tensor, memory: torch.Tensor, active: torch.Tensor
     ) -> torch.Tensor:
-        mixed, _ = self.self_attn(query, query, query, key_padding_mask=~active, need_weights=False)
-        query = self.norm1(query + mixed)
-        context, _ = self.cross_attn(query, memory, memory, need_weights=False)
-        query = self.norm2(query + context)
-        hidden = self.linear2(torch.relu(self.linear1(query)))
-        return self.norm3(query + hidden)
+        normalized = self.norm1(query)
+        mixed, _ = self.self_attn(
+            normalized, normalized, normalized, key_padding_mask=~active, need_weights=False
+        )
+        query = query + mixed
+        normalized = self.norm2(query)
+        context, _ = self.cross_attn(normalized, memory, memory, need_weights=False)
+        query = query + context
+        hidden = self.linear2(torch.nn.functional.gelu(self.linear1(self.norm3(query))))
+        return query + hidden
 
 
 class ParallelQueryEncoder(nn.Module):
@@ -99,11 +106,10 @@ class ParallelQueryEncoder(nn.Module):
 class PolicyValueNet(nn.Module):
     """One-pass actor with an optional asymmetric critic."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, *, actor_only: bool = False) -> None:
         super().__init__()
         self.config = config
-        self.uses_episode_history = config.use_episode_history
-        self.uses_asymmetric_critic = config.use_asymmetric_critic
+        self.actor_only = actor_only
         self.token_embedding = TokenEmbedding(config.d_model)
         self.board_position_embedding = nn.Embedding(L.N_POSITIONS, config.d_model)
         nn.init.normal_(self.board_position_embedding.weight, std=0.02)
@@ -114,12 +120,20 @@ class PolicyValueNet(nn.Module):
             config.num_heads,
             config.d_feedforward,
             config.num_layers_encoder,
-            config.dropout,
+            0.0,
         )
         self.query_encoder = ParallelQueryEncoder(self.board_position_embedding, config)
-        self.policy_proj = nn.Linear(config.d_model, config.d_model)
-        self.quantity_condition = nn.Linear(config.d_model * 2, config.d_model)
-        if config.use_asymmetric_critic:
+        self.unit_head = nn.Linear(config.d_model, N_UNIT_ACTIONS)
+        self.market_head = nn.Linear(config.d_model, N_MARKET_ACTIONS)
+        self.unit_action_embedding = nn.Embedding(N_UNIT_ACTIONS, config.d_model)
+        self.market_action_embedding = nn.Embedding(N_MARKET_ACTIONS, config.d_model)
+        self.unit_quantity_condition = nn.Linear(config.d_model * 2, config.d_model)
+        self.market_quantity_condition = nn.Linear(config.d_model * 2, config.d_model)
+        self.quantity_head = nn.Linear(config.d_model, N_QUANTITIES)
+        self.privileged_encoder = None
+        self.critic_macro_encoder = None
+        self.value_head = None
+        if not actor_only:
             self.privileged_encoder = PrivilegedEncoder(
                 self.token_embedding,
                 self.board_position_embedding,
@@ -127,108 +141,104 @@ class PolicyValueNet(nn.Module):
                 config.num_heads,
                 config.d_feedforward,
                 config.num_layers_critic,
-                config.dropout,
+                0.0,
             )
-        else:
-            self.privileged_encoder = None
-        self.critic_macro_encoder = (
-            nn.Sequential(
+            self.critic_macro_encoder = nn.Sequential(
                 nn.Linear(NUM_CRITIC_MACRO_FEATURES, config.d_model),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(config.d_model, config.d_model),
             )
-            if config.use_asymmetric_critic
-            else None
-        )
-        value_width = config.d_model * (3 if config.use_asymmetric_critic else 1)
-        self.value_head = nn.Sequential(
-            nn.Linear(value_width, value_width // 2), nn.ReLU(), nn.Linear(value_width // 2, 1)
-        )
+            self.value_head = nn.Sequential(
+                nn.Linear(config.d_model * 4, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1),
+            )
 
     def embed_dense(self, index: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Embed fixed-width sparse features without constructing EmbeddingBag offsets."""
         embedded = self.token_embedding.bag.weight[index]
         return self.token_embedding.norm((embedded * value[..., None]).sum(dim=-2))
 
-    def forward(
+    def encode_actor(
         self,
-        encoder_index: torch.Tensor,
-        encoder_value: torch.Tensor,
-        unit_positions: torch.Tensor,
-        unit_active: torch.Tensor,
-        unit_inventory_index: torch.Tensor,
-        unit_inventory_value: torch.Tensor,
-        privileged_index: torch.Tensor | None = None,
-        privileged_value: torch.Tensor | None = None,
-        privileged_positions: torch.Tensor | None = None,
-        privileged_padding: torch.Tensor | None = None,
-        critic_macro: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        encoder_index,
+        encoder_value,
+        unit_positions,
+        unit_active,
+        unit_inventory_index,
+        unit_inventory_value,
+    ):
+        """Encode public state into all parallel action slots."""
         embedded = self.embed_dense(encoder_index, encoder_value)
         memory = self.encoder.forward_embedded(embedded)
-        unit_inventory_embedding = self.embed_dense(unit_inventory_index, unit_inventory_value)
-        queries = self.query_encoder(memory, unit_positions, unit_active, unit_inventory_embedding)
-        value_input = memory[:, 0]
-        if self.uses_asymmetric_critic:
-            if any(
-                item is None
-                for item in (
-                    privileged_index,
-                    privileged_value,
-                    privileged_positions,
-                    privileged_padding,
-                    critic_macro,
-                )
-            ):
-                raise ValueError("asymmetric critic requires privileged inputs")
-            privileged_embedded = self.embed_dense(privileged_index, privileged_value)
-            pbatch = privileged_embedded.shape[0]
-            pcls = self.privileged_encoder.cls_token.expand(pbatch, 1, -1)
-            privileged = torch.cat([pcls, privileged_embedded], dim=1)
-            cls_position = torch.full(
-                (pbatch, 1), L.NO_POSITION, dtype=torch.long, device=privileged_embedded.device
-            )
-            positions = torch.cat([cls_position, privileged_positions], dim=1)
-            privileged = privileged + self.privileged_encoder.owner_embedding(
-                self.privileged_encoder._owner_ids
-            )
-            privileged = privileged + self.privileged_encoder.zone_embedding(
-                self.privileged_encoder._zone_ids
-            )
-            privileged = privileged + self.board_position_embedding(positions)
-            padding = torch.cat(
-                [
-                    torch.zeros((pbatch, 1), dtype=torch.bool, device=privileged_embedded.device),
-                    privileged_padding,
-                ],
-                dim=1,
-            )
-            privileged = self.privileged_encoder.transformer(
-                privileged, src_key_padding_mask=padding
-            )
-            macro = self.critic_macro_encoder(critic_macro)
-            value_input = torch.cat([value_input, privileged[:, 0], macro], dim=-1)
-        return queries, self.value_head(value_input)[:, 0]
+        inventory = self.embed_dense(unit_inventory_index, unit_inventory_value)
+        queries = self.query_encoder(memory, unit_positions, unit_active, inventory)
+        public = torch.cat([memory[:, 0], memory[:, 1:].mean(dim=1)], dim=-1)
+        return queries, public
 
-    def score_candidates(
+    def forward(
         self,
-        hidden: torch.Tensor,
-        candidate_index: torch.Tensor,
-        candidate_value: torch.Tensor,
-        candidate_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        candidates = self.embed_dense(candidate_index, candidate_value)
-        scores = torch.einsum("...d,...cd->...c", self.policy_proj(hidden), candidates)
-        # log_softmaxへ-infを流すと、マスクしていない要素の勾配までNaNになる
-        # (JAX側と同じ問題。実測で確認済み)。forward値を変えない範囲で
-        # 十分小さい有限値を使う。
-        return (scores / self.config.d_model**0.5).masked_fill(~candidate_mask, -1e9)
+        encoder_index,
+        encoder_value,
+        unit_positions,
+        unit_active,
+        unit_inventory_index,
+        unit_inventory_value,
+        privileged_index,
+        privileged_value,
+        privileged_positions,
+        privileged_padding,
+        critic_macro,
+    ):
+        if self.actor_only:
+            raise RuntimeError("actor-only submission model has no critic")
+        queries, public = self.encode_actor(
+            encoder_index,
+            encoder_value,
+            unit_positions,
+            unit_active,
+            unit_inventory_index,
+            unit_inventory_value,
+        )
+        privileged_embedded = self.embed_dense(privileged_index, privileged_value)
+        batch = privileged_embedded.shape[0]
+        cls = self.privileged_encoder.cls_token.expand(batch, 1, -1)
+        privileged = torch.cat([cls, privileged_embedded], dim=1)
+        cls_position = torch.full(
+            (batch, 1), L.NO_POSITION, dtype=torch.long, device=privileged.device
+        )
+        positions = torch.cat([cls_position, privileged_positions], dim=1)
+        privileged = privileged + self.privileged_encoder.owner_embedding(
+            self.privileged_encoder._owner_ids
+        )
+        privileged = privileged + self.privileged_encoder.zone_embedding(
+            self.privileged_encoder._zone_ids
+        )
+        privileged = privileged + self.board_position_embedding(positions)
+        padding = torch.cat(
+            [
+                torch.zeros((batch, 1), dtype=torch.bool, device=privileged.device),
+                privileged_padding,
+            ],
+            dim=1,
+        )
+        privileged = self.privileged_encoder.transformer(privileged, src_key_padding_mask=padding)
+        macro = self.critic_macro_encoder(critic_macro)
+        value = self.value_head(torch.cat([public, privileged[:, 0], macro], dim=-1))[:, 0]
+        return queries, value
 
-    def condition_quantity(
-        self,
-        hidden: torch.Tensor,
-        selected_index: torch.Tensor,
-        selected_value: torch.Tensor,
-    ) -> torch.Tensor:
-        selected = self.embed_dense(selected_index, selected_value)
-        return self.quantity_condition(torch.cat([hidden, selected], dim=-1))
+    def unit_logits(self, hidden, mask):
+        return self.unit_head(hidden).masked_fill(~mask, -1e9)
+
+    def market_logits(self, hidden, mask):
+        return self.market_head(hidden).masked_fill(~mask, -1e9)
+
+    def unit_quantity_logits(self, hidden, action, mask):
+        selected = self.unit_action_embedding(action)
+        hidden = self.unit_quantity_condition(torch.cat([hidden, selected], dim=-1))
+        return self.quantity_head(hidden).masked_fill(~mask, -1e9)
+
+    def market_quantity_logits(self, hidden, action, mask):
+        selected = self.market_action_embedding(action)
+        hidden = self.market_quantity_condition(torch.cat([hidden, selected], dim=-1))
+        return self.quantity_head(hidden).masked_fill(~mask, -1e9)

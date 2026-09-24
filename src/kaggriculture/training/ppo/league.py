@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -105,8 +104,7 @@ def _load_all(specs: list[str]):
     reference = first_ppo or parsed[0][2]
     reference_metadata = read_checkpoint_metadata(reference)
     model_config = ModelConfig(**reference_metadata["model_config"])
-    model_config = replace(model_config, use_asymmetric_critic=True)
-    model = create_model(model_config, reference_metadata.get("model_variant", "shared"))
+    model = create_model(model_config)
     variables = P.initialize(model, jax.random.key(0))
     template = core.create_train_state(model, variables, core.PPOConfig())
     loaded = {}

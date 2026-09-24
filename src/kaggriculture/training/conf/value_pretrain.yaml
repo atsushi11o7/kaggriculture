@@ -14,7 +14,6 @@ hydra:
     dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 model:
-  use_asymmetric_critic: true
 
 data:
   data_dir: data/replays
@@ -25,7 +24,6 @@ data:
   cache_dir: data/cache/value_pretrain
 
 train:
-  model_variant: shared
   actor_checkpoint: null
   gamma: 0.999
   # PPO開始時と同じ複合報酬。0にすると終端勝敗のみを学習する。

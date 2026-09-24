@@ -98,8 +98,6 @@ def main(cfg: DictConfig) -> None:
         cfg.train.daily_reward_maximum,
     )
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
-    if not model_config.use_asymmetric_critic:
-        raise ValueError("value pretraining requires use_asymmetric_critic=true")
     train_paths, validation_paths = _sources(cfg)
     if not train_paths or not validation_paths:
         raise ValueError("training and validation both require completed episodes")
@@ -111,7 +109,7 @@ def main(cfg: DictConfig) -> None:
     )
     if not train_shards or not validation_shards:
         raise ValueError("training and validation both require completed episodes")
-    model = create_model(model_config, cfg.train.model_variant)
+    model = create_model(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     variables = _load_actor_checkpoint(
         Path(to_absolute_path(cfg.train.actor_checkpoint)), variables, model_config
@@ -183,8 +181,7 @@ def main(cfg: DictConfig) -> None:
         validation = metrics["model_mse"]
         metadata = {
             "trainer": "value_pretrain",
-            "model_variant": cfg.train.model_variant,
-            "critic_architecture_version": critic_version(cfg.train.model_variant),
+            "critic_architecture_version": critic_version(),
             "model_config": asdict(model_config),
             **checkpoint_shape_metadata(),
             "reward_mode": "terminal_win_daily_asset",

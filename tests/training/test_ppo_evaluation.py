@@ -16,7 +16,7 @@ from kaggriculture.training.ppo.rollout import RolloutConfig
 
 
 def _model():
-    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, False, 1)
+    config = ModelConfig(8, 1, 16, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.key(0))
 

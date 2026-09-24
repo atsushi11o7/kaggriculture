@@ -12,7 +12,7 @@ from kaggriculture.policy.torch import actions as A
 from kaggriculture.policy.torch import decode as DS
 from kaggriculture.policy.torch import strategy as S
 from kaggriculture.policy.torch import tokenize
-from kaggriculture.policy.torch.model import N_UNIT_SLOTS, PolicyValueNet
+from kaggriculture.policy.torch.model import N_QUERY_SLOTS, N_UNIT_SLOTS, PolicyValueNet
 from kaggriculture.rules import constants as C
 
 
@@ -221,12 +221,10 @@ def predict_action(
     Raises:
         ValueError: If critic or history settings are incompatible with submission inference.
     """
-    if net.uses_asymmetric_critic:
-        raise ValueError("submission actor must have use_asymmetric_critic=False")
-    if net.uses_episode_history and counters is None:
-        raise ValueError("episode history model requires counters")
-    if not net.uses_episode_history and counters is not None:
-        raise ValueError("model does not use episode history")
+    if not net.actor_only:
+        raise ValueError("submission inference requires an actor-only model")
+    if counters is None:
+        counters = {}
     device = next(net.parameters()).device
     encoder_index, encoder_value = _pack(
         tokenize.get_encoder_input(obs, turns_per_day, counters), device
@@ -246,7 +244,7 @@ def predict_action(
     farm, shed, seeds, market, inventories = _copy_environment(obs)
 
     with _evaluation(net):
-        queries, _ = net(
+        queries, _ = net.encode_actor(
             encoder_index[None],
             encoder_value[None],
             unit_positions,
@@ -254,9 +252,6 @@ def predict_action(
             unit_inventory_index[None],
             unit_inventory_value[None],
         )
-        unit_index, unit_value = _pack(UNIT_VECTORS, device)
-        market_index, market_value = _pack(MARKET_VECTORS, device)
-        quantity_index, quantity_value = _pack(QUANTITY_VECTORS, device)
         unit_hidden = queries[0, :N_UNIT_SLOTS]
         market_hidden = queries[0, N_UNIT_SLOTS:]
 
@@ -285,31 +280,28 @@ def predict_action(
         while len(legal_masks) < N_UNIT_SLOTS:
             legal_masks.append([index == 0 for index in range(len(UNIT_VECTORS))])
         unit_mask = torch.tensor(legal_masks, dtype=torch.bool, device=device)
-        unit_logits = net.score_candidates(unit_hidden, unit_index, unit_value, unit_mask)
+        unit_logits = net.unit_logits(unit_hidden, unit_mask)
         selected_units = unit_logits.argmax(-1)
 
         market_mask = torch.tensor(S.market_mask(obs, MARKET_META), dtype=torch.bool, device=device)
-        market_logits = net.score_candidates(market_hidden, market_index, market_value, market_mask)
+        market_logits = net.market_logits(market_hidden, market_mask)
         selected_market = market_logits.argmax(-1)
 
-        selected_vectors = torch.cat(
-            [unit_index[selected_units], market_index[selected_market]], dim=0
-        )
-        selected_values = torch.cat(
-            [unit_value[selected_units], market_value[selected_market]], dim=0
-        )
-        conditioned = net.condition_quantity(queries[0], selected_vectors, selected_values)
         quantity_mask = torch.ones(
-            (conditioned.shape[0], len(QUANTITY_VECTORS)), dtype=torch.bool, device=device
+            (N_QUERY_SLOTS, len(QUANTITY_VECTORS)), dtype=torch.bool, device=device
         )
         numbers = torch.arange(1, len(QUANTITY_VECTORS) + 1, device=device)
         for slot, (position, inventory) in enumerate(zip(positions_xy, inventories, strict=True)):
             op, arg = UNIT_META[int(selected_units[slot])]
             maximum = _unit_quantity_upper_bound(op, arg, position, inventory, farm)
             quantity_mask[slot] = numbers <= maximum
-        quantity_logits = net.score_candidates(
-            conditioned, quantity_index, quantity_value, quantity_mask
+        unit_quantity_logits = net.unit_quantity_logits(
+            unit_hidden, selected_units, quantity_mask[:N_UNIT_SLOTS]
         )
+        market_quantity_logits = net.market_quantity_logits(
+            market_hidden, selected_market, quantity_mask[N_UNIT_SLOTS:]
+        )
+        quantity_logits = torch.cat([unit_quantity_logits, market_quantity_logits], dim=0)
         selected_quantities = quantity_logits.argmax(-1).add(1).tolist()
         selected_units = selected_units.tolist()
         selected_market = selected_market.tolist()

@@ -22,6 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.action import Action
@@ -77,10 +78,9 @@ def collect_compact_game(
     run_key,
 ) -> CompactGame:
     """全環境を初期状態から最後まで回し、状態を保存せずに行動と統計だけを返す。"""
-    if model.config.use_episode_history:
-        raise NotImplementedError("full-game PPO does not support episode history")
     opponent_seat = 1 - learner_seat
     state = initial_state(reset_key, batch_size, config)
+    counters = H.zeros(batch_size)
     assets = estimated_assets(state)
     margin = assets[:, 0] - assets[:, 1]
     daily_config = DailyRewardConfig(
@@ -90,7 +90,7 @@ def collect_compact_game(
     opponent_players = jnp.full((batch_size,), opponent_seat, jnp.int32)
 
     def scan_step(carry, step_key):
-        state, margin = carry
+        state, counters, margin = carry
         learner_key, opponent_key = jax.random.split(step_key)
         learner_out = P.sample_actions(
             model,
@@ -98,7 +98,7 @@ def collect_compact_game(
             state,
             learner_players,
             learner_key,
-            None,
+            jax.tree.map(lambda value: value[:, learner_seat], counters),
             temperature=config.temperature,
             turns_per_day=config.turns_per_day,
             shed_capacity=config.shed_capacity,
@@ -110,7 +110,7 @@ def collect_compact_game(
             state,
             opponent_players,
             opponent_key,
-            None,
+            jax.tree.map(lambda value: value[:, opponent_seat], counters),
             temperature=config.temperature,
             turns_per_day=config.turns_per_day,
             shed_capacity=config.shed_capacity,
@@ -126,6 +126,14 @@ def collect_compact_game(
             )
         )
         stepped, cash, done = _step(state, action, config)
+        next_counters = H.update_counters(
+            state,
+            action,
+            counters,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
+        )
         daily, next_margin = daily_asset_rewards(
             stepped, margin, done, config.turns_per_day, daily_config
         )
@@ -145,10 +153,10 @@ def collect_compact_game(
             learner_out.stats.clamped_unit_quantity,
             cash,
         )
-        return (stepped, next_margin), record
+        return (stepped, next_counters, next_margin), record
 
     keys = jax.random.split(run_key, config.episode_steps - 1)
-    _, records = jax.lax.scan(scan_step, (state, margin), keys)
+    _, records = jax.lax.scan(scan_step, (state, counters, margin), keys)
     *fields, cash = records
     return CompactGame(*fields, final_cash=cash[-1])
 
@@ -175,14 +183,23 @@ def segment_bounds(steps: int, length: int) -> list[tuple[int, int]]:
 
 
 @partial(jax.jit, static_argnums=(0,))
-def replay_segment(config: RolloutConfig, state, actions: Action):
-    """保存した行動でシミュレータだけを進め、各ターンの行動前の状態を再生成する。"""
+def replay_segment(config: RolloutConfig, state, counters, actions: Action):
+    """Replay actions and regenerate pre-action states and observable history."""
 
-    def step(state, action):
+    def step(carry, action):
+        state, counters = carry
         stepped, _, _ = _step(state, action, config)
-        return stepped, state
+        updated = H.update_counters(
+            state,
+            action,
+            counters,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
+        )
+        return (stepped, updated), (state, counters)
 
-    return jax.lax.scan(step, state, actions)
+    return jax.lax.scan(step, (state, counters), actions)
 
 
 @partial(jax.jit, static_argnums=(0, 5, 6, 7))
@@ -225,7 +242,7 @@ def segment_gradient(
             selected["old_value"],
             selected["advantages"],
             selected["returns"],
-            None,
+            selected["counters"],
         )
         (_, metrics), gradients = jax.value_and_grad(core._loss, argnums=1, has_aux=True)(
             model, params, batch_, ppo_config, reference_params
@@ -305,12 +322,15 @@ def full_game_update(
     metric_total = core.Metrics(*(jnp.zeros(()) for _ in core.Metrics._fields))
     for seat, reset_key, permutation_key, game, advantages, returns in games:
         state = initial_state(reset_key, batch_size, rollout_config)
+        counters = H.zeros(batch_size)
         steps = game.dones.shape[0]
         gradient = jax.tree.map(jnp.zeros_like, params)
         round_minibatches = 0
         for number, (start, end) in enumerate(segment_bounds(steps, segment_length)):
             window = _window(start, end)
-            state, states = replay_segment(rollout_config, state, window(game.actions))
+            (state, counters), (states, state_counters) = replay_segment(
+                rollout_config, state, counters, window(game.actions)
+            )
             rows = {
                 "intent": window(game.intent),
                 "slot_mask": game.slot_mask[start:end],
@@ -318,6 +338,9 @@ def full_game_update(
                 "old_value": game.value[start:end],
                 "advantages": (advantages[start:end] - mean) / std,
                 "returns": returns[start:end],
+                "counters": jax.tree.map(
+                    lambda value, seat=seat: value[:, :, seat], state_counters
+                ),
             }
             gradient_sum, metric_sum, used = segment_gradient(
                 model,

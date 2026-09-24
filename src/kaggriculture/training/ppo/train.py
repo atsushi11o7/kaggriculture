@@ -51,8 +51,7 @@ logger = logging.getLogger(__name__)
 
 def _validate_critic_architecture(metadata: dict, path: Path) -> None:
     """checkpointに記録されたcritic実装とversionの組み合わせを検証する。"""
-    variant = metadata.get("model_variant", "shared")
-    if metadata.get("critic_architecture_version") != critic_version(variant):
+    if metadata.get("critic_architecture_version") != critic_version():
         raise ValueError(f"incompatible critic architecture: {path}")
 
 
@@ -62,8 +61,6 @@ _ACTOR_CONFIG_FIELDS = (
     "d_feedforward",
     "num_layers_encoder",
     "num_layers_decoder",
-    "dropout",
-    "use_episode_history",
 )
 
 
@@ -105,20 +102,6 @@ def _load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConf
     for name in target_actor:
         target[name] = jnp.asarray(source[name])
 
-    # 分離版のcritic公開Encoderは、Actor checkpointの公開Encoderを複製して始める。
-    # value head等は初期値のままなので、actor-only loadの意味は維持される。
-    aliases = {
-        "critic_token_embedding": "token_embedding",
-        "critic_board_position_embedding": "board_position_embedding",
-        "critic_encoder": "encoder",
-    }
-    for name in target:
-        if name[0] not in aliases:
-            continue
-        source_name = (aliases[name[0]], *name[1:])
-        if source_name not in source or source[source_name].shape != target[name].shape:
-            raise ValueError(f"incompatible separated critic initialization: {path}")
-        target[name] = jnp.asarray(source[source_name])
     return {"params": freeze(traverse_util.unflatten_dict(target))}
 
 
@@ -174,20 +157,39 @@ def _load_value_checkpoint(
     saved = serialization.msgpack_restore((path / "state.msgpack").read_bytes())
     source = traverse_util.flatten_dict(saved["params"])
     target = traverse_util.flatten_dict(unfreeze(variables["params"]))
-    aliases = {
-        "critic_token_embedding": "token_embedding",
-        "critic_board_position_embedding": "board_position_embedding",
-        "critic_encoder": "encoder",
-    }
     restored = {}
     for name, target_value in target.items():
-        source_name = name
-        if source_name not in source and name[0] in aliases:
-            source_name = (aliases[name[0]], *name[1:])
-        if source_name not in source or source[source_name].shape != target_value.shape:
+        if name not in source or source[name].shape != target_value.shape:
             raise ValueError(f"incompatible value checkpoint parameters: {path}")
-        restored[name] = jnp.asarray(source[source_name])
+        restored[name] = jnp.asarray(source[name])
     return {"params": freeze(traverse_util.unflatten_dict(restored))}
+
+
+def _load_initial_bc_checkpoint(
+    path: Path,
+    variables: dict,
+    target_config: ModelConfig,
+    gamma: float,
+    daily_reward_coefficient: float,
+    daily_reward_scale: float,
+    daily_reward_maximum: float,
+    *,
+    allow_reward_mismatch: bool = False,
+) -> dict:
+    """Load a BC actor and preserve its jointly trained critic when available."""
+    metadata = read_checkpoint_metadata(path)
+    if metadata.get("trainer") == "bc" and metadata.get("joint_value_training") is True:
+        return _load_value_checkpoint(
+            path,
+            variables,
+            target_config,
+            gamma,
+            daily_reward_coefficient,
+            daily_reward_scale,
+            daily_reward_maximum,
+            allow_reward_mismatch=allow_reward_mismatch,
+        )
+    return _load_actor_checkpoint(path, variables, target_config)
 
 
 def _opponent_variables(directory: Path, train_state) -> dict:
@@ -341,7 +343,7 @@ def main(cfg: DictConfig) -> None:
     if samples % cfg.ppo.minibatch_size:
         raise ValueError("minibatch_size must divide batch_size * horizon * 2")
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
-    model = create_model(model_config, cfg.ppo.model_variant)
+    model = create_model(model_config)
     key = jax.random.key(cfg.ppo.seed)
     key, init_key, reset_key = jax.random.split(key, 3)
     initial_variables = P.initialize(model, init_key)
@@ -376,8 +378,17 @@ def main(cfg: DictConfig) -> None:
     anchor_path = Path(to_absolute_path(anchor_checkpoint))
     anchor_variables = _load_actor_checkpoint(anchor_path, initial_variables, model_config)
     if cfg.ppo.init_bc_checkpoint:
-        variables = _load_actor_checkpoint(
-            Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)), initial_variables, model_config
+        variables = _load_initial_bc_checkpoint(
+            Path(to_absolute_path(cfg.ppo.init_bc_checkpoint)),
+            initial_variables,
+            model_config,
+            cfg.ppo.gamma,
+            cfg.ppo.daily_reward_coefficient,
+            cfg.ppo.daily_reward_scale,
+            cfg.ppo.daily_reward_maximum,
+            allow_reward_mismatch=(
+                cfg.ppo.critic_warmup_updates > 0 or cfg.ppo.allow_value_reward_mismatch
+            ),
         )
     if cfg.ppo.init_value_checkpoint:
         variables = _load_value_checkpoint(
@@ -542,9 +553,8 @@ def main(cfg: DictConfig) -> None:
             metadata = {
                 **checkpoint_shape_metadata(),
                 "trainer": "ppo",
-                "model_variant": cfg.ppo.model_variant,
                 "phase": "critic_warmup",
-                "critic_architecture_version": critic_version(cfg.ppo.model_variant),
+                "critic_architecture_version": critic_version(),
                 "warmup_update": warmup_update,
                 "update": 0,
                 "model_config": asdict(model_config),
@@ -755,9 +765,8 @@ def main(cfg: DictConfig) -> None:
         metadata = {
             **checkpoint_shape_metadata(),
             "trainer": "ppo",
-            "model_variant": cfg.ppo.model_variant,
             "phase": "ppo",
-            "critic_architecture_version": critic_version(cfg.ppo.model_variant),
+            "critic_architecture_version": critic_version(),
             "update": update,
             "model_config": asdict(model_config),
             "reference_checkpoint_resolved": str(reference_path.resolve()),

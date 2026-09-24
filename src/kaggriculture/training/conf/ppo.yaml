@@ -13,20 +13,16 @@ hydra:
   run:
     dir: outputs/${hydra.job.name}/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-model:
-  use_asymmetric_critic: true
-
 env:
-  batch_size: 128
+  batch_size: 32
 
 ppo:
-  model_variant: shared
   total_updates: 1000
-  rollout_horizon: 128
-  update_epochs: 4
+  rollout_horizon: 720
+  update_epochs: 1
   # 0以外なら、完了試合をこのラウンド数だけ集め(1ラウンド=全環境が1試合を最後まで)、勾配を蓄積して
   # 1回だけ更新する(full_game.py)。1 updateの試合数はラウンド数×env.batch_size。
-  full_game_rounds: 0
+  full_game_rounds: 2
   # 蓄積時に状態を再生成する区間の長さ(メモリと速度の兼ね合い)。
   full_game_segment_length: 144
   # 価値の教師のλ。1.0なら、criticの予測を含まない実際のreturn(モンテカルロ)。
@@ -45,7 +41,7 @@ ppo:
   value_coef: 0.5
   entropy_coef: 0.0
   # 日末・終端に前回評価時からの概算資産差改善を小さく加える。
-  daily_reward_coefficient: 0.05
+  daily_reward_coefficient: 0.0
   daily_reward_scale: 10000.0
   daily_reward_maximum: 0.02
   # 固定した参照Actorからのパラメータ乖離を抑える係数(0で無効)。
@@ -59,6 +55,7 @@ ppo:
   checkpoint_interval: 50
   # step_*だけ古い順に削除する(best/poolは対象外)。0以下で無効。
   keep_last_checkpoints: 5
+  # joint BCならActorとcriticを、Actor-only BCならActorだけを読み込む。
   init_bc_checkpoint: null
   # 事前学習したActor+criticを読み込む。報酬変更時はcritic warm-upが必須。
   init_value_checkpoint: null

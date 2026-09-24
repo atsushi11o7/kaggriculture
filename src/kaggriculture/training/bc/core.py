@@ -1,4 +1,4 @@
-"""非自己回帰固定slot方策のJAX Behavior Cloning。"""
+"""固定slot方策のJAX Behavior Cloning。"""
 
 from __future__ import annotations
 
@@ -11,9 +11,7 @@ import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
 
-from kaggriculture.policy.common.config import CRITIC_PARAMETER_MODULES
 from kaggriculture.policy.jax import policy as P
-from kaggriculture.policy.jax.separated_model import SeparatedPolicyValueNet
 
 
 @dataclass(frozen=True)
@@ -35,20 +33,10 @@ class BCMetrics(NamedTuple):
 
 
 def create_train_state(model, variables, config: BCConfig):
-    def transform():
-        return optax.chain(
-            optax.clip_by_global_norm(config.max_grad_norm),
-            optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
-        )
-
-    if isinstance(model, SeparatedPolicyValueNet):
-        labels = jax.tree_util.tree_map_with_path(
-            lambda path, _: "critic" if path[0].key in CRITIC_PARAMETER_MODULES else "actor",
-            variables["params"],
-        )
-        optimizer = optax.multi_transform({"actor": transform(), "critic": transform()}, labels)
-    else:
-        optimizer = transform()
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+    )
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 
@@ -59,6 +47,7 @@ def loss(model, params, batch, config: BCConfig):
         batch.states,
         batch.players,
         batch.intent,
+        counters=batch.counters,
         turns_per_day=config.turns_per_day,
         shed_capacity=config.shed_capacity,
     )

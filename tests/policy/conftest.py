@@ -26,9 +26,6 @@ DEFAULT_MODEL_CONFIG = ModelConfig(
     d_feedforward=512,
     num_layers_encoder=4,
     num_layers_decoder=3,
-    dropout=0.0,
-    use_episode_history=False,
-    use_asymmetric_critic=False,
     num_layers_critic=2,
 )
 
@@ -100,13 +97,13 @@ def net() -> M.PolicyValueNet:
 @pytest.fixture
 def net_with_history() -> M.PolicyValueNet:
     torch.manual_seed(0)
-    return M.PolicyValueNet(test_model_config(use_episode_history=True))
+    return M.PolicyValueNet(DEFAULT_MODEL_CONFIG)
 
 
 @pytest.fixture
 def net_with_asymmetric_critic() -> M.PolicyValueNet:
     torch.manual_seed(0)
-    return M.PolicyValueNet(test_model_config(use_asymmetric_critic=True))
+    return M.PolicyValueNet(DEFAULT_MODEL_CONFIG)
 
 
 @pytest.fixture

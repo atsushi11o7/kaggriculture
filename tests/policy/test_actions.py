@@ -95,3 +95,13 @@ def test_legal_unit_actions_accepts_observation_position_lists() -> None:
     candidates = A.legal_unit_actions(farm, shed, seeds, {}, [4, 4], 0)
     pickup = A._candidate(farmer_op="PICKUP", item_index=V.entity_index("WHEAT"))
     assert tuple(pickup.index) in {tuple(candidate.index) for candidate in candidates}
+
+
+def test_commit_unit_action_ignores_stale_harvest() -> None:
+    """A stale HARVEST after an earlier unit is a no-op."""
+    farm = {"tiles": [[None] * 10 for _ in range(10)]}
+    shed = dict.fromkeys(C.SHED_ITEMS, 0)
+    seeds = dict.fromkeys(C.CROPS, 0)
+
+    assert DS.commit_unit_action(farm, shed, seeds, "HARVEST", None, (0, 0), 0) == {}
+    assert farm["tiles"][0][0] is None
