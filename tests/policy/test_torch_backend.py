@@ -11,8 +11,9 @@ from kaggriculture.policy.jax import features as F
 from kaggriculture.policy.jax.model import N_UNIT_SLOTS
 from kaggriculture.policy.jax.model import PolicyValueNet as JaxNet
 from kaggriculture.policy.jax.policy import initialize
+from kaggriculture.policy.torch import candidates as torch_candidates
+from kaggriculture.policy.torch import executor as torch_executor
 from kaggriculture.policy.torch import history as torch_history
-from kaggriculture.policy.torch import policy as torch_policy
 from kaggriculture.policy.torch.model import PolicyValueNet as TorchNet
 from kaggriculture.policy.torch.policy import predict_action
 from kaggriculture.training.weight_bridge import jax_to_torch
@@ -92,11 +93,11 @@ def test_torch_place_quantity_bound_uses_unit_inventory() -> None:
     farm = {"tiles": [[None] * 10 for _ in range(10)]}
     op = next(
         op
-        for op, arg in torch_policy.UNIT_META
-        if op == torch_policy.C.FARMER_OP_PLACE and arg == 0
+        for op, arg in torch_candidates.UNIT_META
+        if op == torch_candidates.C.FARMER_OP_PLACE and arg == 0
     )
-    bound = torch_policy._unit_quantity_upper_bound(
-        op, 0, (4, 4), {torch_policy.C.SHED_ITEMS[0]: 3}, farm
+    bound = torch_executor.unit_quantity_upper_bound(
+        op, 0, (4, 4), {torch_candidates.C.SHED_ITEMS[0]: 3}, farm
     )
     assert bound == 3
 
@@ -123,10 +124,12 @@ def test_torch_executor_skips_stale_duplicate_harvest_commit() -> None:
     shed = dict.fromkeys(C.SHED_ITEMS, 0)
     seeds = dict.fromkeys(C.CROPS, 0)
     harvest = next(
-        index for index, (op, _) in enumerate(torch_policy.UNIT_META) if op == C.FARMER_OP_HARVEST
+        index
+        for index, (op, _) in enumerate(torch_candidates.UNIT_META)
+        if op == C.FARMER_OP_HARVEST
     )
 
-    entries = torch_policy._execute_units(
+    entries = torch_executor.execute_units(
         [harvest, harvest],
         [1, 1],
         [(0, 0), (0, 0)],
@@ -181,3 +184,27 @@ def test_torch_history_replays_duplicate_harvest_as_one_production() -> None:
     deltas = torch_history.compute_turn_deltas(farm, shed, seeds, market, [{}, {}], day, action)
 
     assert deltas == {"produced": {crop: 1}}
+
+
+def test_fixed_candidate_schema_matches_both_backends() -> None:
+    from kaggriculture.policy.common import action_schema as schema
+    from kaggriculture.policy.jax import actions as jax_actions
+
+    jax_units = list(
+        zip(
+            np.asarray(jax_actions.UNIT_CANDIDATES.op).tolist(),
+            np.asarray(jax_actions.UNIT_CANDIDATES.arg).tolist(),
+            strict=True,
+        )
+    )
+    jax_market = list(
+        zip(
+            np.asarray(jax_actions.MARKET_CANDIDATES.op).tolist(),
+            np.asarray(jax_actions.MARKET_CANDIDATES.arg).tolist(),
+            strict=True,
+        )
+    )
+
+    assert jax_units == list(schema.UNIT_CANDIDATES) == torch_candidates.UNIT_META
+    assert jax_market == list(schema.MARKET_CANDIDATES) == torch_candidates.MARKET_META
+    assert len(torch_candidates.QUANTITY_VECTORS) == schema.N_QUANTITIES

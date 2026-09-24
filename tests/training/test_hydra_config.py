@@ -53,3 +53,13 @@ def test_ppo_stability_defaults() -> None:
     assert cfg.ppo.anchor_promotion_win_rate == 0.5
     assert cfg.ppo.reference_actor_l2_coef == 0.1
     assert cfg.ppo.reference_checkpoint is None
+
+
+def test_value_pretraining_reward_matches_ppo_default() -> None:
+    value = _compose("value_pretrain")
+    ppo = _compose("ppo")
+
+    assert value.train.gamma == ppo.ppo.gamma
+    assert value.train.daily_reward_coefficient == ppo.ppo.daily_reward_coefficient
+    assert value.train.daily_reward_scale == ppo.ppo.daily_reward_scale
+    assert value.train.daily_reward_maximum == ppo.ppo.daily_reward_maximum

@@ -20,7 +20,7 @@ from kaggriculture.policy.common.config import (
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.checkpoint import save_checkpoint
-from kaggriculture.training.ppo.train import _load_actor_checkpoint
+from kaggriculture.training.ppo.checkpointing import load_actor_checkpoint
 from kaggriculture.training.replays import (
     list_episode_files,
     load_selected_sources,
@@ -111,7 +111,7 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("training and validation both require completed episodes")
     model = create_model(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
-    variables = _load_actor_checkpoint(
+    variables = load_actor_checkpoint(
         Path(to_absolute_path(cfg.train.actor_checkpoint)), variables, model_config
     )
     steps_per_epoch = _steps_per_epoch(

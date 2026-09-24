@@ -24,9 +24,12 @@ from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.model_factory import create_model
 from kaggriculture.training.checkpoint import read_checkpoint_metadata
 from kaggriculture.training.ppo import core
+from kaggriculture.training.ppo.checkpointing import (
+    load_actor_checkpoint,
+    load_opponent_variables,
+)
 from kaggriculture.training.ppo.evaluation import evaluate_closed_loop
 from kaggriculture.training.ppo.rollout import RolloutConfig
-from kaggriculture.training.ppo.train import _load_actor_checkpoint, _opponent_variables
 
 
 def wilson_interval(score: float, games: int, z: float = 1.96) -> tuple[float, float]:
@@ -110,9 +113,9 @@ def _load_all(specs: list[str]):
     loaded = {}
     for label, kind, path in parsed:
         if kind == "bc":
-            loaded[label] = _load_actor_checkpoint(path, variables, model_config)
+            loaded[label] = load_actor_checkpoint(path, variables, model_config)
         else:
-            loaded[label] = _opponent_variables(path, template)
+            loaded[label] = load_opponent_variables(path, template)
     return model, loaded
 
 

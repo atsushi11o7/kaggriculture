@@ -1,10 +1,11 @@
-"""PyTorch implementation of the fixed-slot fixed-slot policy."""
+"""PyTorch implementation of the fixed-slot policy."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
+from kaggriculture.policy.common import action_schema as S
 from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.common.config import NUM_CRITIC_MACRO_FEATURES, ModelConfig
 from kaggriculture.policy.torch.network import Encoder, PrivilegedEncoder, TokenEmbedding
@@ -13,9 +14,9 @@ from kaggriculture.rules import constants as C
 N_UNIT_SLOTS = C.MAX_HANDS + 1
 N_MARKET_SLOTS = C.MAX_MARKET_ORDERS
 N_QUERY_SLOTS = N_UNIT_SLOTS + N_MARKET_SLOTS
-N_UNIT_ACTIONS = C.N_FARMER_OPS - 3 + C.N_CROPS + 2 * C.N_SHED_ITEMS
-N_MARKET_ACTIONS = 6 + C.N_CROPS + C.N_ANIMALS + C.N_PRODUCTS
-N_QUANTITIES = 100
+N_UNIT_ACTIONS = S.N_UNIT_ACTIONS
+N_MARKET_ACTIONS = S.N_MARKET_ACTIONS
+N_QUANTITIES = S.N_QUANTITIES
 
 
 class QueryBlock(nn.Module):

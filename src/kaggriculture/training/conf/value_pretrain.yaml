@@ -26,8 +26,8 @@ data:
 train:
   actor_checkpoint: null
   gamma: 0.999
-  # PPO開始時と同じ複合報酬。0にすると終端勝敗のみを学習する。
-  daily_reward_coefficient: 0.05
+  # PPO既定設定と同じ終端勝敗報酬。日次資産報酬を使う実験だけ正値へ上書きする。
+  daily_reward_coefficient: 0.0
   daily_reward_scale: 10000.0
   daily_reward_maximum: 0.02
   batch_size: 64

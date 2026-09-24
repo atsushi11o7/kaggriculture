@@ -29,7 +29,10 @@ from kaggriculture.training.checkpoint import (
     read_checkpoint_metadata,
     save_checkpoint,
 )
-from kaggriculture.training.ppo.train import _load_actor_checkpoint, _load_value_checkpoint
+from kaggriculture.training.ppo.checkpointing import (
+    load_actor_checkpoint,
+    load_value_checkpoint,
+)
 from kaggriculture.training.replays import (
     list_episode_files,
     load_selected_sources,
@@ -142,7 +145,7 @@ def _checkpoint(
 
 
 def _load_bc_checkpoint_params(path: Path, variables: dict, model_config: ModelConfig) -> dict:
-    return _load_actor_checkpoint(path, variables, model_config)
+    return load_actor_checkpoint(path, variables, model_config)
 
 
 def _update_ema(ema, metrics, decay: float = 0.98):
@@ -244,7 +247,7 @@ def main(cfg: DictConfig) -> None:
             Path(to_absolute_path(cfg.train.init_checkpoint)), variables, model_config
         )
     if cfg.train.init_value_checkpoint:
-        variables = _load_value_checkpoint(
+        variables = load_value_checkpoint(
             Path(to_absolute_path(cfg.train.init_value_checkpoint)),
             variables,
             model_config,

@@ -8,7 +8,7 @@ from kaggriculture.policy.common.strategy import StrategyMaskConfig, market_cand
 from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax import strategy as JS
-from kaggriculture.policy.torch import policy as TP
+from kaggriculture.policy.torch import candidates as TC
 from kaggriculture.policy.torch import strategy as TS
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.reset import reset
@@ -20,18 +20,18 @@ def test_strategy_masks_match_between_backends() -> None:
     state = reset(jax.random.key(0), 1)
     obs = make_fresh_observation()
     jax_market = np.asarray(JS.market_mask(state, jnp.asarray(0)))
-    torch_market = np.asarray(TS.market_mask(obs, TP.MARKET_META))
+    torch_market = np.asarray(TS.market_mask(obs, TC.MARKET_META))
     np.testing.assert_array_equal(jax_market, torch_market)
 
-    wait = next(i for i, (op, _) in enumerate(TP.MARKET_META) if op == C.N_MARKET_OPS)
-    stop = next(i for i, (op, _) in enumerate(TP.MARKET_META) if op == C.N_MARKET_OPS + 1)
+    wait = next(i for i, (op, _) in enumerate(TC.MARKET_META) if op == C.N_MARKET_OPS)
+    stop = next(i for i, (op, _) in enumerate(TC.MARKET_META) if op == C.N_MARKET_OPS + 1)
     assert jax_market[:-1, wait].all()
     assert not jax_market[-1, wait]
     assert jax_market[:, stop].all()
     assert jax_market.sum(axis=-1).min() > 0
 
     jax_unit = np.asarray(JS.unit_mask(state, jnp.asarray(0), jnp.asarray(0)))
-    torch_unit = np.asarray(TS.unit_mask(obs, 0, TP.UNIT_META))
+    torch_unit = np.asarray(TS.unit_mask(obs, 0, TC.UNIT_META))
     np.testing.assert_array_equal(jax_unit, torch_unit)
     assert jax_unit.all()
 

@@ -19,16 +19,16 @@ from kaggriculture.simulator.reset import reset
 from kaggriculture.training.bc import core as bc_core
 from kaggriculture.training.checkpoint import save_checkpoint
 from kaggriculture.training.ppo import core
+from kaggriculture.training.ppo.checkpointing import (
+    load_actor_checkpoint,
+    load_initial_bc_checkpoint,
+    load_value_checkpoint,
+)
 from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
     collect_rollout,
     monte_carlo_returns,
     to_ppo_batch,
-)
-from kaggriculture.training.ppo.train import (
-    _load_actor_checkpoint,
-    _load_initial_bc_checkpoint,
-    _load_value_checkpoint,
 )
 from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, estimated_assets
 from tests.policy.test_policy import _model
@@ -227,7 +227,7 @@ def test_reference_actor_loads_bc_and_ppo_checkpoints(tmp_path, trainer: str) ->
         {**checkpoint_shape_metadata(), "trainer": trainer, "model_config": asdict(model.config)},
     )
 
-    loaded = _load_actor_checkpoint(checkpoint, target_variables, target_model.config)["params"]
+    loaded = load_actor_checkpoint(checkpoint, target_variables, target_model.config)["params"]
     assert jnp.allclose(loaded["unit_head"]["kernel"], changed["unit_head"]["kernel"])
     assert jnp.allclose(
         loaded["value_head"]["layers_0"]["kernel"],
@@ -285,7 +285,7 @@ def test_joint_bc_initialization_restores_actor_and_critic(tmp_path) -> None:
         },
     )
 
-    loaded = _load_initial_bc_checkpoint(
+    loaded = load_initial_bc_checkpoint(
         checkpoint, variables, model.config, 0.999, 0.0, 10000.0, 0.02
     )["params"]
     assert jnp.array_equal(loaded["unit_head"]["kernel"], changed["unit_head"]["kernel"])
@@ -318,9 +318,9 @@ def test_value_checkpoint_reward_mismatch_requires_warmup(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="reward configuration differs"):
-        _load_value_checkpoint(checkpoint, variables, model.config, 0.999, 0.0, 10000.0, 0.02)
+        load_value_checkpoint(checkpoint, variables, model.config, 0.999, 0.0, 10000.0, 0.02)
 
-    loaded = _load_value_checkpoint(
+    loaded = load_value_checkpoint(
         checkpoint,
         variables,
         model.config,
@@ -335,7 +335,7 @@ def test_value_checkpoint_reward_mismatch_requires_warmup(tmp_path) -> None:
     )
 
     with pytest.raises(ValueError, match="gamma differs"):
-        _load_value_checkpoint(
+        load_value_checkpoint(
             checkpoint,
             variables,
             model.config,
@@ -359,7 +359,7 @@ def test_reference_actor_rejects_incompatible_checkpoint(tmp_path) -> None:
     target = unfreeze(source_variables["params"])
     target["unit_head"]["kernel"] = jnp.zeros((1, 1))
     with pytest.raises(ValueError, match="incompatible actor checkpoint"):
-        _load_actor_checkpoint(checkpoint, {"params": freeze(target)}, model.config)
+        load_actor_checkpoint(checkpoint, {"params": freeze(target)}, model.config)
 
 
 @pytest.mark.parametrize("override", [{"num_heads": 4}, {"num_layers_decoder": 2}])
@@ -374,4 +374,4 @@ def test_reference_actor_rejects_semantically_incompatible_config(tmp_path, over
     )
     target_config = replace(model.config, **override)
     with pytest.raises(ValueError, match="incompatible actor checkpoint config"):
-        _load_actor_checkpoint(checkpoint, source_variables, target_config)
+        load_actor_checkpoint(checkpoint, source_variables, target_config)

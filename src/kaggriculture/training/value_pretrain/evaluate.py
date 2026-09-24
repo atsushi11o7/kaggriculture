@@ -23,7 +23,7 @@ from kaggriculture.policy.common.config import ModelConfig
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.model_factory import create_model, critic_version
 from kaggriculture.training.checkpoint import load_checkpoint, read_checkpoint_metadata
-from kaggriculture.training.ppo.train import _load_actor_checkpoint
+from kaggriculture.training.ppo.checkpointing import load_actor_checkpoint
 from kaggriculture.training.value_pretrain import core
 from kaggriculture.training.value_pretrain.evaluation import (
     compute_metrics,
@@ -86,7 +86,7 @@ def main() -> None:
         model_config = ModelConfig(**actor_metadata["model_config"])
         model = create_model(model_config)
         variables = P.initialize(model, jax.random.key(args.seed))
-        variables = _load_actor_checkpoint(Path(args.actor_checkpoint), variables, model_config)
+        variables = load_actor_checkpoint(Path(args.actor_checkpoint), variables, model_config)
         params = variables["params"]
         label = f"untrained critic (actor={args.actor_checkpoint})"
     else:
