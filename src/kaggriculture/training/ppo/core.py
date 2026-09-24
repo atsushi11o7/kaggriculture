@@ -1,4 +1,4 @@
-"""固定slot非自己回帰方策のPPO目的関数。"""
+"""固定slot方策のPPO目的関数。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from flax.training.train_state import TrainState
 from kaggriculture.policy.common.config import CRITIC_PARAMETER_MODULES
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
-from kaggriculture.policy.jax.separated_model import SeparatedPolicyValueNet
 from kaggriculture.policy.jax.tokenize import EpisodeCounters
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.state import State
@@ -103,20 +102,10 @@ def create_critic_train_state(
 
 
 def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig):
-    def transform():
-        return optax.chain(
-            optax.clip_by_global_norm(config.max_grad_norm),
-            optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
-        )
-
-    if isinstance(model, SeparatedPolicyValueNet):
-        labels = jax.tree_util.tree_map_with_path(
-            lambda path, _: "critic" if path[0].key in CRITIC_PARAMETER_MODULES else "actor",
-            variables["params"],
-        )
-        optimizer = optax.multi_transform({"actor": transform(), "critic": transform()}, labels)
-    else:
-        optimizer = transform()
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+    )
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
 
 

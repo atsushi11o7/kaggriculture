@@ -20,23 +20,23 @@ from kaggriculture.training.bc import core as bc_core
 from kaggriculture.training.bc.dataset import action_to_intent, stack_samples
 from kaggriculture.training.bc.train import _restored_best, _schedule_steps
 from kaggriculture.training.ppo import core as ppo_core
+from kaggriculture.training.ppo.population import (
+    evaluation_summary,
+    list_pool_members,
+    select_opponent,
+)
 from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
     collect_rollout,
     collect_rollout_vs_opponent,
     to_ppo_batch,
 )
-from kaggriculture.training.ppo.train import (
-    _evaluation_summary,
-    _pool_members,
-    _select_opponent,
-)
 from kaggriculture.training.replays.state import CacheRules
 from tests.policy.conftest import make_fresh_observation
 
 
 def _model():
-    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, False, 1)
+    config = ModelConfig(8, 1, 16, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.key(0))
 
@@ -70,7 +70,7 @@ def test_bc_update() -> None:
 
 
 def _joint_model():
-    config = ModelConfig(8, 1, 16, 1, 1, 0.0, False, True, 1)
+    config = ModelConfig(8, 1, 16, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.key(0))
 
@@ -100,7 +100,7 @@ def test_joint_bc_value_update_trains_policy_and_critic() -> None:
 
     assert jnp.isfinite(metrics.loss)
     assert metrics.value_loss > 0
-    assert changed("policy_proj")
+    assert changed("unit_head")
     assert changed("value_head")
     assert changed("encoder")
 
@@ -142,8 +142,11 @@ def test_actor_logits_are_the_same_for_single_view_and_paired_states() -> None:
 
     def logits(state):
         batch = jax.tree.map(lambda value: jnp.asarray(value)[None], state)
-        result = P._logits(model, variables, batch, jnp.asarray([0]), None, 24, 100)
-        return result[3], result[4]
+        players = jnp.asarray([0])
+        _, _, _, unit_logits, market_logits, *_ = P._logits(
+            model, variables, batch, players, None, 24, 100
+        )
+        return unit_logits, market_logits
 
     paired_unit, paired_market = logits(paired)
     single_unit, single_market = logits(single)
@@ -303,15 +306,15 @@ def test_bc_resume_restores_validation_best() -> None:
 
 
 def test_select_opponent_uses_anchor_pool_and_self_probabilities() -> None:
-    assert _select_opponent(0.1, True, 0.5, 0.25) == "anchor"
-    assert _select_opponent(0.6, True, 0.5, 0.25) == "pool"
-    assert _select_opponent(0.9, True, 0.5, 0.25) == "self"
+    assert select_opponent(0.1, True, 0.5, 0.25) == "anchor"
+    assert select_opponent(0.6, True, 0.5, 0.25) == "pool"
+    assert select_opponent(0.9, True, 0.5, 0.25) == "self"
 
 
 def test_select_opponent_routes_empty_pool_share_to_anchor() -> None:
     # poolが空の間は、pool分の確率もself-playへ逃がさずanchorへ回す。
-    assert _select_opponent(0.6, False, 0.5, 0.25) == "anchor"
-    assert _select_opponent(0.8, False, 0.5, 0.25) == "self"
+    assert select_opponent(0.6, False, 0.5, 0.25) == "anchor"
+    assert select_opponent(0.8, False, 0.5, 0.25) == "self"
 
 
 def test_evaluation_summary_reports_outcomes_seats_and_cash() -> None:
@@ -325,7 +328,7 @@ def test_evaluation_summary_reports_outcomes_seats_and_cash() -> None:
         opponent_pass_rate=jnp.asarray([0.5, 0.6, 0.7, 0.8]),
     )
 
-    summary = _evaluation_summary(result)
+    summary = evaluation_summary(result)
 
     assert summary == pytest.approx(
         {
@@ -347,7 +350,7 @@ def test_pool_members_are_sorted_by_numeric_suffix(tmp_path) -> None:
     for name in ("member_10", "member_2", "member_1", "notes"):
         (tmp_path / name).mkdir()
 
-    assert [path.name for path in _pool_members(tmp_path)] == [
+    assert [path.name for path in list_pool_members(tmp_path)] == [
         "member_1",
         "member_2",
         "member_10",
@@ -378,3 +381,33 @@ def test_bc_schedule_respects_step_limit() -> None:
         _schedule_steps(0, 20, -1)
     with pytest.raises(ValueError, match="max_epochs"):
         _schedule_steps(100, 0, -1)
+
+
+def test_invalid_unit_noop_is_not_a_pass_teacher() -> None:
+    """A simulator-ignored expert command must not reinforce the PASS class."""
+    obs = make_fresh_observation()
+    rules = CacheRules()
+
+    explicit_intent, explicit_mask = action_to_intent(
+        obs, {"farmer": ["PASS"], "hands": [], "market": []}, rules
+    )
+    intent, invalid_mask = action_to_intent(
+        obs, {"farmer": ["FEED"], "hands": [], "market": []}, rules
+    )
+
+    assert explicit_mask[0]
+    assert not invalid_mask[0]
+    assert int(intent.unit[0]) == int(explicit_intent.unit[0])
+    assert invalid_mask[C.MAX_HANDS + 1]  # generated market STOP remains a teacher
+
+
+def test_full_game_opponent_choice_preserves_self_play() -> None:
+    from kaggriculture.training.ppo.population import opponent_for_choice
+
+    anchor = {"params": "anchor"}
+    learner = {"params": "learner"}
+    pool = {"params": "pool"}
+
+    assert opponent_for_choice("anchor", anchor, learner, pool) is anchor
+    assert opponent_for_choice("self", anchor, learner, pool) is learner
+    assert opponent_for_choice("pool", anchor, learner, pool) is pool

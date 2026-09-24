@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--iterations", type=int, default=10)
     args = parser.parse_args()
-    config = ModelConfig(128, 4, 512, 4, 3, 0.0, False, False, 2)
+    config = ModelConfig(128, 4, 512, 4, 3, 2)
     model = M.PolicyValueNet(config)
     variables = P.initialize(model, jax.random.key(0))
     sample = jax.jit(P.sample_self_play_actions, static_argnums=(0,))

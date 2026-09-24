@@ -24,12 +24,9 @@ def test_bc_and_ppo_share_actor_structure() -> None:
         "d_feedforward",
         "num_layers_encoder",
         "num_layers_decoder",
-        "dropout",
-        "use_episode_history",
+        "num_layers_critic",
     )
     assert all(bc.model[name] == ppo.model[name] for name in actor_fields)
-    assert not bc.model.use_asymmetric_critic
-    assert ppo.model.use_asymmetric_critic
     ModelConfig(**dict(bc.model))
     ModelConfig(**dict(ppo.model))
 
@@ -45,6 +42,10 @@ def test_ppo_stability_defaults() -> None:
     cfg = _compose("ppo")
 
     assert cfg.ppo.learning_rate == 5.0e-5
+    assert cfg.ppo.full_game_rounds == 2
+    assert cfg.ppo.rollout_horizon == cfg.rules.episode_steps
+    assert cfg.ppo.update_epochs == 1
+    assert cfg.ppo.daily_reward_coefficient == 0.0
     assert cfg.ppo.entropy_coef == 0.0
     assert cfg.ppo.target_kl == 0.02
     assert cfg.ppo.anchor_sample_prob == 0.5
@@ -52,3 +53,13 @@ def test_ppo_stability_defaults() -> None:
     assert cfg.ppo.anchor_promotion_win_rate == 0.5
     assert cfg.ppo.reference_actor_l2_coef == 0.1
     assert cfg.ppo.reference_checkpoint is None
+
+
+def test_value_pretraining_reward_matches_ppo_default() -> None:
+    value = _compose("value_pretrain")
+    ppo = _compose("ppo")
+
+    assert value.train.gamma == ppo.ppo.gamma
+    assert value.train.daily_reward_coefficient == ppo.ppo.daily_reward_coefficient
+    assert value.train.daily_reward_scale == ppo.ppo.daily_reward_scale
+    assert value.train.daily_reward_maximum == ppo.ppo.daily_reward_maximum

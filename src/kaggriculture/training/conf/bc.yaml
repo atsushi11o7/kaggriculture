@@ -23,7 +23,6 @@ data:
   min_player_reward: null
 
 train:
-  model_variant: shared
   learning_rate: 3.0e-4
   # cosine decayの最終学習率はlearning_rate * lr_decay_alpha。
   lr_decay_alpha: 0.1
@@ -39,7 +38,7 @@ train:
   checkpoint_interval: 3000
   seed: 0
   # 0なら従来どおりActorのみを学習する。正値なら非対称criticも同じ更新で学習する。
-  value_loss_coefficient: 0.0
+  value_loss_coefficient: 0.5
   value_gamma: 0.999
   daily_reward_coefficient: 0.0
   daily_reward_scale: 10000.0

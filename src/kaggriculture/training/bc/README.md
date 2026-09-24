@@ -6,7 +6,7 @@
 uv run python -m kaggriculture.training.bc.train
 ```
 
-初回だけリプレイJSONをCPUで読み、expert行動の正規化と固定shape `State + Intent` shardの作成を
+初回だけリプレイJSONをCPUで読み、expert行動の正規化と固定shape `State + Intent + episode history` shardの作成を
 行います。以後はshardを逐次先読みするため、全データをRAMへ保持せず、token化・合法mask・
 Transformer・損失・更新をJAX/GPUで処理します。
 
@@ -39,14 +39,9 @@ privileged/macro/value branchにはvalue lossだけが流れます。モデル�
 読むため、入力は1人視点のStateと変わりません(テストで確認済み)。価値教師が作れない不完全な試合は
 試合ごと除外します。報酬設定(`value_gamma`、`daily_reward_*`)はキャッシュの鍵に含まれます。
 
-```bash
-uv run python -m kaggriculture.training.bc.train \
-  experiment.name=joint_bc_value \
-  model.use_asymmetric_critic=true \
-  train.init_value_checkpoint=outputs/value_pretrain/<run>/checkpoints/best \
-  train.value_loss_coefficient=0.5 \
-  train.daily_reward_coefficient=0.0
-```
+標準設定は`value_loss_coefficient=0.5`、終端勝敗returnです。そのまま起動すれば共同学習に
+なります。無効命令から正規化されたPASS/WAITは該当slotの方策lossだけから除外し、他slotと
+value教師は保持します。
 
 joint checkpointには両方の重みと報酬設定を保存するため、PPOの`ppo.init_value_checkpoint`へ
 直接渡せます。

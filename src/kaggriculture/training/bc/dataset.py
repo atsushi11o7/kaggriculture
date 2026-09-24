@@ -1,4 +1,4 @@
-"""正規化済みリプレイを非自己回帰方策の固定slot教師へ変換する。"""
+"""正規化済みリプレイをV3方策の固定slot教師へ変換する。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ import jax
 import numpy as np
 
 from kaggriculture.policy.jax import actions as A
+from kaggriculture.policy.jax import tokenize as T
 from kaggriculture.policy.jax.types import Intent
+from kaggriculture.policy.torch import history as TH
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.state import State
 from kaggriculture.training.replays.io import iter_replay_actions
@@ -26,6 +28,7 @@ class BCBatch(NamedTuple):
     intent: Intent
     slot_mask: np.ndarray
     value_target: np.ndarray
+    counters: T.EpisodeCounters
 
 
 @dataclass
@@ -99,20 +102,70 @@ def action_to_intent(obs: dict, action: dict, rules: CacheRules):
     unit = np.full(C.MAX_HANDS + 1, _PASS, np.int32)
     unit_quantity = np.zeros(C.MAX_HANDS + 1, np.int32)
     unit_mask = np.zeros(C.MAX_HANDS + 1, bool)
-    unit_mask[: len(hands) + 1] = True
+    raw_hands = action.get("hands", []) if isinstance(action, dict) else []
+    raw_hands = raw_hands if isinstance(raw_hands, list) else []
+    raw_units = [action.get("farmer", None) if isinstance(action, dict) else None, *raw_hands]
     for index, entry in enumerate([normalized["farmer"], *normalized["hands"]]):
         unit[index], unit_quantity[index] = _unit(entry)
+        raw = raw_units[index] if index < len(raw_units) else None
+        unit_mask[index] = not (entry == ["PASS"] and raw != ["PASS"])
     market = np.full(C.MAX_MARKET_ORDERS, _STOP, np.int32)
     market_quantity = np.zeros(C.MAX_MARKET_ORDERS, np.int32)
     market_mask = np.zeros(C.MAX_MARKET_ORDERS, bool)
+    raw_market = action.get("market", []) if isinstance(action, dict) else []
+    raw_market = raw_market if isinstance(raw_market, list) else []
+    explicit_wait = ["SELL", "WHEAT", 0]
     for index, entry in enumerate(normalized["market"][: C.MAX_MARKET_ORDERS]):
         market[index], market_quantity[index] = _market(entry)
-        market_mask[index] = True
+        raw = raw_market[index] if index < len(raw_market) else None
+        market_mask[index] = not (entry == explicit_wait and raw != explicit_wait)
     if len(normalized["market"]) < C.MAX_MARKET_ORDERS:
         market_mask[len(normalized["market"])] = True
     return Intent(unit, unit_quantity, market, market_quantity), np.concatenate(
         [unit_mask, market_mask]
     )
+
+
+def _empty_counter_dict() -> dict:
+    return {
+        "produced": {},
+        "sold": {},
+        "estimated_bought_product": {},
+        "estimated_revenue": {},
+        "has_ever_sold": {},
+    }
+
+
+def _counter_array(counter: dict) -> T.EpisodeCounters:
+    def values(name, dtype=np.float32):
+        return np.asarray([counter.get(name, {}).get(item, 0) for item in C.PRODUCTS], dtype)
+
+    return T.EpisodeCounters(
+        values("produced"),
+        values("sold"),
+        values("estimated_bought_product"),
+        values("estimated_revenue"),
+        values("has_ever_sold", bool),
+    )
+
+
+def _counter_after(obs: dict, normalized: dict, counter: dict, rules: CacheRules) -> dict:
+    player = obs["player"]
+    farm = obs["farms"][player]
+    private = obs["private"]
+    deltas = TH.compute_turn_deltas(
+        farm,
+        private["shed"],
+        private["seeds"],
+        obs["market"],
+        private["inventories"],
+        obs["day"],
+        normalized,
+        turns_per_day=rules.turns_per_day,
+        shed_capacity=rules.shed_capacity,
+        hire_mult=rules.hire_mult,
+    )
+    return TH.update_counters(counter, deltas)
 
 
 def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | None = None):
@@ -138,6 +191,7 @@ def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | N
                 stats.discarded += 1
                 stats.reasons["value_episode:" + type(error).__name__ + ":" + str(error)[:60]] += 1
                 continue
+        episode_counters = [_empty_counter_dict(), _empty_counter_dict()]
         for index, player, obs, action in iter_replay_actions(
             data,
             Path(path),
@@ -146,6 +200,17 @@ def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | N
         ):
             try:
                 intent, mask = action_to_intent(obs, action, rules)
+                from kaggriculture.policy.torch.candidate_api import normalize_expert_action
+
+                normalized = normalize_expert_action(
+                    obs,
+                    action,
+                    turns_per_day=rules.turns_per_day,
+                    shed_capacity=rules.shed_capacity,
+                    hire_mult=rules.hire_mult,
+                    max_market_orders=rules.max_market_orders,
+                )
+                counter = _counter_array(episode_counters[player])
                 if states is None:
                     state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
                     value = 0.0
@@ -153,7 +218,10 @@ def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | N
                     state = jax.tree.map(lambda values, index=index: values[index], states)
                     value = float(targets[index, player])
                 stats.accepted += 1
-                yield state, int(obs["player"]), intent, mask, value
+                yield state, int(obs["player"]), intent, mask, value, counter
+                episode_counters[player] = _counter_after(
+                    obs, normalized, episode_counters[player], rules
+                )
             except (KeyError, IndexError, TypeError, ValueError) as error:
                 stats.discarded += 1
                 stats.reasons[type(error).__name__ + ":" + str(error)[:80]] += 1
@@ -182,4 +250,19 @@ def stack_samples(samples) -> BCBatch:
         intent,
         np.stack([sample[3] for sample in samples]),
         np.asarray([sample[4] if len(sample) > 4 else 0.0 for sample in samples], np.float32),
+        T.EpisodeCounters(
+            *(
+                np.stack(
+                    [
+                        np.asarray(getattr(sample[5], name))
+                        if len(sample) > 5
+                        else np.zeros(
+                            (C.N_PRODUCTS,), dtype=bool if name == "has_ever_sold" else np.float32
+                        )
+                        for sample in samples
+                    ]
+                )
+                for name in T.EpisodeCounters._fields
+            )
+        ),
     )

@@ -1,6 +1,6 @@
 """Flaxによる学習用JAX Actor/Critic。
 
-提出用のPyTorchモデルと同じpost-norm Transformer構造を持つ。入力は
+提出用のPyTorchモデルと同じpre-norm Transformer構造を持つ。入力は
 `jax_features`で固定形状化した(index, value)で、paddingはvalue=0として扱う。
 """
 
@@ -27,7 +27,7 @@ class TokenEmbedding(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """PyTorch TransformerEncoderLayer互換のpost-normブロック。"""
+    """PyTorch TransformerEncoderLayer互換のpre-norm GELUブロック。"""
 
     config: ModelConfig
 
@@ -36,24 +36,21 @@ class EncoderBlock(nn.Module):
         self, x: jnp.ndarray, *, mask: jnp.ndarray | None, deterministic: bool
     ) -> jnp.ndarray:
         cfg = self.config
+        normalized = nn.LayerNorm(epsilon=1e-5, name="norm1")(x)
         attention = nn.MultiHeadDotProductAttention(
             num_heads=cfg.num_heads,
             qkv_features=cfg.d_model,
             out_features=cfg.d_model,
-            dropout_rate=cfg.dropout,
+            dropout_rate=0.0,
             use_bias=True,
             name="self_attn",
-        )(x, mask=mask, deterministic=deterministic)
-        x = nn.LayerNorm(epsilon=1e-5, name="norm1")(
-            x + nn.Dropout(cfg.dropout, name="dropout1")(attention, deterministic=deterministic)
-        )
-        hidden = nn.Dense(cfg.d_feedforward, name="linear1")(x)
-        hidden = nn.relu(hidden)
-        hidden = nn.Dropout(cfg.dropout, name="dropout")(hidden, deterministic=deterministic)
+        )(normalized, mask=mask, deterministic=deterministic)
+        x = x + attention
+        normalized = nn.LayerNorm(epsilon=1e-5, name="norm2")(x)
+        hidden = nn.Dense(cfg.d_feedforward, name="linear1")(normalized)
+        hidden = nn.gelu(hidden)
         hidden = nn.Dense(cfg.d_model, name="linear2")(hidden)
-        return nn.LayerNorm(epsilon=1e-5, name="norm2")(
-            x + nn.Dropout(cfg.dropout, name="dropout2")(hidden, deterministic=deterministic)
-        )
+        return x + hidden
 
 
 class Encoder(nn.Module):

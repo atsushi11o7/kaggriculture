@@ -166,6 +166,41 @@ def legal_unit_actions(
     return candidates
 
 
+def is_legal_unit_action(
+    farm: dict,
+    shed: dict,
+    seeds: dict,
+    inventory: dict,
+    pos: tuple[int, int],
+    day: int,
+    op_name: str,
+    item_name: str | None,
+    shed_capacity: int = 100,
+) -> bool:
+    """Return whether an intent is executable in the current shadow state.
+
+    Args:
+        farm: Current farm shadow state.
+        shed: Current shed shadow state.
+        seeds: Current seed shadow state.
+        inventory: Inventory of the acting unit.
+        pos: Current unit position as (x, y).
+        day: Current day.
+        op_name: Farmer operation name.
+        item_name: Optional item selected by the operation.
+        shed_capacity: Shed capacity.
+
+    Returns:
+        Whether the operation and item occur in the current legal candidates.
+    """
+    item_index = V.entity_index(item_name) if item_name is not None else None
+    selected = tuple(_candidate(farmer_op=op_name, item_index=item_index).index)
+    return any(
+        tuple(candidate.index) == selected
+        for candidate in legal_unit_actions(farm, shed, seeds, inventory, pos, day, shed_capacity)
+    )
+
+
 def legal_market_actions(
     farm: dict,
     shed: dict,

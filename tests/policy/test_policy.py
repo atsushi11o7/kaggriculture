@@ -16,7 +16,7 @@ from kaggriculture.simulator.step import step_batch_lockstep
 
 
 def _model():
-    config = ModelConfig(16, 2, 32, 1, 1, 0.0, False, False, 1)
+    config = ModelConfig(16, 2, 32, 1, 1, 1)
     model = M.PolicyValueNet(config)
     return model, P.initialize(model, jax.random.PRNGKey(0), batch_size=2)
 
@@ -53,17 +53,8 @@ def test_unit_inventory_changes_the_encoded_query() -> None:
     players = jnp.asarray([player], jnp.int32)
 
     def _queries(state):
-        encoded, positions, active_mask, _, inventory = P._inputs(state, players, None, 24)
-        queries, _ = model.apply(
-            variables,
-            encoded.index,
-            encoded.value,
-            positions,
-            active_mask,
-            inventory.index,
-            inventory.value,
-        )
-        return queries
+        _, units, market, *_ = P._logits(model, variables, state, players, None, 24, 100)
+        return jnp.concatenate([units, market], axis=1)
 
     queries_empty = _queries(empty)
     queries_with_item = _queries(with_item_state)

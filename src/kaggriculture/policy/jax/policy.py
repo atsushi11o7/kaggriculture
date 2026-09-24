@@ -45,10 +45,6 @@ def _inputs(states: State, players: jnp.ndarray, counters, turns_per_day: int):
     return encoded, positions, active, counters, unit_inventory
 
 
-def _candidate_logits(model, variables, hidden, index, value, mask):
-    return model.apply(variables, hidden, index, value, mask, method=model.score_candidates)
-
-
 def _distribution(logits, choices=None, key=None, greedy=False):
     log_probs = jax.nn.log_softmax(logits)
     probabilities = jnp.exp(log_probs)
@@ -72,18 +68,16 @@ def _logits(
     encoded, positions, unit_active, _, unit_inventory = _inputs(
         states, players, counters, turns_per_day
     )
-    privileged = {}
-    if model.config.use_asymmetric_critic:
-        features, privileged_positions, privileged_padding = jax.vmap(T.encode_privileged)(
-            states, players
-        )
-        privileged = {
-            "privileged_index": features.index,
-            "privileged_value": features.value,
-            "privileged_positions": privileged_positions,
-            "privileged_padding": privileged_padding,
-            "critic_macro": jax.vmap(VF.critic_macro_features)(states, players),
-        }
+    features, privileged_positions, privileged_padding = jax.vmap(T.encode_privileged)(
+        states, players
+    )
+    privileged = {
+        "privileged_index": features.index,
+        "privileged_value": features.value,
+        "privileged_positions": privileged_positions,
+        "privileged_padding": privileged_padding,
+        "critic_macro": jax.vmap(VF.critic_macro_features)(states, players),
+    }
     queries, value = model.apply(
         variables,
         encoded.index,
@@ -110,24 +104,10 @@ def _logits(
     )(states, players)
     unit_mask = unit_mask & unit_active[..., None]
     unit_mask = unit_mask.at[..., 0].set(True)
-    unit_logits = _candidate_logits(
-        model,
-        variables,
-        unit_hidden,
-        A.UNIT_CANDIDATES.index[None, None],
-        A.UNIT_CANDIDATES.value[None, None],
-        unit_mask,
-    )
+    unit_logits = model.apply(variables, unit_hidden, unit_mask, method=model.unit_logits)
     # 先行注文で合法化し得る候補は残し、状態に依存しない戦略規則だけ適用する。
     market_mask = jax.vmap(S.market_mask)(states, players)
-    market_logits = _candidate_logits(
-        model,
-        variables,
-        market_hidden,
-        A.MARKET_CANDIDATES.index[None, None],
-        A.MARKET_CANDIDATES.value[None, None],
-        market_mask,
-    )
+    market_logits = model.apply(variables, market_hidden, market_mask, method=model.market_logits)
     return (
         value,
         unit_hidden,
@@ -148,23 +128,10 @@ def _market_active(choices: jnp.ndarray) -> jnp.ndarray:
 
 
 def _quantity_logits(model, variables, hidden, selected, table, mask):
-    selected_index = table.index[selected]
-    selected_value = table.value[selected]
-    conditioned = model.apply(
-        variables,
-        hidden,
-        selected_index,
-        selected_value,
-        method=model.condition_quantity,
+    method = (
+        model.unit_quantity_logits if table is A.UNIT_CANDIDATES else model.market_quantity_logits
     )
-    return _candidate_logits(
-        model,
-        variables,
-        conditioned,
-        A.QUANTITY_INDEX[None, None],
-        A.QUANTITY_VALUE[None, None],
-        mask,
-    )
+    return model.apply(variables, hidden, selected, mask, method=method)
 
 
 def sample_actions(
@@ -381,18 +348,16 @@ def state_values(model, variables, states, counters=None, turns_per_day=24):
     encoded, positions, active, _, unit_inventory = _inputs(
         doubled, players, doubled_counters, turns_per_day
     )
-    privileged = {}
-    if model.config.use_asymmetric_critic:
-        features, privileged_positions, privileged_padding = jax.vmap(T.encode_privileged)(
-            doubled, players
-        )
-        privileged = {
-            "privileged_index": features.index,
-            "privileged_value": features.value,
-            "privileged_positions": privileged_positions,
-            "privileged_padding": privileged_padding,
-            "critic_macro": jax.vmap(VF.critic_macro_features)(doubled, players),
-        }
+    features, privileged_positions, privileged_padding = jax.vmap(T.encode_privileged)(
+        doubled, players
+    )
+    privileged = {
+        "privileged_index": features.index,
+        "privileged_value": features.value,
+        "privileged_positions": privileged_positions,
+        "privileged_padding": privileged_padding,
+        "critic_macro": jax.vmap(VF.critic_macro_features)(doubled, players),
+    }
     _, values = model.apply(
         variables,
         encoded.index,
@@ -419,22 +384,14 @@ def initialize(model: M.PolicyValueNet, key, batch_size: int = 1):
         (batch_size, M.N_UNIT_SLOTS, F.MAX_ENCODER_FEATURES), jnp.int32
     )
     unit_inventory_value = jnp.zeros_like(unit_inventory_index, dtype=jnp.float32)
-    privileged = {}
-    if model.config.use_asymmetric_critic:
-        from kaggriculture.policy.jax import features as F
-
-        count = len(L.PRIVILEGED_OWNER_ZONE_WITH_CLS) - 1
-        privileged = {
-            "privileged_index": jnp.zeros(
-                (batch_size, count, F.MAX_PRIVILEGED_FEATURES), jnp.int32
-            ),
-            "privileged_value": jnp.zeros(
-                (batch_size, count, F.MAX_PRIVILEGED_FEATURES), jnp.float32
-            ),
-            "privileged_positions": jnp.full((batch_size, count), L.NO_POSITION, jnp.int32),
-            "privileged_padding": jnp.zeros((batch_size, count), bool),
-            "critic_macro": jnp.zeros((batch_size, NUM_CRITIC_MACRO_FEATURES), dtype=jnp.float32),
-        }
+    count = len(L.PRIVILEGED_OWNER_ZONE_WITH_CLS) - 1
+    privileged = {
+        "privileged_index": jnp.zeros((batch_size, count, F.MAX_PRIVILEGED_FEATURES), jnp.int32),
+        "privileged_value": jnp.zeros((batch_size, count, F.MAX_PRIVILEGED_FEATURES), jnp.float32),
+        "privileged_positions": jnp.full((batch_size, count), L.NO_POSITION, jnp.int32),
+        "privileged_padding": jnp.zeros((batch_size, count), bool),
+        "critic_macro": jnp.zeros((batch_size, NUM_CRITIC_MACRO_FEATURES), dtype=jnp.float32),
+    }
     return model.init(
         key,
         index,

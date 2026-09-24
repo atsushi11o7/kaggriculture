@@ -7,12 +7,16 @@ from flax import linen as nn
 
 from kaggriculture.policy.common import layout as L
 from kaggriculture.policy.common.config import ModelConfig
+from kaggriculture.policy.jax import actions as A
 from kaggriculture.policy.jax.network import Encoder, PrivilegedEncoder, TokenEmbedding
 from kaggriculture.rules import constants as C
 
 N_UNIT_SLOTS = C.MAX_HANDS + 1
 N_MARKET_SLOTS = C.MAX_MARKET_ORDERS
 N_QUERY_SLOTS = N_UNIT_SLOTS + N_MARKET_SLOTS
+N_UNIT_ACTIONS = A.UNIT_CANDIDATES.op.shape[0]
+N_MARKET_ACTIONS = A.MARKET_CANDIDATES.op.shape[0]
+N_QUANTITIES = A.QUANTITY_INDEX.shape[0]
 
 
 class QueryBlock(nn.Module):
@@ -24,24 +28,27 @@ class QueryBlock(nn.Module):
     def __call__(self, query, memory, active, *, deterministic: bool):
         cfg = self.config
         query_mask = active[:, None, None, :]
+        normalized = nn.LayerNorm(name="norm1")(query)
         mixed = nn.MultiHeadDotProductAttention(
             num_heads=cfg.num_heads,
             qkv_features=cfg.d_model,
-            dropout_rate=cfg.dropout,
+            dropout_rate=0.0,
             name="self_attn",
-        )(query, mask=query_mask, deterministic=deterministic)
-        query = nn.LayerNorm(name="norm1")(query + mixed)
+        )(normalized, mask=query_mask, deterministic=deterministic)
+        query = query + mixed
+        normalized = nn.LayerNorm(name="norm2")(query)
         context = nn.MultiHeadDotProductAttention(
             num_heads=cfg.num_heads,
             qkv_features=cfg.d_model,
-            dropout_rate=cfg.dropout,
+            dropout_rate=0.0,
             name="cross_attn",
-        )(query, inputs_k=memory, inputs_v=memory, deterministic=deterministic)
-        query = nn.LayerNorm(name="norm2")(query + context)
-        hidden = nn.Dense(cfg.d_feedforward, name="linear1")(query)
-        hidden = nn.relu(hidden)
+        )(normalized, inputs_k=memory, inputs_v=memory, deterministic=deterministic)
+        query = query + context
+        normalized = nn.LayerNorm(name="norm3")(query)
+        hidden = nn.Dense(cfg.d_feedforward, name="linear1")(normalized)
+        hidden = nn.gelu(hidden)
         hidden = nn.Dense(cfg.d_model, name="linear2")(hidden)
-        return nn.LayerNorm(name="norm3")(query + hidden)
+        return query + hidden
 
 
 class ParallelQueryEncoder(nn.Module):
@@ -102,22 +109,24 @@ class PolicyValueNet(nn.Module):
         )
         self.encoder = Encoder(cfg, name="encoder")
         self.query_encoder = ParallelQueryEncoder(cfg, name="query_encoder")
-        self.privileged_encoder = (
-            PrivilegedEncoder(cfg, name="privileged_encoder") if cfg.use_asymmetric_critic else None
+        self.privileged_encoder = PrivilegedEncoder(cfg, name="privileged_encoder")
+        self.critic_macro_encoder = nn.Sequential(
+            [nn.Dense(cfg.d_model), nn.gelu, nn.Dense(cfg.d_model)],
+            name="critic_macro_encoder",
         )
-        self.critic_macro_encoder = (
-            nn.Sequential(
-                [nn.Dense(cfg.d_model), nn.relu, nn.Dense(cfg.d_model)],
-                name="critic_macro_encoder",
-            )
-            if cfg.use_asymmetric_critic
-            else None
+        self.unit_head = nn.Dense(N_UNIT_ACTIONS, name="unit_head")
+        self.market_head = nn.Dense(N_MARKET_ACTIONS, name="market_head")
+        self.unit_action_embedding = nn.Embed(
+            N_UNIT_ACTIONS, cfg.d_model, name="unit_action_embedding"
         )
-        self.policy_proj = nn.Dense(cfg.d_model, name="policy_proj")
-        self.quantity_condition = nn.Dense(cfg.d_model, name="quantity_condition")
-        value_width = cfg.d_model * (3 if cfg.use_asymmetric_critic else 1)
+        self.market_action_embedding = nn.Embed(
+            N_MARKET_ACTIONS, cfg.d_model, name="market_action_embedding"
+        )
+        self.unit_quantity_condition = nn.Dense(cfg.d_model, name="unit_quantity_condition")
+        self.market_quantity_condition = nn.Dense(cfg.d_model, name="market_quantity_condition")
+        self.quantity_head = nn.Dense(N_QUANTITIES, name="quantity_head")
         self.value_head = nn.Sequential(
-            [nn.Dense(value_width // 2), nn.relu, nn.Dense(1)], name="value_head"
+            [nn.Dense(cfg.d_model), nn.gelu, nn.Dense(1)], name="value_head"
         )
 
     def __call__(
@@ -152,55 +161,47 @@ class PolicyValueNet(nn.Module):
             unit_inventory_embedding,
             deterministic=deterministic,
         )
-        # Head parameterも同じinit呼び出しで生成する。実際の採点は公開methodで行う。
-        _ = self.policy_proj(queries)
-        _ = self.quantity_condition(jnp.concatenate([queries, queries], axis=-1))
-        value_input = memory[:, 0]
-        if self.config.use_asymmetric_critic:
-            if any(
-                value is None
-                for value in (
-                    privileged_index,
-                    privileged_value,
-                    privileged_positions,
-                    privileged_padding,
-                    critic_macro,
-                )
-            ):
-                raise ValueError("asymmetric critic requires privileged inputs")
-            privileged_embedded = self.token_embedding(privileged_index, privileged_value)
-            privileged = self.privileged_encoder(
-                privileged_embedded,
-                privileged_positions,
-                privileged_padding,
-                self.board_position_embedding,
-                deterministic=deterministic,
-            )
-            macro = self.critic_macro_encoder(critic_macro)
-            value_input = jnp.concatenate([value_input, privileged[:, 0], macro], axis=-1)
+        units = queries[:, :N_UNIT_SLOTS]
+        market = queries[:, N_UNIT_SLOTS:]
+        _ = self.unit_head(units)
+        _ = self.market_head(market)
+        unit_selected = self.unit_action_embedding(jnp.zeros(units.shape[:-1], jnp.int32))
+        market_selected = self.market_action_embedding(jnp.zeros(market.shape[:-1], jnp.int32))
+        _ = self.quantity_head(
+            self.unit_quantity_condition(jnp.concatenate([units, unit_selected], -1))
+        )
+        _ = self.quantity_head(
+            self.market_quantity_condition(jnp.concatenate([market, market_selected], -1))
+        )
+        public = jnp.concatenate([memory[:, 0], jnp.mean(memory[:, 1:], axis=1)], axis=-1)
+        privileged_embedded = self.token_embedding(privileged_index, privileged_value)
+        privileged = self.privileged_encoder(
+            privileged_embedded,
+            privileged_positions,
+            privileged_padding,
+            self.board_position_embedding,
+            deterministic=deterministic,
+        )
+        macro = self.critic_macro_encoder(critic_macro)
+        value_input = jnp.concatenate([public, privileged[:, 0], macro], axis=-1)
         return queries, self.value_head(value_input)[:, 0]
 
-    def score_candidates(
-        self,
-        hidden: jnp.ndarray,
-        candidate_index: jnp.ndarray,
-        candidate_value: jnp.ndarray,
-        candidate_mask: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """任意の先行shapeを保ったまま候補を内積採点する。"""
-        candidates = self.token_embedding(candidate_index, candidate_value)
-        scores = jnp.einsum("...d,...cd->...c", self.policy_proj(hidden), candidates)
-        scores = scores / jnp.sqrt(jnp.asarray(self.config.d_model, dtype=scores.dtype))
-        # log_softmaxへ-infを流すと、マスクしていない要素の勾配までNaNになる
-        # (JAXでの既知の問題)。forward値を変えない範囲で十分小さい有限値を使う。
-        return jnp.where(candidate_mask, scores, -1e9)
+    def unit_logits(self, hidden, mask):
+        """Score the fixed unit action vocabulary."""
+        return jnp.where(mask, self.unit_head(hidden), -1e9)
 
-    def condition_quantity(
-        self,
-        hidden: jnp.ndarray,
-        selected_index: jnp.ndarray,
-        selected_value: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """選択したop/itemで数量queryを条件付けする。"""
-        selected = self.token_embedding(selected_index, selected_value)
-        return self.quantity_condition(jnp.concatenate([hidden, selected], axis=-1))
+    def market_logits(self, hidden, mask):
+        """Score the fixed market action vocabulary."""
+        return jnp.where(mask, self.market_head(hidden), -1e9)
+
+    def unit_quantity_logits(self, hidden, action, mask):
+        """Score quantities conditioned on a selected unit action."""
+        selected = self.unit_action_embedding(action)
+        hidden = self.unit_quantity_condition(jnp.concatenate([hidden, selected], -1))
+        return jnp.where(mask, self.quantity_head(hidden), -1e9)
+
+    def market_quantity_logits(self, hidden, action, mask):
+        """Score quantities conditioned on a selected market action."""
+        selected = self.market_action_embedding(action)
+        hidden = self.market_quantity_condition(jnp.concatenate([hidden, selected], -1))
+        return jnp.where(mask, self.quantity_head(hidden), -1e9)

@@ -81,7 +81,13 @@ class Encoder(nn.Module):
             nn.init.normal_(embedding.weight, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model, num_heads, d_feedforward, dropout, batch_first=True
+            d_model,
+            num_heads,
+            d_feedforward,
+            0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers, enable_nested_tensor=False
@@ -153,7 +159,13 @@ class PrivilegedEncoder(nn.Module):
             nn.init.normal_(embedding.weight, std=0.02)
 
         layer = nn.TransformerEncoderLayer(
-            d_model, num_heads, d_feedforward, dropout, batch_first=True
+            d_model,
+            num_heads,
+            d_feedforward,
+            0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers, enable_nested_tensor=False)
 

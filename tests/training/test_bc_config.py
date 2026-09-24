@@ -19,12 +19,9 @@ def test_jax_bc_and_ppo_share_actor_structure() -> None:
         "d_feedforward",
         "num_layers_encoder",
         "num_layers_decoder",
-        "dropout",
-        "use_episode_history",
+        "num_layers_critic",
     )
     assert all(bc.model[name] == ppo.model[name] for name in fields)
-    assert not bc.model.use_asymmetric_critic
-    assert ppo.model.use_asymmetric_critic
     ModelConfig(**dict(bc.model))
 
 

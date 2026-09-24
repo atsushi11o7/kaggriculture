@@ -1,4 +1,4 @@
-"""非自己回帰方策・Executor・シミュレータを結ぶGPU完結rollout。"""
+"""V3方策・Executor・シミュレータを結ぶGPU完結rollout。"""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def collect_rollout(
             variables,
             state,
             action_key,
-            counters=counters if model.config.use_episode_history else None,
+            counters=counters,
             temperature=config.temperature,
             turns_per_day=config.turns_per_day,
             shed_capacity=config.shed_capacity,
@@ -115,17 +115,13 @@ def collect_rollout(
             stepped, margin, done, config.turns_per_day, daily_config
         )
         rewards = terminal_win_rewards(cash, done) + daily_rewards
-        updated_counters = (
-            H.update_counters(
-                state,
-                output.action,
-                counters,
-                turns_per_day=config.turns_per_day,
-                shed_capacity=config.shed_capacity,
-                hire_mult=config.hire_mult,
-            )
-            if model.config.use_episode_history
-            else counters
+        updated_counters = H.update_counters(
+            state,
+            output.action,
+            counters,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
         )
         fresh = reset(
             reset_key,
@@ -163,7 +159,7 @@ def collect_rollout(
         model,
         variables,
         final_state,
-        final_counters if model.config.use_episode_history else None,
+        final_counters,
         config.turns_per_day,
     )
     return Rollout(*values, final_state, final_counters, final_margin, bootstrap)
@@ -194,7 +190,6 @@ def collect_rollout_vs_opponent(
     """
     batch_size = initial_state.step.shape[0]
     opponent_seat = 1 - learner_seat
-    use_history = model.config.use_episode_history
     if initial_margin is None:
         assets = estimated_assets(initial_state)
         initial_margin = assets[:, 0] - assets[:, 1]
@@ -207,8 +202,8 @@ def collect_rollout_vs_opponent(
         rng, learner_key, opponent_key, reset_key = jax.random.split(rng, 4)
         learner_players = jnp.full((batch_size,), learner_seat, jnp.int32)
         opponent_players = jnp.full((batch_size,), opponent_seat, jnp.int32)
-        learner_counters = counters[:, learner_seat] if use_history else None
-        opponent_counters = counters[:, opponent_seat] if use_history else None
+        learner_counters = jax.tree.map(lambda value: value[:, learner_seat], counters)
+        opponent_counters = jax.tree.map(lambda value: value[:, opponent_seat], counters)
         learner_out = P.sample_actions(
             model,
             learner_variables,
@@ -247,17 +242,13 @@ def collect_rollout_vs_opponent(
             stepped, margin, done, config.turns_per_day, daily_config
         )
         rewards = terminal_win_rewards(cash, done) + daily_rewards
-        updated_counters = (
-            H.update_counters(
-                state,
-                action,
-                counters,
-                turns_per_day=config.turns_per_day,
-                shed_capacity=config.shed_capacity,
-                hire_mult=config.hire_mult,
-            )
-            if use_history
-            else counters
+        updated_counters = H.update_counters(
+            state,
+            action,
+            counters,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
         )
         fresh = reset(
             reset_key,
@@ -315,7 +306,7 @@ def collect_rollout_vs_opponent(
         model,
         learner_variables,
         final_state,
-        final_counters if use_history else None,
+        final_counters,
         config.turns_per_day,
     )
     return Rollout(*values, final_state, final_counters, final_margin, bootstrap)

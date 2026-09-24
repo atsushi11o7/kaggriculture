@@ -5,6 +5,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from kaggriculture.policy.common import action_schema as S
 from kaggriculture.policy.common import vocab as V
 from kaggriculture.policy.jax import features as F
 from kaggriculture.rules import constants as C
@@ -14,8 +15,8 @@ from kaggriculture.simulator.market_lockstep import market_lockstep
 from kaggriculture.simulator.state import State
 from kaggriculture.simulator.unit_actions import apply_unit_action
 
-MARKET_WAIT = C.N_MARKET_OPS
-MARKET_STOP = C.N_MARKET_OPS + 1
+MARKET_WAIT = S.MARKET_WAIT
+MARKET_STOP = S.MARKET_STOP
 
 
 class CandidateTable(NamedTuple):
@@ -57,40 +58,14 @@ def _candidate_features(ops, args, market_action: bool) -> tuple[jnp.ndarray, jn
     return index, value
 
 
-def _build_unit_candidates() -> CandidateTable:
-    item_ops = {C.FARMER_OP_PICKUP, C.FARMER_OP_PLANT, C.FARMER_OP_PLACE}
-    ops = [op for op in range(C.N_FARMER_OPS) if op not in item_ops]
-    args = [-1] * len(ops)
-    ops.extend([C.FARMER_OP_PLANT] * C.N_CROPS)
-    args.extend(range(C.N_CROPS))
-    ops.extend([C.FARMER_OP_PLACE] * C.N_SHED_ITEMS)
-    args.extend(range(C.N_SHED_ITEMS))
-    ops.extend([C.FARMER_OP_PICKUP] * C.N_SHED_ITEMS)
-    args.extend(range(C.N_SHED_ITEMS))
-    index, value = _candidate_features(ops, args, market_action=False)
+def _build_candidates(metadata, *, market_action: bool) -> CandidateTable:
+    ops, args = zip(*metadata, strict=True)
+    index, value = _candidate_features(ops, args, market_action)
     return CandidateTable(jnp.asarray(ops), jnp.asarray(args), index, value)
 
 
-def _build_market_candidates() -> CandidateTable:
-    ops = [C.MARKET_OP_HIRE, C.MARKET_OP_BUY_LAND]
-    args = [-1, -1]
-    ops.extend([C.MARKET_OP_BUY_SEED] * C.N_CROPS)
-    args.extend(range(C.N_CROPS))
-    ops.extend([C.MARKET_OP_BUY_ANIMAL] * C.N_ANIMALS)
-    args.extend(range(C.N_ANIMALS))
-    for item in (C.PRODUCTS.index("WHEAT"), C.PRODUCTS.index("FERTILIZER")):
-        ops.append(C.MARKET_OP_BUY_PRODUCT)
-        args.append(item)
-    ops.extend([C.MARKET_OP_SELL] * C.N_PRODUCTS)
-    args.extend(range(C.N_PRODUCTS))
-    ops.extend([MARKET_WAIT, MARKET_STOP])
-    args.extend([-1, -1])
-    index, value = _candidate_features(ops, args, market_action=True)
-    return CandidateTable(jnp.asarray(ops), jnp.asarray(args), index, value)
-
-
-UNIT_CANDIDATES = _build_unit_candidates()
-MARKET_CANDIDATES = _build_market_candidates()
+UNIT_CANDIDATES = _build_candidates(S.UNIT_CANDIDATES, market_action=False)
+MARKET_CANDIDATES = _build_candidates(S.MARKET_CANDIDATES, market_action=True)
 
 
 def quantity_candidates() -> tuple[jnp.ndarray, jnp.ndarray]:

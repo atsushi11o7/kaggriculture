@@ -72,8 +72,7 @@ def evaluate_closed_loop(
     )
     players0 = jnp.zeros((batch_size,), jnp.int32)
     players1 = jnp.ones((batch_size,), jnp.int32)
-    use_history = model.config.use_episode_history
-    initial_counters = H.zeros(batch_size) if use_history else None
+    initial_counters = H.zeros(batch_size)
     zero_counts = jnp.zeros((batch_size,), jnp.float32)
 
     def scan_step(carry, step_key):
@@ -85,7 +84,7 @@ def evaluate_closed_loop(
             state,
             players0,
             key0,
-            counters[:, 0] if use_history else None,
+            jax.tree.map(lambda value: value[:, 0], counters),
             temperature=config.temperature,
             greedy=greedy,
             turns_per_day=config.turns_per_day,
@@ -98,7 +97,7 @@ def evaluate_closed_loop(
             state,
             players1,
             key1,
-            counters[:, 1] if use_history else None,
+            jax.tree.map(lambda value: value[:, 1], counters),
             temperature=config.temperature,
             greedy=greedy,
             turns_per_day=config.turns_per_day,
@@ -127,17 +126,13 @@ def evaluate_closed_loop(
             max_shop_instances=config.max_shop_instances,
             episode_steps=config.episode_steps,
         )
-        next_counters = (
-            H.update_counters(
-                state,
-                action,
-                counters,
-                turns_per_day=config.turns_per_day,
-                shed_capacity=config.shed_capacity,
-                hire_mult=config.hire_mult,
-            )
-            if use_history
-            else counters
+        next_counters = H.update_counters(
+            state,
+            action,
+            counters,
+            turns_per_day=config.turns_per_day,
+            shed_capacity=config.shed_capacity,
+            hire_mult=config.hire_mult,
         )
         return (next_state, next_counters, pass0, total0, pass1, total1), None
 

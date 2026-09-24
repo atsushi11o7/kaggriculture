@@ -4,18 +4,15 @@ from dataclasses import dataclass
 
 from kaggriculture.rules import constants as C
 
-POLICY_ARCHITECTURE = "fixed_slot"
-POLICY_ARCHITECTURE_VERSION = 2
-CRITIC_ARCHITECTURE_VERSION = 2
+POLICY_ARCHITECTURE = "fixed_slot_parallel_v3"
+POLICY_ARCHITECTURE_VERSION = 3
+CRITIC_ARCHITECTURE_VERSION = 3
 NUM_CRITIC_MACRO_FEATURES = 12
 CRITIC_PARAMETER_MODULES = frozenset(
     {
         "value_head",
         "privileged_encoder",
         "critic_macro_encoder",
-        "critic_token_embedding",
-        "critic_board_position_embedding",
-        "critic_encoder",
     }
 )
 
@@ -46,9 +43,6 @@ class ModelConfig:
     d_feedforward: int
     num_layers_encoder: int
     num_layers_decoder: int
-    dropout: float
-    use_episode_history: bool
-    use_asymmetric_critic: bool
     num_layers_critic: int
 
     def __post_init__(self) -> None:
@@ -63,5 +57,3 @@ class ModelConfig:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if not 0 <= self.dropout < 1:
-            raise ValueError("dropout must be in [0, 1)")

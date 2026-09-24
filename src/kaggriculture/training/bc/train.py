@@ -29,7 +29,10 @@ from kaggriculture.training.checkpoint import (
     read_checkpoint_metadata,
     save_checkpoint,
 )
-from kaggriculture.training.ppo.train import _load_actor_checkpoint, _load_value_checkpoint
+from kaggriculture.training.ppo.checkpointing import (
+    load_actor_checkpoint,
+    load_value_checkpoint,
+)
 from kaggriculture.training.replays import (
     list_episode_files,
     load_selected_sources,
@@ -113,7 +116,6 @@ def _checkpoint(
     metadata = {
         **checkpoint_shape_metadata(),
         "trainer": "bc",
-        "model_variant": cfg.train.model_variant,
         "step": step,
         "epoch": epoch,
         "validation_loss": validation,
@@ -127,7 +129,7 @@ def _checkpoint(
         metadata.update(
             {
                 "joint_value_training": True,
-                "critic_architecture_version": critic_version(cfg.train.model_variant),
+                "critic_architecture_version": critic_version(),
                 "reward_mode": "terminal_win_daily_asset",
                 "gamma": float(cfg.train.value_gamma),
                 "daily_reward_coefficient": float(cfg.train.daily_reward_coefficient),
@@ -143,7 +145,7 @@ def _checkpoint(
 
 
 def _load_bc_checkpoint_params(path: Path, variables: dict, model_config: ModelConfig) -> dict:
-    return _load_actor_checkpoint(path, variables, model_config)
+    return load_actor_checkpoint(path, variables, model_config)
 
 
 def _update_ema(ema, metrics, decay: float = 0.98):
@@ -190,10 +192,6 @@ def _validate(model, params, paths, cfg, bc_config):
 def main(cfg: DictConfig) -> None:
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
     joint_value_training = cfg.train.value_loss_coefficient > 0
-    if model_config.use_asymmetric_critic != joint_value_training:
-        raise ValueError(
-            "use_asymmetric_critic must be true exactly when value_loss_coefficient is positive"
-        )
     if cfg.train.value_gamma <= 0 or cfg.train.value_gamma > 1:
         raise ValueError("value_gamma must be in (0, 1]")
     DailyRewardConfig(
@@ -242,14 +240,14 @@ def main(cfg: DictConfig) -> None:
     if joint_value_training and not (train_paths and validation_paths):
         raise ValueError("joint BC/value training requires complete train and validation games")
 
-    model = create_model(model_config, cfg.train.model_variant)
+    model = create_model(model_config)
     variables = P.initialize(model, jax.random.key(cfg.train.seed))
     if cfg.train.init_checkpoint:
         variables = _load_bc_checkpoint_params(
             Path(to_absolute_path(cfg.train.init_checkpoint)), variables, model_config
         )
     if cfg.train.init_value_checkpoint:
-        variables = _load_value_checkpoint(
+        variables = load_value_checkpoint(
             Path(to_absolute_path(cfg.train.init_value_checkpoint)),
             variables,
             model_config,

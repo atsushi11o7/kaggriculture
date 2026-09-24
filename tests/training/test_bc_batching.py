@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.state import State
 from kaggriculture.training.bc import cache
@@ -23,6 +24,7 @@ def _fake_shard(value: float) -> BCBatch:
         Intent(*(np.zeros((n,), np.int32) for _ in Intent._fields)),
         np.zeros((n, 35), bool),
         np.full((n,), value, np.float32),
+        H.EpisodeCounters(*(value[:, 0] for value in H.zeros(n))),
     )
 
 
