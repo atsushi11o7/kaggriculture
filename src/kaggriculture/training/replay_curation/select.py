@@ -38,6 +38,10 @@ def _eligible(entry: SelectionEntry, cfg: DictConfig) -> bool:
         entry.min_agent_score is None or entry.min_agent_score < cfg.selection.min_agent_score
     ):
         return False
+    if cfg.selection.agent_names is not None and entry.agent_name not in cfg.selection.agent_names:
+        return False
+    if cfg.selection.day11_full_land_only and not entry.day11_full_land:
+        return False
     return True
 
 

@@ -29,6 +29,7 @@ class SelectionEntry:
     hires: int
     sell_units: int
     buy_product_units: int
+    day11_full_land: bool
     source_size: int
     source_mtime_ns: int
     selection_reason: str = "winner"
