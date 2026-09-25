@@ -1,7 +1,7 @@
 """Torch提出推論へ適用する戦略上の候補制約。"""
 
 from kaggriculture.policy.common.strategy import market_candidate_allowed
-from kaggriculture.policy.endgame.common import investment_allowed
+from kaggriculture.policy.endgame.common import investment_allowed, last_action_step
 from kaggriculture.rules import constants as C
 
 
@@ -14,10 +14,16 @@ def unit_mask(obs: dict, unit: int, candidates: list[tuple[int, int]]) -> list[b
         candidates: 候補の操作IDと引数。
 
     Returns:
-        候補順の許可mask。現時点では全候補を許可する。
+        候補順の許可mask。回収不能な投資と最終stepの無価値な行動を除外する。
     """
     del unit
-    return [investment_allowed(op, arg, market=False, day=obs["day"]) for op, arg in candidates]
+    step = obs["day"] * 24 + obs["hour"]
+    final = step == last_action_step(720)
+    return [
+        investment_allowed(op, arg, market=False, day=obs["day"])
+        and (not final or op == C.FARMER_OP_PASS)
+        for op, arg in candidates
+    ]
 
 
 def market_mask(obs: dict, candidates: list[tuple[int, int]]) -> list[list[bool]]:
