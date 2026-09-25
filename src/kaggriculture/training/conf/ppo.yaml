@@ -15,6 +15,10 @@ hydra:
 
 env:
   batch_size: 32
+  # 設定すると、ロールアウトの新局初期stateをday0からのresetではなく、
+  # このファイル(state_bank.pyのpickle形式)からサンプルしたday12状態から
+  # 始める(day<=11オープニングを毎回シミュレートするコストを省く)。
+  state_bank_path: null
 
 ppo:
   total_updates: 1000

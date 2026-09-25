@@ -26,7 +26,6 @@ from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.action import Action
-from kaggriculture.simulator.reset import reset
 from kaggriculture.training.ppo import core
 from kaggriculture.training.ppo.rollout import RolloutConfig, _step
 from kaggriculture.training.rl import (
@@ -58,7 +57,7 @@ class CompactGame(NamedTuple):
 
 def initial_state(reset_key, batch_size: int, config: RolloutConfig):
     """回収と再生成で同じ初期状態を作る。"""
-    return reset(
+    return config.reset_fn(
         reset_key,
         batch_size,
         board_size=config.board_size,
@@ -155,7 +154,7 @@ def collect_compact_game(
         )
         return (stepped, next_counters, next_margin), record
 
-    keys = jax.random.split(run_key, config.episode_steps - 1)
+    keys = jax.random.split(run_key, config.episode_steps - 1 - config.start_step)
     _, records = jax.lax.scan(scan_step, (state, counters, margin), keys)
     *fields, cash = records
     return CompactGame(*fields, final_cash=cash[-1])

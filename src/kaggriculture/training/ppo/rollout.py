@@ -39,11 +39,19 @@ class RolloutConfig:
     hire_mult: int = 1
     max_shop_instances: int = 8
     episode_steps: int = 720
+    # reset_fnが返す初期stateの共通step値(全て同じstepを返す前提)。full_game.py
+    # がスキャン長を「episode_steps-1-start_step」として計算するのに使う。
+    # 通常のday0 resetなら0。day12状態バンクなら288。
+    start_step: int = 0
     starting_money: float = 3000.0
     temperature: float = 0.8
     daily_reward_coefficient: float = 0.05
     daily_reward_scale: float = 10000.0
     daily_reward_maximum: float = 0.02
+    # 新局の初期stateを作る関数(key, batch_size, board_size=, starting_money=)。
+    # 既定はday0からの通常reset。state bankからday12状態をサンプルする関数に
+    # 差し替え可能(kaggriculture.training.ppo.state_bank.make_bank_reset_fn)。
+    reset_fn: object = reset
 
 
 class Rollout(NamedTuple):
@@ -123,7 +131,7 @@ def collect_rollout(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
-        fresh = reset(
+        fresh = config.reset_fn(
             reset_key,
             batch_size,
             board_size=config.board_size,
@@ -250,7 +258,7 @@ def collect_rollout_vs_opponent(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
-        fresh = reset(
+        fresh = config.reset_fn(
             reset_key,
             batch_size,
             board_size=config.board_size,

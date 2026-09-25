@@ -24,7 +24,6 @@ from kaggriculture.policy.jax.model_factory import (
     create_model,
     critic_version,
 )
-from kaggriculture.simulator.reset import reset
 from kaggriculture.training.checkpoint import (
     load_checkpoint,
     load_pytree,
@@ -32,7 +31,7 @@ from kaggriculture.training.checkpoint import (
     save_checkpoint,
     save_pytree,
 )
-from kaggriculture.training.ppo import core, full_game
+from kaggriculture.training.ppo import core, full_game, state_bank
 from kaggriculture.training.ppo.checkpointing import (
     load_actor_checkpoint,
     load_initial_bc_checkpoint,
@@ -102,6 +101,21 @@ def _save_runtime(directory: Path, key, state, counters, daily_margin) -> None:
 
 def _rollout_config(cfg):
     rules = cfg.rules
+    kwargs = {}
+    state_bank_path = getattr(cfg.env, "state_bank_path", None)
+    if state_bank_path:
+        bank = state_bank.load_state_bank(to_absolute_path(state_bank_path))
+        bank_steps = set(jax.device_get(bank.step).tolist())
+        if len(bank_steps) != 1:
+            raise ValueError(f"state bank must have one common step, found {bank_steps}")
+        kwargs["reset_fn"] = state_bank.make_bank_reset_fn(bank)
+        kwargs["start_step"] = next(iter(bank_steps))
+        logger.info(
+            "using state bank %s (%d entries, start_step=%d) for rollout resets",
+            state_bank_path,
+            jax.tree.util.tree_leaves(bank)[0].shape[0],
+            kwargs["start_step"],
+        )
     return RolloutConfig(
         horizon=cfg.ppo.rollout_horizon,
         board_size=rules.board_size,
@@ -119,6 +133,7 @@ def _rollout_config(cfg):
         daily_reward_coefficient=cfg.ppo.daily_reward_coefficient,
         daily_reward_scale=cfg.ppo.daily_reward_scale,
         daily_reward_maximum=cfg.ppo.daily_reward_maximum,
+        **kwargs,
     )
 
 
@@ -214,7 +229,10 @@ def main(cfg: DictConfig) -> None:
         turns_per_day=cfg.rules.turns_per_day,
         shed_capacity=cfg.rules.shed_capacity,
     )
-    state = reset(reset_key, cfg.env.batch_size, starting_money=cfg.rules.starting_money)
+    rollout_config = _rollout_config(cfg)
+    state = rollout_config.reset_fn(
+        reset_key, cfg.env.batch_size, starting_money=cfg.rules.starting_money
+    )
     counters = H.zeros(cfg.env.batch_size)
     daily_margin = jnp.zeros((cfg.env.batch_size,), dtype=jnp.float32)
     start_update = 0
@@ -254,7 +272,6 @@ def main(cfg: DictConfig) -> None:
             runtime["daily_margin"],
         )
 
-    rollout_config = _rollout_config(cfg)
     checkpoints_dir = Path("checkpoints")
     best_dir = checkpoints_dir / "best"
     run_warmup = resume_phase == "critic_warmup" or (
