@@ -1,45 +1,30 @@
-"""Land-purchase override for the day<=11 opening window.
-
-hybrid2965's own land timing (NE day6, SW day11, SE day18) trails the real
-top-ladder pace observed from DSM replays (NE day6, SW day9, SE day10-11,
-consistently full-owned). Land purchase is a rare (<=3 per game), high-value
-decision, so we buy on this faster schedule directly rather than trusting
-either the network or hybrid2965's own pacing for it.
-
-Cash is not the limiting factor at this pace (verified: DSM already holds
-1900+ well before each purchase), but the day/cash guard is kept as a safety
-net for unusual games. The land order is inserted ahead of hybrid2965's own
-market orders (see controller.py), so it is charged before hybrid2965's own
-turn spending sees the remaining cash; a fixed operating reserve is required
-on top of the sticker price so a same-turn purchase can't crowd out its own
-seed/hire/feed orders that turn.
-"""
+"""Land-purchase deadlines keyed by Kaggle's raw zero-based day."""
 
 from __future__ import annotations
 
-# (quadrant, day it becomes eligible, price) in the fixed purchase order.
-# NE is left to hybrid2965's own market order: it already buys NE on day 6,
-# hour 7 every time (verified, zero variance across seeds), matching our
-# target, so there is nothing to override there. Only SW/SE need forcing.
-_SCHEDULE = (("SW", 9, 2000), ("SE", 11, 4000))
-
-# Headroom kept on top of the sticker price so the same-turn forced purchase
-# doesn't starve hybrid2965's own seed/hire/feed orders for that turn.
+# Modal purchase days measured directly from top-player replay observations.
+# Retrying after each threshold handles cash-dependent one-day delays.
+_SCHEDULE = (("NE", 6, 1000), ("SW", 9, 2000), ("SE", 10, 4000))
 _OPERATING_RESERVE = 300
 
 
-def next_forced_purchase(obs: dict) -> list | None:
-    """Return a BUY_LAND market entry if the schedule calls for one this turn.
+def required_capital(obs: dict, purchases_ahead: int = 0) -> int:
+    """Return cash to reserve for a pending scheduled land purchase."""
+    player = obs["player"]
+    owned = set(obs["farms"][player]["unlocked_quadrants"])
+    pending = [entry for entry in _SCHEDULE if entry[0] not in owned]
+    if purchases_ahead >= len(pending):
+        return 0
+    return pending[purchases_ahead][2] + _OPERATING_RESERVE
 
-    Returns None when the next quadrant in order isn't due yet, or its price
-    plus operating reserve isn't affordable yet (in which case the purchase
-    is deferred, not skipped: the same quadrant is retried on a later turn).
-    """
+
+def next_forced_purchase(obs: dict, available_cash: float | None = None) -> list | None:
+    """Return BUY_LAND when the raw observation-day deadline is affordable."""
     player = obs["player"]
     farm = obs["farms"][player]
     owned = set(farm["unlocked_quadrants"])
     day = obs["day"]
-    cash = farm["money"]
+    cash = farm["money"] if available_cash is None else available_cash
 
     for quadrant, eligible_day, price in _SCHEDULE:
         if quadrant in owned:
