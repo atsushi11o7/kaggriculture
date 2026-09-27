@@ -21,6 +21,10 @@ data:
   split_seed: 0
   cache_dir: data/cache/bc
   min_player_reward: null
+  # raw obs["day"]の範囲(両端含む)。nullなら制限なし。opening専用/day12以降専用のBCを
+  # 同じmanifestから切り出すのに使う。
+  min_day: null
+  max_day: null
 
 train:
   learning_rate: 3.0e-4
