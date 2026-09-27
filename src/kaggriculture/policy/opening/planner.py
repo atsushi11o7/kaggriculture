@@ -167,14 +167,18 @@ def _tasks(observation: dict, targets: OpeningTargets) -> list[Task]:
                     tasks.append(Task(55, position, ("CARE",)))
 
     # Place already purchased animals before creating more structures or crops.
+    # Fill the shed-closest empty structure first to keep daily feed/care
+    # travel short.
     empty_structures: dict[str, list[tuple[int, int]]] = {"COOP": [], "PASTURE": []}
     for kind in empty_structures:
-        empty_structures[kind] = _tile_positions(
+        positions = _tile_positions(
             tiles,
             lambda tile, kind=kind: (
                 isinstance(tile, dict) and tile.get("kind") == kind and tile.get("animal") is None
             ),
         )
+        positions.sort(key=lambda position: _distance(position, _nearest_shed(position)))
+        empty_structures[kind] = positions
     for animal in C.ANIMALS:
         available = _held(private, animal)
         positions = empty_structures[_STRUCTURE[animal]]
@@ -203,8 +207,19 @@ def _tasks(observation: dict, targets: OpeningTargets) -> list[Task]:
         ),
     }
 
-    # Long-lived crops need the remaining opening days to establish, so reserve
-    # their tiles before constructing capacity for newly purchased animals.
+    # Reserve tiles for animals already bought before crops claim the rest.
+    # needed_structures only counts animals already owned (never the full
+    # strategic target), so this is a small, bounded claim that stops
+    # purchased livestock from sitting unplaced in the shed indefinitely
+    # while large crop targets exhaust every empty tile first.
+    for kind, command in (("COOP", "BUILD_COOP"), ("PASTURE", "BUILD_PASTURE")):
+        for position in empty:
+            if not needed_structures[kind] or position in reserved:
+                continue
+            tasks.append(Task(40, position, (command,)))
+            reserved.add(position)
+            needed_structures[kind] -= 1
+
     se_occupied = sum(
         isinstance(tile, dict)
         for y, row in enumerate(tiles)
@@ -227,14 +242,6 @@ def _tasks(observation: dict, targets: OpeningTargets) -> list[Task]:
             reserved.add(position)
             available -= 1
 
-    for kind, command in (("COOP", "BUILD_COOP"), ("PASTURE", "BUILD_PASTURE")):
-        for position in empty:
-            if not needed_structures[kind] or position in reserved:
-                continue
-            tasks.append(Task(40, position, (command,)))
-            reserved.add(position)
-            needed_structures[kind] -= 1
-
     unfilled = sum(needed_structures.values()) + sum(
         max(0, targets.crops[crop] - crop_count[crop] - int(seed_stock.get(crop, 0)))
         for crop in C.CROPS
@@ -245,6 +252,30 @@ def _tasks(observation: dict, targets: OpeningTargets) -> list[Task]:
     # Python's sort is stable: keep the quadrant-spreading order within each
     # priority instead of collapsing it back to NW-first coordinate order.
     return sorted(tasks, key=lambda task: task.priority)
+
+
+def _allocate_budget(budget: float, shortfalls: dict[str, tuple[int, int]]) -> dict[str, int]:
+    """Split a cash budget across items by dollar-value shortfall.
+
+    Buying items in a fixed priority order lets earlier, cheaper items
+    exhaust a scarce budget and starve everything after them (this is how
+    SHEEP, the costliest animal and last in iteration order, could go an
+    entire game without a single purchase). Each item instead gets a share
+    of the budget proportional to its own remaining shortfall value, then
+    buys as many units as that share affords.
+    """
+    total_value = sum(cost * missing for cost, missing in shortfalls.values())
+    if total_value <= 0:
+        return {}
+    quantities: dict[str, int] = {}
+    for name, (cost, missing) in shortfalls.items():
+        if missing <= 0 or cost <= 0:
+            continue
+        share = budget * (cost * missing) / total_value
+        quantity = min(missing, int(share // cost))
+        if quantity:
+            quantities[name] = quantity
+    return quantities
 
 
 def _job_pending(task: Task, observation: dict) -> bool:
@@ -445,26 +476,58 @@ def _market_orders(observation: dict, targets: OpeningTargets) -> list[list]:
     expansion_cash = max(0.0, min(cash, settled_cash) - expansion_reserve)
 
     seed_cost = dict(zip(C.CROPS, P.CROP_SEED_COST, strict=True))
+    animal_cost = dict(zip(C.ANIMALS, P.ANIMAL_COST, strict=True))
+    crop_shortfall_value = sum(
+        max(0, targets.crops[crop] - crop_count[crop] - int(private["seeds"].get(crop, 0)))
+        * seed_cost[crop]
+        for crop in C.CROPS
+    )
+    animal_shortfall_value = sum(
+        max(0, targets.animals[animal] - animal_count[animal] - _held(private, animal))
+        * animal_cost[animal]
+        for animal in C.ANIMALS
+    )
+    # Split expansion cash between crops and animals by their remaining
+    # dollar-value shortfall. Spending crops-first every turn otherwise
+    # starves animal purchases, since crop targets need far more tiles.
+    total_shortfall_value = crop_shortfall_value + animal_shortfall_value
+    if total_shortfall_value > 0:
+        animal_cash = expansion_cash * animal_shortfall_value / total_shortfall_value
+    else:
+        animal_cash = 0.0
+    crop_cash = expansion_cash - animal_cash
+
+    crop_purchases = _allocate_budget(
+        crop_cash,
+        {
+            crop: (
+                seed_cost[crop],
+                max(0, targets.crops[crop] - crop_count[crop] - int(private["seeds"].get(crop, 0))),
+            )
+            for crop in _CROP_INVESTMENT_ORDER
+        },
+    )
     for crop in _CROP_INVESTMENT_ORDER:
-        cost = seed_cost[crop]
-        missing = max(
-            0,
-            targets.crops[crop] - crop_count[crop] - int(private["seeds"].get(crop, 0)),
-        )
-        quantity = min(missing, int(expansion_cash // cost))
+        quantity = crop_purchases.get(crop, 0)
         if quantity and len(orders) < C.MAX_MARKET_ORDERS:
             orders.append(["BUY_SEED", crop, quantity])
-            cash -= quantity * cost
-            expansion_cash -= quantity * cost
+            cash -= quantity * seed_cost[crop]
 
-    for animal, cost in zip(C.ANIMALS, P.ANIMAL_COST, strict=True):
-        held = _held(private, animal)
-        missing = max(0, targets.animals[animal] - animal_count[animal] - held)
-        quantity = min(missing, int(expansion_cash // cost))
+    animal_purchases = _allocate_budget(
+        animal_cash,
+        {
+            animal: (
+                animal_cost[animal],
+                max(0, targets.animals[animal] - animal_count[animal] - _held(private, animal)),
+            )
+            for animal in C.ANIMALS
+        },
+    )
+    for animal in C.ANIMALS:
+        quantity = animal_purchases.get(animal, 0)
         if quantity and len(orders) < C.MAX_MARKET_ORDERS:
             orders.append(["BUY_ANIMAL", animal, quantity])
-            cash -= quantity * cost
-            expansion_cash -= quantity * cost
+            cash -= quantity * animal_cost[animal]
 
     return orders[: C.MAX_MARKET_ORDERS]
 
