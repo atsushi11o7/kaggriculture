@@ -41,17 +41,37 @@ class RolloutConfig:
     episode_steps: int = 720
     # reset_fnが返す初期stateの共通step値(全て同じstepを返す前提)。full_game.py
     # がスキャン長を「episode_steps-1-start_step」として計算するのに使う。
-    # 通常のday0 resetなら0。day12状態バンクなら288。
+    # 通常のraw day 0 resetなら0。表示day 12状態バンクなら264(raw day 11)。
     start_step: int = 0
     starting_money: float = 3000.0
     temperature: float = 0.8
     daily_reward_coefficient: float = 0.05
     daily_reward_scale: float = 10000.0
     daily_reward_maximum: float = 0.02
-    # 新局の初期stateを作る関数(key, batch_size, board_size=, starting_money=)。
-    # 既定はday0からの通常reset。state bankからday12状態をサンプルする関数に
-    # 差し替え可能(kaggriculture.training.ppo.state_bank.make_bank_reset_fn)。
+    # 通常の新局を作る関数。start_fnが設定されている場合はそちらを優先する。
     reset_fn: object = reset
+    # State・EpisodeCounters・資産差を揃えて返すopening handoff sampler。
+    start_fn: object | None = None
+
+
+def initial_rollout_start(key, batch_size: int, config: RolloutConfig):
+    """Create a matched state/history/margin tuple for a rollout."""
+    if config.start_fn is not None:
+        return config.start_fn(
+            key,
+            batch_size,
+            board_size=config.board_size,
+            starting_money=config.starting_money,
+        )
+    state = config.reset_fn(
+        key,
+        batch_size,
+        board_size=config.board_size,
+        starting_money=config.starting_money,
+    )
+    counters = H.zeros(batch_size)
+    assets = estimated_assets(state)
+    return state, counters, assets[:, 0] - assets[:, 1]
 
 
 class Rollout(NamedTuple):
@@ -131,15 +151,12 @@ def collect_rollout(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
-        fresh = config.reset_fn(
-            reset_key,
-            batch_size,
-            board_size=config.board_size,
-            starting_money=config.starting_money,
+        fresh_state, fresh_counters, fresh_margin = initial_rollout_start(
+            reset_key, batch_size, config
         )
-        next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
-        next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
-        next_margin = jnp.where(done, 0.0, next_margin)
+        next_state = jax.lax.cond(done[0], lambda: fresh_state, lambda: stepped)
+        next_counters = jax.lax.cond(done[0], lambda: fresh_counters, lambda: updated_counters)
+        next_margin = jnp.where(done, fresh_margin, next_margin)
         transition = (
             state,
             output.intent,
@@ -258,15 +275,12 @@ def collect_rollout_vs_opponent(
             shed_capacity=config.shed_capacity,
             hire_mult=config.hire_mult,
         )
-        fresh = config.reset_fn(
-            reset_key,
-            batch_size,
-            board_size=config.board_size,
-            starting_money=config.starting_money,
+        fresh_state, fresh_counters, fresh_margin = initial_rollout_start(
+            reset_key, batch_size, config
         )
-        next_state = jax.lax.cond(done[0], lambda: fresh, lambda: stepped)
-        next_counters = jax.lax.cond(done[0], lambda: H.zeros(batch_size), lambda: updated_counters)
-        next_margin = jnp.where(done, 0.0, next_margin)
+        next_state = jax.lax.cond(done[0], lambda: fresh_state, lambda: stepped)
+        next_counters = jax.lax.cond(done[0], lambda: fresh_counters, lambda: updated_counters)
+        next_margin = jnp.where(done, fresh_margin, next_margin)
         intent = _stack_seats(outputs[0].intent, outputs[1].intent)
         slot_masks = [outputs[0].slot_mask, outputs[1].slot_mask]
         slot_masks[opponent_seat] = jnp.zeros_like(slot_masks[opponent_seat])

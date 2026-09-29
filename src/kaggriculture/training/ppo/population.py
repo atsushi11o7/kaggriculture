@@ -37,6 +37,18 @@ def add_to_pool(pool_dir: Path, train_state, metadata: dict, pool_size: int) -> 
             shutil.rmtree(stale)
 
 
+def initialize_pool(pool_dir: Path, checkpoints: list[Path], pool_size: int) -> None:
+    """Populate an empty opponent pool from existing compatible checkpoints."""
+    if list_pool_members(pool_dir) or not checkpoints:
+        return
+    selected = checkpoints[-pool_size:] if pool_size > 0 else checkpoints
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    for index, source in enumerate(selected):
+        if not (source / "metadata.json").exists() or not (source / "state.msgpack").exists():
+            raise ValueError(f"invalid initial pool checkpoint: {source}")
+        shutil.copytree(source, pool_dir / f"member_{index}")
+
+
 def select_opponent(
     draw: float, has_pool: bool, anchor_probability: float, pool_probability: float
 ) -> str:

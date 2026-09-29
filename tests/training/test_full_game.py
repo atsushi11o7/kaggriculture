@@ -5,7 +5,6 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 
-from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import model as M
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.training.ppo import core, full_game
@@ -39,10 +38,9 @@ def _collect(model, variables, seat=0, config=None):
 def test_replayed_states_reach_the_recorded_final_cash() -> None:
     model, variables = _model()
     config, game = _collect(model, variables)
-    state = full_game.initial_state(jax.random.key(1), ENVS, config)
+    state, counters, _ = full_game.initial_state(jax.random.key(1), ENVS, config)
 
     final = state
-    counters = H.zeros(ENVS)
     replayed_steps = []
     for start, end in full_game.segment_bounds(game.dones.shape[0], 5):
         window = full_game._window(start, end)
@@ -92,9 +90,8 @@ def _run_accumulated_gradient_check() -> None:
     model, variables = _model()
     config, game = _collect(model, variables)
     advantages, returns = full_game.game_targets(game, 0.999, 0.95, 1.0)
-    state = full_game.initial_state(jax.random.key(1), ENVS, config)
+    state, counters, _ = full_game.initial_state(jax.random.key(1), ENVS, config)
     steps = game.dones.shape[0]
-    counters = H.zeros(ENVS)
     (state, counters), (states, state_counters) = full_game.replay_segment(
         config, state, counters, game.actions
     )
@@ -144,8 +141,36 @@ def _run_accumulated_gradient_check() -> None:
 
     mean = jax.tree.map(lambda x: x / count, accumulated)
     differences = jax.tree.leaves(jax.tree.map(lambda a, b: jnp.abs(a - b).max(), mean, expected))
-    assert count == used // minibatch
+    assert count == used
     assert max(float(value) for value in differences) < 1e-4
+
+
+def test_full_game_update_rejects_mismatched_round_configs() -> None:
+    model, variables = _model()
+    config = _config()
+    train_state = core.create_train_state(model, variables, core.PPOConfig())
+
+    try:
+        full_game.full_game_update(
+            model,
+            train_state,
+            None,
+            core.PPOConfig(),
+            config,
+            [variables, variables],
+            jax.random.key(5),
+            batch_size=ENVS,
+            minibatch=2,
+            segment_length=2,
+            gamma=0.999,
+            gae_lambda=1.0,
+            value_lambda=1.0,
+            rollout_configs=[config],
+        )
+    except ValueError as error:
+        assert str(error) == "rollout_configs must match opponents"
+    else:
+        raise AssertionError("mismatched rollout configs were accepted")
 
 
 def test_full_game_update_alternates_seats_and_changes_parameters() -> None:

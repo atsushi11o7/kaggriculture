@@ -12,9 +12,8 @@ from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.rules import constants as C
 from kaggriculture.simulator.action import Action
-from kaggriculture.simulator.reset import reset
 from kaggriculture.simulator.step import step_batch_lockstep
-from kaggriculture.training.ppo.rollout import RolloutConfig
+from kaggriculture.training.ppo.rollout import RolloutConfig, initial_rollout_start
 
 
 class EvaluationResult(NamedTuple):
@@ -67,12 +66,9 @@ def evaluate_closed_loop(
     初期盤面が同一のため試合が独立にならず、勝率の信頼区間が意味を持たない。
     """
     reset_key, run_key = jax.random.split(key)
-    initial_state = reset(
-        reset_key, batch_size, board_size=config.board_size, starting_money=config.starting_money
-    )
+    initial_state, initial_counters, _ = initial_rollout_start(reset_key, batch_size, config)
     players0 = jnp.zeros((batch_size,), jnp.int32)
     players1 = jnp.ones((batch_size,), jnp.int32)
-    initial_counters = H.zeros(batch_size)
     zero_counts = jnp.zeros((batch_size,), jnp.float32)
 
     def scan_step(carry, step_key):
@@ -136,7 +132,7 @@ def evaluate_closed_loop(
         )
         return (next_state, next_counters, pass0, total0, pass1, total1), None
 
-    keys = jax.random.split(run_key, config.episode_steps - 1)
+    keys = jax.random.split(run_key, config.episode_steps - 1 - config.start_step)
     init = (initial_state, initial_counters, zero_counts, zero_counts, zero_counts, zero_counts)
     (final_state, _, pass0, total0, pass1, total1), _ = jax.lax.scan(scan_step, init, keys)
     cash = final_state.money

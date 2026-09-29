@@ -1,59 +1,82 @@
-"""Pre-generated day<=11 handoff states, for PPO rollouts that start at day 12.
-
-Every PPO rollout iteration otherwise pays the cost of simulating the fixed,
-non-learned day<=11 opening from scratch before any of the trajectory
-becomes eligible for policy loss. Since that opening is deterministic-ish
-(rule-based or a frozen BC checkpoint, not the policy under training), it's
-cheaper to generate a bank of realistic day-12 starting states once, offline,
-and have rollouts sample from it instead of re-simulating day<=11 every time.
-
-See src/kaggriculture/training/opening/generate_state_bank.py (or the
-scratch script that produced a given bank file) for how a bank is built:
-each entry is a ``State`` snapshot at step 288 (day 12, hour 0), pickled one
-after another into a single file.
-"""
+"""Opening handoff states for PPO rollouts from displayed day 12."""
 
 from __future__ import annotations
 
 import pickle
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from kaggriculture.policy.jax import history as H
+from kaggriculture.policy.jax.tokenize import EpisodeCounters
 from kaggriculture.simulator.state import State
+from kaggriculture.training.rl import estimated_assets
 
 
-def load_state_bank(path: str | Path) -> State:
-    """Load a pickled sequence of single-game States into one batched State."""
-    states = []
-    with open(path, "rb") as f:
+class StateBank(NamedTuple):
+    """Batched simulator state and observable history at one handoff step."""
+
+    state: State
+    counters: EpisodeCounters
+
+
+class RolloutStart(NamedTuple):
+    """A sampled batch ready to enter a PPO rollout."""
+
+    state: State
+    counters: EpisodeCounters
+    margin: jax.Array
+
+
+def _stack_leaves(*values):
+    first = values[0]
+    if hasattr(first, "dtype") and jax.dtypes.issubdtype(first.dtype, jax.dtypes.prng_key):
+        data = np.stack([jax.random.key_data(value) for value in values])
+        return jax.random.wrap_key_data(jnp.asarray(data))
+    return jnp.asarray(np.stack(values))
+
+
+def load_state_bank(path: str | Path) -> StateBank:
+    """Load handoff entries and stack them into one device-resident bank.
+
+    Legacy files containing only ``State`` remain readable. Their counters are
+    initialized to zero, so they should only be used for policies that do not
+    rely on episode-history features.
+    """
+    entries = []
+    with open(path, "rb") as stream:
         while True:
             try:
-                states.append(pickle.load(f))
+                entries.append(pickle.load(stream))
             except EOFError:
                 break
-    if not states:
+    if not entries:
         raise ValueError(f"state bank at {path} is empty")
-    stacked = jax.tree.map(lambda *xs: jnp.stack(xs), *states)
-    return stacked
+    if isinstance(entries[0], StateBank):
+        states = [entry.state for entry in entries]
+        counters = [entry.counters for entry in entries]
+        return StateBank(
+            jax.tree.map(_stack_leaves, *states),
+            jax.tree.map(_stack_leaves, *counters),
+        )
+    state = jax.tree.map(_stack_leaves, *entries)
+    return StateBank(state, H.zeros(len(entries)))
 
 
-def make_bank_reset_fn(bank: State) -> Callable[..., State]:
-    """Build a ``reset``-compatible sampler that draws (with replacement) from ``bank``.
+def make_bank_start_fn(bank: StateBank) -> Callable[..., RolloutStart]:
+    """Build a JIT-safe sampler returning matched state and history rows."""
+    bank_size = jax.tree.leaves(bank.state)[0].shape[0]
 
-    Matches the call signature of :func:`kaggriculture.simulator.reset.reset`
-    (``key, batch_size, board_size=..., starting_money=...``) so it can be
-    swapped in wherever ``reset`` is currently called, including inside
-    ``collect_rollout``'s jitted scan body: it's pure array indexing, so it's
-    jit/vmap-safe.
-    """
-    bank_size = jax.tree.util.tree_leaves(bank)[0].shape[0]
-
-    def bank_reset(key, batch_size, board_size=None, starting_money=None):
+    def bank_start(key, batch_size, board_size=None, starting_money=None):
         del board_size, starting_money
         indices = jax.random.randint(key, (batch_size,), 0, bank_size)
-        return jax.tree.map(lambda x: x[indices], bank)
+        state = jax.tree.map(lambda value: value[indices], bank.state)
+        counters = jax.tree.map(lambda value: value[indices], bank.counters)
+        assets = estimated_assets(state)
+        return RolloutStart(state, counters, assets[:, 0] - assets[:, 1])
 
-    return bank_reset
+    return bank_start

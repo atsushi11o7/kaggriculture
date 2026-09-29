@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
 import hydra
 import jax
-import jax.numpy as jnp
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
@@ -18,7 +19,6 @@ from kaggriculture.policy.common.config import (
     checkpoint_shape_metadata,
     validate_checkpoint_metadata,
 )
-from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.model_factory import (
     create_model,
@@ -36,12 +36,14 @@ from kaggriculture.training.ppo.checkpointing import (
     load_actor_checkpoint,
     load_initial_bc_checkpoint,
     load_opponent_variables,
+    load_policy_value_checkpoint,
     load_value_checkpoint,
     validate_critic_architecture,
 )
 from kaggriculture.training.ppo.evaluation import evaluate_both_seats
 from kaggriculture.training.ppo.population import (
     add_to_pool,
+    initialize_pool,
     list_pool_members,
     log_evaluation,
     opponent_for_choice,
@@ -52,6 +54,7 @@ from kaggriculture.training.ppo.rollout import (
     RolloutConfig,
     collect_rollout,
     collect_rollout_vs_opponent,
+    initial_rollout_start,
     to_critic_batch,
     to_ppo_batch,
 )
@@ -99,21 +102,21 @@ def _save_runtime(directory: Path, key, state, counters, daily_margin) -> None:
     )
 
 
-def _rollout_config(cfg):
+def _rollout_config(cfg, bank_path=None):
     rules = cfg.rules
     kwargs = {}
-    state_bank_path = getattr(cfg.env, "state_bank_path", None)
+    state_bank_path = bank_path or getattr(cfg.env, "state_bank_path", None)
     if state_bank_path:
         bank = state_bank.load_state_bank(to_absolute_path(state_bank_path))
-        bank_steps = set(jax.device_get(bank.step).tolist())
+        bank_steps = set(jax.device_get(bank.state.step).tolist())
         if len(bank_steps) != 1:
             raise ValueError(f"state bank must have one common step, found {bank_steps}")
-        kwargs["reset_fn"] = state_bank.make_bank_reset_fn(bank)
+        kwargs["start_fn"] = state_bank.make_bank_start_fn(bank)
         kwargs["start_step"] = next(iter(bank_steps))
         logger.info(
             "using state bank %s (%d entries, start_step=%d) for rollout resets",
             state_bank_path,
-            jax.tree.util.tree_leaves(bank)[0].shape[0],
+            jax.tree.leaves(bank.state)[0].shape[0],
             kwargs["start_step"],
         )
     return RolloutConfig(
@@ -152,6 +155,7 @@ def main(cfg: DictConfig) -> None:
             bool(path)
             for path in (
                 cfg.ppo.init_bc_checkpoint,
+                cfg.ppo.init_checkpoint,
                 cfg.ppo.init_value_checkpoint,
                 cfg.ppo.resume_checkpoint,
             )
@@ -159,14 +163,17 @@ def main(cfg: DictConfig) -> None:
         > 1
     ):
         raise ValueError(
-            "init_bc_checkpoint, init_value_checkpoint and resume_checkpoint are mutually exclusive"
+            "init_bc_checkpoint, init_checkpoint, init_value_checkpoint and "
+            "resume_checkpoint are mutually exclusive"
         )
     resume_metadata = None
     if cfg.ppo.resume_checkpoint:
         resume_metadata = read_checkpoint_metadata(
             Path(to_absolute_path(cfg.ppo.resume_checkpoint))
         )
-    anchor_checkpoint = cfg.ppo.anchor_bc_checkpoint or cfg.ppo.init_bc_checkpoint
+    anchor_checkpoint = (
+        cfg.ppo.anchor_bc_checkpoint or cfg.ppo.init_checkpoint or cfg.ppo.init_bc_checkpoint
+    )
     if anchor_checkpoint is None and resume_metadata is not None:
         previous_ppo = resume_metadata.get("config", {}).get("ppo", {})
         anchor_checkpoint = previous_ppo.get("anchor_bc_checkpoint") or previous_ppo.get(
@@ -188,6 +195,10 @@ def main(cfg: DictConfig) -> None:
             allow_reward_mismatch=(
                 cfg.ppo.critic_warmup_updates > 0 or cfg.ppo.allow_value_reward_mismatch
             ),
+        )
+    if cfg.ppo.init_checkpoint:
+        variables = load_policy_value_checkpoint(
+            Path(to_absolute_path(cfg.ppo.init_checkpoint)), initial_variables, model_config
         )
     if cfg.ppo.init_value_checkpoint:
         variables = load_value_checkpoint(
@@ -230,11 +241,44 @@ def main(cfg: DictConfig) -> None:
         shed_capacity=cfg.rules.shed_capacity,
     )
     rollout_config = _rollout_config(cfg)
-    state = rollout_config.reset_fn(
-        reset_key, cfg.env.batch_size, starting_money=cfg.rules.starting_money
+    eval_bank_path = getattr(cfg.env, "eval_state_bank_path", None)
+    eval_rollout_config = _rollout_config(cfg, eval_bank_path) if eval_bank_path else rollout_config
+    matched_opponents = []
+    for entry in cfg.ppo.matched_opponents:
+        opponent_path = Path(to_absolute_path(entry.checkpoint))
+        bank_path = Path(to_absolute_path(entry.state_bank_path))
+        manifest_path = bank_path.with_suffix(bank_path.suffix + ".json")
+        if not manifest_path.exists():
+            raise ValueError(f"matched state bank requires a manifest: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("learner_seat") != 1:
+            raise ValueError(f"matched state bank learner must occupy seat 1: {bank_path}")
+        opening_path = Path(to_absolute_path(entry.opening_checkpoint)).resolve()
+        recorded_opponent = Path(manifest.get("opponent_checkpoint", "")).resolve()
+        if recorded_opponent != opening_path:
+            raise ValueError(
+                f"matched state bank opponent opening mismatch: {bank_path} records "
+                f"{recorded_opponent}, expected {opening_path}"
+            )
+        for field in ("require_learner_lands", "require_opponent_lands"):
+            expected = entry.get(field)
+            if manifest.get(field) != expected:
+                raise ValueError(
+                    f"matched state bank {field} mismatch: {bank_path} records "
+                    f"{manifest.get(field)}, expected {expected}"
+                )
+        matched_opponents.append(
+            (
+                str(entry.name),
+                load_actor_checkpoint(opponent_path, initial_variables, model_config),
+                _rollout_config(cfg, entry.state_bank_path),
+            )
+        )
+    if matched_opponents and cfg.ppo.full_game_rounds != 2:
+        raise ValueError("matched_opponents require full_game_rounds=2")
+    state, counters, daily_margin = initial_rollout_start(
+        reset_key, cfg.env.batch_size, rollout_config
     )
-    counters = H.zeros(cfg.env.batch_size)
-    daily_margin = jnp.zeros((cfg.env.batch_size,), dtype=jnp.float32)
     start_update = 0
     warmup_start = 0
     train_state = None
@@ -273,6 +317,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     checkpoints_dir = Path("checkpoints")
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     best_dir = checkpoints_dir / "best"
     run_warmup = resume_phase == "critic_warmup" or (
         resume_metadata is None and cfg.ppo.critic_warmup_updates > 0
@@ -372,6 +417,16 @@ def main(cfg: DictConfig) -> None:
     # (to_absolute_pathでchdir前の元cwd基準にすると、実行のたびに共有される
     # 固定パスになってしまい、別runのpool対戦相手が混ざり込む)。
     pool_dir = checkpoints_dir / cfg.ppo.pool_dir
+    if cfg.ppo.init_checkpoint and not (best_dir / "metadata.json").exists():
+        source = Path(to_absolute_path(cfg.ppo.init_checkpoint))
+        if not (source / "metadata.json").exists() or not (source / "state.msgpack").exists():
+            raise ValueError(f"invalid initial best checkpoint: {source}")
+        shutil.copytree(source, best_dir)
+    initialize_pool(
+        pool_dir,
+        [Path(to_absolute_path(path)) for path in cfg.ppo.initial_pool_checkpoints],
+        cfg.ppo.pool_size,
+    )
     for update in range(start_update + 1, cfg.ppo.total_updates + 1):
         key, rollout_key, update_key, opponent_key, member_key, seat_key, eval_key = (
             jax.random.split(key, 7)
@@ -494,8 +549,19 @@ def main(cfg: DictConfig) -> None:
 
         else:
             round_opponents = []
-            for _ in range(cfg.ppo.full_game_rounds):
+            round_configs = []
+            round_labels = []
+            for round_index in range(cfg.ppo.full_game_rounds):
                 key, round_opponent_key, round_member_key = jax.random.split(key, 3)
+                if matched_opponents and round_index == 1:
+                    matched_index = int(
+                        jax.random.randint(round_opponent_key, (), 0, len(matched_opponents))
+                    )
+                    label, opponent_variables, opponent_config = matched_opponents[matched_index]
+                    round_opponents.append(opponent_variables)
+                    round_configs.append(opponent_config)
+                    round_labels.append(f"matched:{label}")
+                    continue
                 choice = select_opponent(
                     float(jax.random.uniform(round_opponent_key)),
                     bool(pool_members),
@@ -516,6 +582,8 @@ def main(cfg: DictConfig) -> None:
                         pool_variables,
                     )
                 )
+                round_configs.append(rollout_config)
+                round_labels.append(choice)
             train_state, diagnostics = full_game.full_game_update(
                 model,
                 train_state,
@@ -530,6 +598,7 @@ def main(cfg: DictConfig) -> None:
                 gamma=cfg.ppo.gamma,
                 gae_lambda=cfg.ppo.gae_lambda,
                 value_lambda=cfg.ppo.value_lambda,
+                rollout_configs=round_configs,
             )
             if update % cfg.ppo.log_interval == 0:
                 logger.info(
@@ -537,7 +606,8 @@ def main(cfg: DictConfig) -> None:
                     "value_loss=%.4f entropy=%.4f reference_actor_l2=%.6f "
                     "gradient_norm=%.4f round_cosine=%.3f win=%.3f lose=%.3f draw=%.3f "
                     "daily_abs_mean=%.4f value_mean=%.4f return_mean=%.4f "
-                    "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f",
+                    "invalid=%.3f clamped=%.3f invalid_unit=%.3f clamped_unit=%.3f "
+                    "opponents=%s",
                     update,
                     time.perf_counter() - started,
                     diagnostics["games"],
@@ -558,6 +628,7 @@ def main(cfg: DictConfig) -> None:
                     diagnostics["clamped"],
                     diagnostics["invalid_unit"],
                     diagnostics["clamped_unit"],
+                    ",".join(round_labels),
                 )
         metadata = _checkpoint_metadata(
             cfg, model_config, reference_path, phase="ppo", update=update
@@ -572,7 +643,7 @@ def main(cfg: DictConfig) -> None:
                 model,
                 {"params": train_state.params},
                 best_variables,
-                rollout_config,
+                eval_rollout_config,
                 best_key,
                 cfg.ppo.eval_episodes,
             )
@@ -584,7 +655,7 @@ def main(cfg: DictConfig) -> None:
                     model,
                     {"params": train_state.params},
                     anchor_variables,
-                    rollout_config,
+                    eval_rollout_config,
                     anchor_key,
                     cfg.ppo.eval_episodes,
                 )

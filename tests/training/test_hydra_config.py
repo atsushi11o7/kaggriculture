@@ -41,18 +41,22 @@ def test_cli_overrides_apply_after_shared_model_config() -> None:
 def test_ppo_stability_defaults() -> None:
     cfg = _compose("ppo")
 
-    assert cfg.ppo.learning_rate == 5.0e-5
+    assert cfg.ppo.learning_rate == 1.0e-5
     assert cfg.ppo.full_game_rounds == 2
     assert cfg.ppo.rollout_horizon == cfg.rules.episode_steps
     assert cfg.ppo.update_epochs == 1
     assert cfg.ppo.daily_reward_coefficient == 0.0
     assert cfg.ppo.entropy_coef == 0.0
     assert cfg.ppo.target_kl == 0.02
-    assert cfg.ppo.anchor_sample_prob == 0.5
+    assert cfg.ppo.anchor_sample_prob == 0.25
     assert cfg.ppo.pool_sample_prob == 0.5
-    assert cfg.ppo.anchor_promotion_win_rate == 0.5
+    assert cfg.ppo.eval_episodes == 64
+    assert cfg.ppo.promotion_win_rate == 0.55
+    assert cfg.ppo.pool_size == 8
+    assert cfg.ppo.anchor_promotion_win_rate == 0.6
     assert cfg.ppo.reference_actor_l2_coef == 0.1
     assert cfg.ppo.reference_checkpoint is None
+    assert list(cfg.ppo.matched_opponents) == []
 
 
 def test_value_pretraining_reward_matches_ppo_default() -> None:
@@ -63,3 +67,36 @@ def test_value_pretraining_reward_matches_ppo_default() -> None:
     assert value.train.daily_reward_coefficient == ppo.ppo.daily_reward_coefficient
     assert value.train.daily_reward_scale == ppo.ppo.daily_reward_scale
     assert value.train.daily_reward_maximum == ppo.ppo.daily_reward_maximum
+
+
+def test_diverse_mmpq_ppo_pairs_fixed_opponents_with_state_banks() -> None:
+    cfg = _compose("ppo_mmpq_diverse")
+
+    assert cfg.ppo.rollout_horizon == 456
+    assert cfg.ppo.full_game_rounds == 2
+    assert [entry.name for entry in cfg.ppo.matched_opponents] == [
+        "dsm_bc",
+        "decem_bc",
+        "decem_ppo_260",
+    ]
+    assert cfg.ppo.matched_opponents[0].opening_checkpoint.endswith(
+        "opening_day10_dsm_v1/2026-09-29/10-05-16/checkpoints/best"
+    )
+    assert all(entry.state_bank_path for entry in cfg.ppo.matched_opponents)
+
+
+def test_focused_diverse_ppo_pairs_each_opponent_with_its_opening() -> None:
+    cfg = _compose("ppo_mmpq_focused_diverse")
+
+    assert cfg.ppo.rollout_horizon == 456
+    assert [entry.name for entry in cfg.ppo.matched_opponents] == [
+        "mmpq_focused",
+        "decem_focused",
+        "dsm_focused",
+        "vadim_focused",
+    ]
+    assert cfg.ppo.init_bc_checkpoint.endswith(
+        "day11plus_mmpq_ppo_light_v1/2026-09-29/22-33-21/checkpoints/best"
+    )
+    assert all(entry.opening_checkpoint for entry in cfg.ppo.matched_opponents)
+    assert all(entry.state_bank_path for entry in cfg.ppo.matched_opponents)
