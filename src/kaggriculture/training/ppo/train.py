@@ -244,6 +244,7 @@ def main(cfg: DictConfig) -> None:
     eval_bank_path = getattr(cfg.env, "eval_state_bank_path", None)
     eval_rollout_config = _rollout_config(cfg, eval_bank_path) if eval_bank_path else rollout_config
     matched_opponents = []
+    matched_total_weight = 0.0
     for entry in cfg.ppo.matched_opponents:
         opponent_path = Path(to_absolute_path(entry.checkpoint))
         bank_path = Path(to_absolute_path(entry.state_bank_path))
@@ -267,11 +268,16 @@ def main(cfg: DictConfig) -> None:
                     f"matched state bank {field} mismatch: {bank_path} records "
                     f"{manifest.get(field)}, expected {expected}"
                 )
+        weight = float(entry.get("weight", 1.0))
+        if weight <= 0.0:
+            raise ValueError(f"matched opponent weight must be positive: {entry.name}")
+        matched_total_weight += weight
         matched_opponents.append(
             (
                 str(entry.name),
                 load_actor_checkpoint(opponent_path, initial_variables, model_config),
                 _rollout_config(cfg, entry.state_bank_path),
+                matched_total_weight,
             )
         )
     if matched_opponents and cfg.ppo.full_game_rounds != 2:
@@ -554,10 +560,15 @@ def main(cfg: DictConfig) -> None:
             for round_index in range(cfg.ppo.full_game_rounds):
                 key, round_opponent_key, round_member_key = jax.random.split(key, 3)
                 if matched_opponents and round_index == 1:
-                    matched_index = int(
-                        jax.random.randint(round_opponent_key, (), 0, len(matched_opponents))
+                    draw = float(jax.random.uniform(round_opponent_key)) * matched_total_weight
+                    matched_index = next(
+                        index
+                        for index, (*_, cumulative_weight) in enumerate(matched_opponents)
+                        if draw < cumulative_weight
                     )
-                    label, opponent_variables, opponent_config = matched_opponents[matched_index]
+                    label, opponent_variables, opponent_config, _ = matched_opponents[
+                        matched_index
+                    ]
                     round_opponents.append(opponent_variables)
                     round_configs.append(opponent_config)
                     round_labels.append(f"matched:{label}")

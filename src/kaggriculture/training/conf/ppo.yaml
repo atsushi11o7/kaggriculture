@@ -91,7 +91,7 @@ ppo:
   # 新しいrunのpoolへ最初にコピーする互換checkpoint。既存poolがあれば何もしない。
   initial_pool_checkpoints: []
   # opening stateとday11+方策を対応させた固定相手。full_gameでは通常ラウンドの
-  # 後に、この一覧から選んだ相手を専用state bankと組にして使用する。
+  # 後に、この一覧からweight比例で選んだ相手を専用state bankと組にして使用する。
   matched_opponents: []
   # rollout相手は固定BC 25%、昇格済みpool 50%、self-play 25%。
   # poolが空ならpool分もanchorへ回す。
