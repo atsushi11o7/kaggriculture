@@ -50,12 +50,16 @@ def analyze_episode(path: Path, rating: dict | None = None) -> list[SelectionEnt
     hires = [0, 0]
     land = [0, 0]
     max_hands = [0, 0]
+    day11_full_land = [False, False]
     for frame in steps:
         for player, record in enumerate(frame):
             observation = record.get("observation") or {}
             farms = observation.get("farms") or []
             if len(farms) > player:
                 max_hands[player] = max(max_hands[player], len(farms[player].get("hands", [])))
+                if observation.get("day") == 11:
+                    quadrants = farms[player].get("unlocked_quadrants") or []
+                    day11_full_land[player] = day11_full_land[player] or len(quadrants) >= 4
             action = record.get("action") or {}
             for order in action.get("market", []):
                 if not isinstance(order, list) or not order:
@@ -93,6 +97,7 @@ def analyze_episode(path: Path, rating: dict | None = None) -> list[SelectionEnt
                 hires=hires[player],
                 sell_units=sum(sales[player].values()),
                 buy_product_units=buy_product_units[player],
+                day11_full_land=day11_full_land[player],
                 source_size=stat.st_size,
                 source_mtime_ns=stat.st_mtime_ns,
             )

@@ -221,6 +221,8 @@ def main(cfg: DictConfig) -> None:
         hire_mult=cfg.rules.hire_mult,
         max_market_orders=cfg.rules.max_market_orders,
         min_player_reward=cfg.data.min_player_reward,
+        min_day=cfg.data.min_day,
+        max_day=cfg.data.max_day,
     )
     cache = Path(to_absolute_path(cfg.data.cache_dir))
     reward = (

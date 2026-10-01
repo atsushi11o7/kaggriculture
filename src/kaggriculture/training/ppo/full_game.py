@@ -26,14 +26,12 @@ from kaggriculture.policy.jax import history as H
 from kaggriculture.policy.jax import policy as P
 from kaggriculture.policy.jax.types import Intent
 from kaggriculture.simulator.action import Action
-from kaggriculture.simulator.reset import reset
 from kaggriculture.training.ppo import core
-from kaggriculture.training.ppo.rollout import RolloutConfig, _step
+from kaggriculture.training.ppo.rollout import RolloutConfig, _step, initial_rollout_start
 from kaggriculture.training.rl import (
     DailyRewardConfig,
     compute_gae,
     daily_asset_rewards,
-    estimated_assets,
     terminal_win_rewards,
 )
 
@@ -57,13 +55,8 @@ class CompactGame(NamedTuple):
 
 
 def initial_state(reset_key, batch_size: int, config: RolloutConfig):
-    """回収と再生成で同じ初期状態を作る。"""
-    return reset(
-        reset_key,
-        batch_size,
-        board_size=config.board_size,
-        starting_money=config.starting_money,
-    )
+    """回収と再生成で同じ状態・履歴・資産差を作る。"""
+    return initial_rollout_start(reset_key, batch_size, config)
 
 
 @partial(jax.jit, static_argnums=(0, 3, 4, 5))
@@ -79,10 +72,7 @@ def collect_compact_game(
 ) -> CompactGame:
     """全環境を初期状態から最後まで回し、状態を保存せずに行動と統計だけを返す。"""
     opponent_seat = 1 - learner_seat
-    state = initial_state(reset_key, batch_size, config)
-    counters = H.zeros(batch_size)
-    assets = estimated_assets(state)
-    margin = assets[:, 0] - assets[:, 1]
+    state, counters, margin = initial_state(reset_key, batch_size, config)
     daily_config = DailyRewardConfig(
         config.daily_reward_coefficient, config.daily_reward_scale, config.daily_reward_maximum
     )
@@ -155,7 +145,7 @@ def collect_compact_game(
         )
         return (stepped, next_counters, next_margin), record
 
-    keys = jax.random.split(run_key, config.episode_steps - 1)
+    keys = jax.random.split(run_key, config.episode_steps - 1 - config.start_step)
     _, records = jax.lax.scan(scan_step, (state, counters, margin), keys)
     *fields, cash = records
     return CompactGame(*fields, final_cash=cash[-1])
@@ -214,10 +204,7 @@ def segment_gradient(
     learner_seat: int,
     permutation_key,
 ):
-    """1区間の全minibatchの勾配とmetricを足し合わせる。
-
-    区間内の行をシャッフルし、minibatchに満たない端数は捨てる。
-    """
+    """Accumulate sample-weighted gradients without dropping a partial minibatch."""
     steps, batch = rows["slot_mask"].shape[:2]
     total = steps * batch
 
@@ -226,18 +213,24 @@ def segment_gradient(
 
     flat_states = jax.tree.map(flatten, states)
     flat_rows = jax.tree.map(flatten, rows)
-    usable = (total // minibatch) * minibatch
-    order = jax.random.permutation(permutation_key, total)[:usable].reshape(-1, minibatch)
+    padding = (-total) % minibatch
+    shuffled = jax.random.permutation(permutation_key, total)
+    indices = jnp.concatenate([shuffled, jnp.zeros((padding,), jnp.int32)])
+    real = jnp.concatenate([jnp.ones((total,), dtype=bool), jnp.zeros((padding,), dtype=bool)])
+    order = indices.reshape(-1, minibatch)
+    real = real.reshape(-1, minibatch)
 
-    def minibatch_step(carry, index):
-        gradient_sum, metric_sum = carry
+    def minibatch_step(carry, item):
+        gradient_sum, metric_sum, sample_sum = carry
+        index, is_real = item
         take = lambda value: value[index]  # noqa: E731
         selected = jax.tree.map(take, flat_rows)
+        slot_mask = selected["slot_mask"] & is_real[:, None]
         batch_ = core.PPOBatch(
             jax.tree.map(take, flat_states),
             jnp.full((minibatch,), learner_seat, jnp.int32),
             selected["intent"],
-            selected["slot_mask"],
+            slot_mask,
             selected["old_slot_log_prob"],
             selected["old_value"],
             selected["advantages"],
@@ -247,14 +240,23 @@ def segment_gradient(
         (_, metrics), gradients = jax.value_and_grad(core._loss, argnums=1, has_aux=True)(
             model, params, batch_, ppo_config, reference_params
         )
-        gradient_sum = jax.tree.map(jnp.add, gradient_sum, gradients)
-        metric_sum = jax.tree.map(jnp.add, metric_sum, metrics)
-        return (gradient_sum, metric_sum), None
+        sample_count = slot_mask.any(-1).sum()
+        gradient_sum = jax.tree.map(
+            lambda accumulated, value: accumulated + value * sample_count,
+            gradient_sum,
+            gradients,
+        )
+        metric_sum = jax.tree.map(
+            lambda accumulated, value: accumulated + value * sample_count,
+            metric_sum,
+            metrics,
+        )
+        return (gradient_sum, metric_sum, sample_sum + sample_count), None
 
     zero_metrics = core.Metrics(*(jnp.zeros(()) for _ in core.Metrics._fields))
-    init = (jax.tree.map(jnp.zeros_like, params), zero_metrics)
-    (gradient_sum, metric_sum), _ = jax.lax.scan(minibatch_step, init, order)
-    return gradient_sum, metric_sum, order.shape[0]
+    init = (jax.tree.map(jnp.zeros_like, params), zero_metrics, jnp.asarray(0))
+    (gradient_sum, metric_sum, sample_sum), _ = jax.lax.scan(minibatch_step, init, (order, real))
+    return gradient_sum, metric_sum, sample_sum
 
 
 def _window(start: int, end: int):
@@ -289,6 +291,7 @@ def full_game_update(
     gamma: float,
     gae_lambda: float,
     value_lambda: float,
+    rollout_configs: list[RolloutConfig] | None = None,
 ):
     """opponentsの数だけ完了試合のラウンドを回し、勾配を蓄積して1回だけ更新する。
 
@@ -299,20 +302,26 @@ def full_game_update(
         (更新後のtrain_state, 診断値のdict)
     """
     rounds = len(opponents)
+    if rollout_configs is None:
+        rollout_configs = [rollout_config] * rounds
+    if len(rollout_configs) != rounds:
+        raise ValueError("rollout_configs must match opponents")
     params = train_state.params
     variables = {"params": params}
     keys = jax.random.split(key, rounds * 3)
     games = []
-    for index, opponent in enumerate(opponents):
+    for index, (opponent, round_config) in enumerate(zip(opponents, rollout_configs, strict=True)):
         seat = index % 2
         reset_key, run_key = keys[3 * index], keys[3 * index + 1]
         game = collect_compact_game(
-            model, variables, opponent, seat, rollout_config, batch_size, reset_key, run_key
+            model, variables, opponent, seat, round_config, batch_size, reset_key, run_key
         )
         advantages, returns = game_targets(game, gamma, gae_lambda, value_lambda)
-        games.append((seat, reset_key, keys[3 * index + 2], game, advantages, returns))
+        games.append(
+            (seat, reset_key, keys[3 * index + 2], round_config, game, advantages, returns)
+        )
 
-    valid = jnp.concatenate([g.slot_mask.any(-1).reshape(-1) for _, _, _, g, _, _ in games])
+    valid = jnp.concatenate([g.slot_mask.any(-1).reshape(-1) for _, _, _, _, g, _, _ in games])
     flat_adv = jnp.concatenate([a.reshape(-1) for *_, a, _ in games])
     count = jnp.maximum(valid.sum(), 1)
     mean = jnp.sum(flat_adv * valid) / count
@@ -320,16 +329,15 @@ def full_game_update(
 
     round_results = []
     metric_total = core.Metrics(*(jnp.zeros(()) for _ in core.Metrics._fields))
-    for seat, reset_key, permutation_key, game, advantages, returns in games:
-        state = initial_state(reset_key, batch_size, rollout_config)
-        counters = H.zeros(batch_size)
+    for seat, reset_key, permutation_key, round_config, game, advantages, returns in games:
+        state, counters, _ = initial_state(reset_key, batch_size, round_config)
         steps = game.dones.shape[0]
         gradient = jax.tree.map(jnp.zeros_like, params)
-        round_minibatches = 0
+        round_samples = 0
         for number, (start, end) in enumerate(segment_bounds(steps, segment_length)):
             window = _window(start, end)
             (state, counters), (states, state_counters) = replay_segment(
-                rollout_config, state, counters, window(game.actions)
+                round_config, state, counters, window(game.actions)
             )
             rows = {
                 "intent": window(game.intent),
@@ -342,7 +350,7 @@ def full_game_update(
                     lambda value, seat=seat: value[:, :, seat], state_counters
                 ),
             }
-            gradient_sum, metric_sum, used = segment_gradient(
+            gradient_sum, metric_sum, used_samples = segment_gradient(
                 model,
                 params,
                 reference_params,
@@ -355,20 +363,20 @@ def full_game_update(
             )
             gradient = jax.tree.map(jnp.add, gradient, gradient_sum)
             metric_total = jax.tree.map(jnp.add, metric_total, metric_sum)
-            round_minibatches += int(used)
-        round_results.append((gradient, round_minibatches))
+            round_samples += int(used_samples)
+        round_results.append((gradient, round_samples))
 
-    minibatches = sum(count for _, count in round_results)
+    samples = sum(count for _, count in round_results)
     total_gradient = jax.tree.map(
-        lambda *gradients: sum(gradients) / minibatches, *[g for g, _ in round_results]
+        lambda *gradients: sum(gradients) / samples, *[g for g, _ in round_results]
     )
-    diagnostics = {"gradient_norm": _tree_norm(total_gradient), "minibatches": minibatches}
+    diagnostics = {"gradient_norm": _tree_norm(total_gradient), "samples": samples}
     if rounds >= 2:
         per_round = [jax.tree.map(lambda x, c=c: x / c, g) for g, c in round_results[:2]]
         diagnostics["round_gradient_cosine"] = _cosine(per_round[0], per_round[1])
     new_state = train_state.apply_gradients(grads=total_gradient)
     for name in core.Metrics._fields:
-        diagnostics[name] = float(getattr(metric_total, name) / minibatches)
+        diagnostics[name] = float(getattr(metric_total, name) / samples)
     diagnostics.update(_game_statistics(games))
     return new_state, diagnostics
 
@@ -377,7 +385,7 @@ def _game_statistics(games) -> dict:
     wins = losses = draws = envs = 0
     invalid = clamped = invalid_unit = clamped_unit = daily = 0.0
     value_mean = return_mean = 0.0
-    for seat, _, _, game, _, returns in games:
+    for seat, _, _, _, game, _, returns in games:
         margin = game.final_cash[:, seat] - game.final_cash[:, 1 - seat]
         wins += int((margin > 0).sum())
         losses += int((margin < 0).sum())

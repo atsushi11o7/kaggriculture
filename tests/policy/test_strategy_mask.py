@@ -93,3 +93,31 @@ def test_endgame_investment_masks_match_between_backends() -> None:
     assert not jax_unit[plant].any()
     for op in (C.MARKET_OP_BUY_SEED, C.MARKET_OP_BUY_ANIMAL, C.MARKET_OP_BUY_LAND):
         assert not jax_market[:, np.asarray(A.MARKET_CANDIDATES.op) == op].any()
+
+
+def test_endgame_investment_allows_a_first_yield_on_the_final_day() -> None:
+    state = reset(jax.random.key(8), 1)._replace(step=jnp.asarray([19 * 24]))
+    obs = make_fresh_observation(day=19)
+
+    jax_unit = np.asarray(JS.unit_mask(state, jnp.asarray(0), jnp.asarray(0)))
+    torch_unit = np.asarray(TS.unit_mask(obs, 0, TC.UNIT_META))
+    np.testing.assert_array_equal(jax_unit, torch_unit)
+
+    melon = C.CROPS.index("MELON")
+    melon_plant = (np.asarray(A.UNIT_CANDIDATES.op) == C.FARMER_OP_PLANT) & (
+        np.asarray(A.UNIT_CANDIDATES.arg) == melon
+    )
+    assert jax_unit[melon_plant].all()
+
+
+def test_final_step_strategy_mask_only_keeps_pass_for_units() -> None:
+    state = reset(jax.random.key(9), 1)._replace(step=jnp.asarray([718]))
+    obs = make_fresh_observation(day=29)
+    obs["hour"] = 22
+
+    jax_unit = np.asarray(JS.unit_mask(state, jnp.asarray(0), jnp.asarray(0)))
+    torch_unit = np.asarray(TS.unit_mask(obs, 0, TC.UNIT_META))
+    np.testing.assert_array_equal(jax_unit, torch_unit)
+
+    expected = np.asarray(A.UNIT_CANDIDATES.op) == C.FARMER_OP_PASS
+    np.testing.assert_array_equal(jax_unit, expected)

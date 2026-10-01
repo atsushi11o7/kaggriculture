@@ -13,7 +13,6 @@ from kaggriculture.policy.common.config import (
 )
 from kaggriculture.policy.jax.model_factory import critic_version
 from kaggriculture.training.checkpoint import (
-    load_checkpoint,
     read_checkpoint_metadata,
 )
 
@@ -126,6 +125,24 @@ def load_value_checkpoint(
     return {"params": freeze(traverse_util.unflatten_dict(restored))}
 
 
+def load_policy_value_checkpoint(path: Path, variables: dict, target_config: ModelConfig) -> dict:
+    """Restore all Actor and critic parameters from a compatible checkpoint."""
+    metadata = read_checkpoint_metadata(path)
+    validate_checkpoint_metadata(metadata)
+    validate_critic_architecture(metadata, path)
+    if ModelConfig(**metadata["model_config"]) != target_config:
+        raise ValueError(f"incompatible policy/value checkpoint config: {path}")
+    saved = serialization.msgpack_restore((path / "state.msgpack").read_bytes())
+    source = traverse_util.flatten_dict(saved["params"])
+    target = traverse_util.flatten_dict(unfreeze(variables["params"]))
+    if source.keys() != target.keys() or any(
+        source[name].shape != target[name].shape for name in source.keys() & target.keys()
+    ):
+        raise ValueError(f"incompatible policy/value checkpoint parameters: {path}")
+    restored = {name: jnp.asarray(source[name]) for name in target}
+    return {"params": freeze(traverse_util.unflatten_dict(restored))}
+
+
 def load_initial_bc_checkpoint(
     path: Path,
     variables: dict,
@@ -154,9 +171,10 @@ def load_initial_bc_checkpoint(
 
 
 def load_opponent_variables(directory: Path, train_state) -> dict:
-    """Restore checkpoint parameters using the given PPO train-state template."""
+    """Restore only model parameters for a fixed PPO opponent."""
     metadata = read_checkpoint_metadata(directory)
-    validate_checkpoint_metadata(metadata)
-    validate_critic_architecture(metadata, directory)
-    restored, _ = load_checkpoint(directory, train_state)
-    return {"params": restored.params}
+    return load_policy_value_checkpoint(
+        directory,
+        {"params": train_state.params},
+        ModelConfig(**metadata["model_config"]),
+    )

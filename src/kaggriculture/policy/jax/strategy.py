@@ -21,15 +21,17 @@ def unit_mask(state: State, player: jnp.ndarray, unit: jnp.ndarray) -> jnp.ndarr
         unit: 対象unit slot。
 
     Returns:
-        候補順の許可mask。現時点では全候補を許可する。
+        候補順の許可mask。回収不能な投資と最終stepの無価値な行動を除外する。
     """
     del player, unit
     day = state.step // 24
     final_day = (720 - 2) // 24
     op = A.UNIT_CANDIDATES.op
     arg = jnp.clip(A.UNIT_CANDIDATES.arg, 0, C.N_CROPS - 1)
-    plant_in_time = day + _CROP_FIRST_YIELD_DAY[arg] < final_day
-    return (op != C.FARMER_OP_PLANT) | plant_in_time
+    plant_in_time = day + _CROP_FIRST_YIELD_DAY[arg] <= final_day
+    investment = (op != C.FARMER_OP_PLANT) | plant_in_time
+    final_step = state.step == 720 - 2
+    return investment & (~final_step | (op == C.FARMER_OP_PASS))
 
 
 def market_mask(state: State, player: jnp.ndarray) -> jnp.ndarray:
@@ -60,7 +62,7 @@ def market_mask(state: State, player: jnp.ndarray) -> jnp.ndarray:
     crop = jnp.clip(arg, 0, C.N_CROPS - 1)
     animal = jnp.clip(arg, 0, C.N_ANIMALS - 1)
     in_time = jnp.ones_like(op, dtype=bool)
-    in_time &= (op != C.MARKET_OP_BUY_SEED) | (day + _CROP_FIRST_YIELD_DAY[crop] < final_day)
-    in_time &= (op != C.MARKET_OP_BUY_ANIMAL) | (day + _ANIMAL_FIRST_YIELD_DAY[animal] < final_day)
-    in_time &= (op != C.MARKET_OP_BUY_LAND) | (day + jnp.min(_CROP_FIRST_YIELD_DAY) < final_day)
+    in_time &= (op != C.MARKET_OP_BUY_SEED) | (day + _CROP_FIRST_YIELD_DAY[crop] <= final_day)
+    in_time &= (op != C.MARKET_OP_BUY_ANIMAL) | (day + _ANIMAL_FIRST_YIELD_DAY[animal] <= final_day)
+    in_time &= (op != C.MARKET_OP_BUY_LAND) | (day + jnp.min(_CROP_FIRST_YIELD_DAY) <= final_day)
     return allowed & in_time[None]

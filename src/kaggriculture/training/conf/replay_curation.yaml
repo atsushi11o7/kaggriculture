@@ -20,6 +20,8 @@ selection:
   min_margin: 0
   min_avg_agent_score: null
   min_agent_score: null
+  agent_names: null
+  day11_full_land_only: false
   max_per_strategy: null
   max_total: null
 

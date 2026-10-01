@@ -15,6 +15,14 @@ hydra:
 
 env:
   batch_size: 32
+  # 設定すると、ロールアウトの新局初期stateをday0からのresetではなく、
+  # このファイル(state_bank.pyのpickle形式)からサンプルした表示day 12
+  # (raw day 11、step 264)状態から始める。表示day 1〜11のオープニングを
+  # 毎回シミュレートするコストを省く。
+  state_bank_path: null
+  # nullなら学習用state bankを評価にも使う。指定時は昇格評価だけを
+  # 未使用の開始状態から行い、学習bankへの過適合を検出する。
+  eval_state_bank_path: null
 
 ppo:
   total_updates: 1000
@@ -24,18 +32,18 @@ ppo:
   # 1回だけ更新する(full_game.py)。1 updateの試合数はラウンド数×env.batch_size。
   full_game_rounds: 2
   # 蓄積時に状態を再生成する区間の長さ(メモリと速度の兼ね合い)。
-  full_game_segment_length: 144
+  full_game_segment_length: 72
   # 価値の教師のλ。1.0なら、criticの予測を含まない実際のreturn(モンテカルロ)。
   value_lambda: 1.0
-  minibatch_size: 256
-  learning_rate: 5.0e-5
+  minibatch_size: 128
+  learning_rate: 1.0e-5
   weight_decay: 0.0
   # PPO更新前にActorを固定し、on-policyの完了試合でcriticだけを適応させる。
   critic_warmup_updates: 0
   critic_warmup_epochs: 4
   critic_warmup_learning_rate: 5.0e-5
   gamma: 0.999
-  gae_lambda: 0.95
+  gae_lambda: 1.0
   clip_epsilon: 0.2
   value_clip_epsilon: 0.2
   value_coef: 0.5
@@ -52,11 +60,13 @@ ppo:
   temperature: 0.8
   seed: 0
   log_interval: 1
-  checkpoint_interval: 50
+  checkpoint_interval: 10
   # step_*だけ古い順に削除する(best/poolは対象外)。0以下で無効。
   keep_last_checkpoints: 5
   # joint BCならActorとcriticを、Actor-only BCならActorだけを読み込む。
   init_bc_checkpoint: null
+  # BC/PPOを問わず、同一構造のActorとcriticを両方読み込んで新しいrunを始める。
+  init_checkpoint: null
   # 事前学習したActor+criticを読み込む。報酬変更時はcritic warm-upが必須。
   init_value_checkpoint: null
   # trueなら、初期criticと報酬設定が違っても、warm-upなしで読み込む(criticはPPOの学習で適応する)。
@@ -67,18 +77,23 @@ ppo:
   reference_checkpoint: null
   resume_checkpoint: null
   # このupdate間隔でcandidateをchekcpoints/best/と対戦させ、昇格判定を行う。0以下で無効。
-  eval_interval: 50
-  eval_episodes: 32
-  # 昇格に必要な勝率(24位のPokemon TCGソリューションと同じ値)。
-  promotion_win_rate: 0.52
+  eval_interval: 10
+  eval_episodes: 64
+  # 片側64試合・計128試合で、現bestへの小さすぎる偶然の勝ち越しを通さない。
+  promotion_win_rate: 0.55
   # 固定BCに対して退化したcandidateを昇格させない。
-  anchor_promotion_win_rate: 0.5
+  anchor_promotion_win_rate: 0.6
   # 昇格したcandidateを追加保存するpopulation-based self-play用の対戦相手プール。
   # checkpoints/配下の相対名(実行ディレクトリ内に閉じる。絶対パス化すると
   # 実行間で共有される固定パスになり、別runのpool対戦相手が混ざってしまう)。
   pool_dir: pool
-  pool_size: 5
-  # rollout相手は固定BC 50%、昇格済みpool 50%(self-playは使わない)。
+  pool_size: 8
+  # 新しいrunのpoolへ最初にコピーする互換checkpoint。既存poolがあれば何もしない。
+  initial_pool_checkpoints: []
+  # opening stateとday11+方策を対応させた固定相手。full_gameでは通常ラウンドの
+  # 後に、この一覧からweight比例で選んだ相手を専用state bankと組にして使用する。
+  matched_opponents: []
+  # rollout相手は固定BC 25%、昇格済みpool 50%、self-play 25%。
   # poolが空ならpool分もanchorへ回す。
-  anchor_sample_prob: 0.5
+  anchor_sample_prob: 0.25
   pool_sample_prob: 0.5

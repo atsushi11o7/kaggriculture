@@ -1,0 +1,46 @@
+defaults:
+  - ppo
+  - _self_
+
+experiment:
+  name: ppo_day11plus_mmpq_ppo270_diverse_v2
+
+env:
+  state_bank_path: data/state_banks/opening_mmpq_focused_v2_self_train.pkl
+  eval_state_bank_path: data/state_banks/opening_mmpq_focused_v2_self_eval.pkl
+
+ppo:
+  total_updates: 200
+  rollout_horizon: 456
+  init_checkpoint: outputs/ppo/ppo_day11plus_mmpq_ppo_light_diverse_v1/2026-09-29/23-41-46/checkpoints/best
+  anchor_bc_checkpoint: outputs/ppo/ppo_day11plus_mmpq_ppo_light_diverse_v1/2026-09-29/23-41-46/checkpoints/best
+  reference_checkpoint: outputs/ppo/ppo_day11plus_mmpq_ppo_light_diverse_v1/2026-09-29/23-41-46/checkpoints/best
+  matched_opponents:
+    - name: mmpq_focused_v2
+      weight: 3.0
+      checkpoint: outputs/bc/day11plus_mmpq_focused_v2/2026-09-30/19-14-38/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_mmpq_focused_v2/2026-09-30/19-14-38/checkpoints/best
+      require_learner_lands: 4
+      require_opponent_lands: 4
+      state_bank_path: data/state_banks/opening_mmpq_focused_v2_vs_mmpq_v2_train.pkl
+    - name: decem_focused_v2
+      weight: 1.0
+      checkpoint: outputs/bc/day11plus_decem_focused_v2/2026-09-30/18-02-44/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_decem_focused_v2/2026-09-30/18-02-44/checkpoints/best
+      require_learner_lands: 4
+      require_opponent_lands: 4
+      state_bank_path: data/state_banks/opening_mmpq_focused_v2_vs_decem_v2_train.pkl
+    - name: dsm_focused
+      weight: 1.0
+      checkpoint: outputs/bc/day11plus_dsm_focused_v1/2026-09-29/18-27-32/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_dsm_focused_v1/2026-09-29/18-27-32/checkpoints/best
+      require_learner_lands: 4
+      require_opponent_lands: null
+      state_bank_path: data/state_banks/opening_mmpq_focused_v2_vs_dsm_train.pkl
+    - name: vadim_focused
+      weight: 1.0
+      checkpoint: outputs/bc/day11plus_vadim_focused_v1/2026-09-29/19-39-05/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_vadim_focused_v1/2026-09-29/19-39-05/checkpoints/best
+      require_learner_lands: 4
+      require_opponent_lands: null
+      state_bank_path: data/state_banks/opening_mmpq_focused_v2_vs_vadim_train.pkl

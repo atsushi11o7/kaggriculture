@@ -1,0 +1,30 @@
+defaults:
+  - ppo
+  - _self_
+
+experiment:
+  name: ppo_day11plus_mmpq_diverse_v1
+
+env:
+  state_bank_path: data/state_banks/opening_mmpq_vs_mmpq_train_v1.pkl
+  eval_state_bank_path: data/state_banks/opening_mmpq_vs_mmpq_eval_v1.pkl
+
+ppo:
+  total_updates: 300
+  rollout_horizon: 456
+  init_bc_checkpoint: outputs/bc/day11plus_mmpq_v2/2026-09-29/09-37-35/checkpoints/best
+  anchor_bc_checkpoint: outputs/bc/day11plus_mmpq_v2/2026-09-29/09-37-35/checkpoints/best
+  reference_checkpoint: outputs/bc/day11plus_mmpq_v2/2026-09-29/09-37-35/checkpoints/best
+  matched_opponents:
+    - name: dsm_bc
+      checkpoint: outputs/bc/day11plus_dsm_v1/2026-09-29/10-21-17/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_dsm_v1/2026-09-29/10-05-16/checkpoints/best
+      state_bank_path: data/state_banks/opening_mmpq_vs_dsm_train_v1.pkl
+    - name: decem_bc
+      checkpoint: outputs/bc/day11plus_decem_v2/2026-09-28/14-11-08/checkpoints/best
+      opening_checkpoint: outputs/bc/opening_day10_decem_v2/2026-09-28/13-53-26/checkpoints/best
+      state_bank_path: data/state_banks/opening_mmpq_vs_decem_train_v1.pkl
+    - name: decem_ppo_260
+      checkpoint: outputs/ppo/ppo_day11plus_decem_v2/2026-09-28/16-56-34/checkpoints/archive/update_260
+      opening_checkpoint: outputs/bc/opening_day10_decem_v2/2026-09-28/13-53-26/checkpoints/best
+      state_bank_path: data/state_banks/opening_mmpq_vs_decem_train_v1.pkl

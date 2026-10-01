@@ -59,6 +59,8 @@ def test_analyze_and_select_winner(tmp_path: Path) -> None:
                 "min_margin": 1,
                 "min_avg_agent_score": 2500,
                 "min_agent_score": 2500,
+                "agent_names": None,
+                "day11_full_land_only": False,
             }
         }
     )

@@ -168,13 +168,25 @@ def _counter_after(obs: dict, normalized: dict, counter: dict, rules: CacheRules
     return TH.update_counters(counter, deltas)
 
 
-def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | None = None):
+def iter_samples(
+    sources,
+    rules: CacheRules,
+    stats: BuildStats,
+    reward: dict | None = None,
+    min_day: int | None = None,
+    max_day: int | None = None,
+):
     """不正サンプルを理由別に集計して逐次変換する。
 
     rewardを渡すと、方策教師と同じ(試合・step・プレイヤー)の価値教師を同時に作る。この場合の
     Stateは両者のprivate情報を含む完全な局面で、Actorは公開情報と自席のprivateだけを読むため
     入力は変わらず、criticは同じ1回の順伝播で価値を出せる。価値教師が作れない不完全な試合は
     試合ごと捨てる。
+
+    min_day/max_dayを指定すると、教師として書き出す生observation dayをその範囲に絞る
+    (raw obs["day"]、両端含む)。範囲外の日もカウンター(produced/soldの累積)は引き続き更新する
+    ため、例えばday12以降だけを書き出す場合でも、day0-11の生産実績が正しく反映された状態で
+    カウンターが始まる。
 
     Yields:
         (State, プレイヤー, Intent, slot mask, 価値教師)。rewardなしの価値教師は0。
@@ -198,8 +210,9 @@ def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | N
             rules.min_player_reward,
             set(selected_players) if selected_players else None,
         ):
+            day = obs["day"]
+            in_range = (min_day is None or day >= min_day) and (max_day is None or day <= max_day)
             try:
-                intent, mask = action_to_intent(obs, action, rules)
                 from kaggriculture.policy.torch.candidate_api import normalize_expert_action
 
                 normalized = normalize_expert_action(
@@ -210,21 +223,24 @@ def iter_samples(sources, rules: CacheRules, stats: BuildStats, reward: dict | N
                     hire_mult=rules.hire_mult,
                     max_market_orders=rules.max_market_orders,
                 )
-                counter = _counter_array(episode_counters[player])
-                if states is None:
-                    state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
-                    value = 0.0
-                else:
-                    state = jax.tree.map(lambda values, index=index: values[index], states)
-                    value = float(targets[index, player])
-                stats.accepted += 1
-                yield state, int(obs["player"]), intent, mask, value, counter
+                if in_range:
+                    intent, mask = action_to_intent(obs, action, rules)
+                    counter = _counter_array(episode_counters[player])
+                    if states is None:
+                        state = observation_to_state(obs, turns_per_day=rules.turns_per_day)
+                        value = 0.0
+                    else:
+                        state = jax.tree.map(lambda values, index=index: values[index], states)
+                        value = float(targets[index, player])
+                    stats.accepted += 1
+                    yield state, int(obs["player"]), intent, mask, value, counter
                 episode_counters[player] = _counter_after(
                     obs, normalized, episode_counters[player], rules
                 )
             except (KeyError, IndexError, TypeError, ValueError) as error:
-                stats.discarded += 1
-                stats.reasons[type(error).__name__ + ":" + str(error)[:80]] += 1
+                if in_range:
+                    stats.discarded += 1
+                    stats.reasons[type(error).__name__ + ":" + str(error)[:80]] += 1
 
 
 def stack_samples(samples) -> BCBatch:

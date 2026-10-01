@@ -21,6 +21,8 @@ class CacheRules:
     hire_mult: float = 1.0
     max_market_orders: int = C.MAX_MARKET_ORDERS
     min_player_reward: float | None = None
+    min_day: int | None = None
+    max_day: int | None = None
 
 
 def _dict_vector(values: dict, names: Sequence[str], dtype=np.int32) -> np.ndarray:

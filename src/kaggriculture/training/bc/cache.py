@@ -49,7 +49,9 @@ def prepare_episode(
         return destination
     stats = BuildStats()
     selected = (source, players) if players is not None else source
-    samples = list(iter_samples([selected], rules, stats, reward))
+    samples = list(
+        iter_samples([selected], rules, stats, reward, min_day=rules.min_day, max_day=rules.max_day)
+    )
     directory.mkdir(parents=True, exist_ok=True)
     destination.with_suffix(".stats.json").write_text(
         json.dumps(

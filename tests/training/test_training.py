@@ -193,6 +193,47 @@ def test_joint_samples_align_value_targets_with_actions(tmp_path) -> None:
     ]
 
 
+def test_iter_samples_min_max_day_splits_opening_from_the_rest(tmp_path) -> None:
+    """min_day/max_dayで、同じ試合からday別に別々の教師データを切り出せる。
+
+    iter_replay_actionsは最終フレーム(次の行動が無い)を教師として出さないので、
+    フィルタ対象にしたいday(0, 5, 12)の後ろにもう1フレーム足しておく。
+    """
+    import json
+
+    from kaggriculture.training.bc.dataset import BuildStats, iter_samples
+
+    def observation(player: int, step: int, day: int) -> dict:
+        obs = make_fresh_observation(player=player, day=day)
+        obs["step"] = step
+        return obs
+
+    days = (0, 5, 12, 12)
+    steps = [
+        [
+            {
+                "observation": observation(player, index, day),
+                "action": {"farmer": ["PASS"], "hands": [], "market": []},
+                "status": "DONE" if index == len(days) - 1 else "ACTIVE",
+            }
+            for player in range(2)
+        ]
+        for index, day in enumerate(days)
+    ]
+    path = tmp_path / "episode.json"
+    path.write_text(json.dumps({"steps": steps, "rewards": [10.0, 3.0]}))
+
+    opening = list(iter_samples([path], CacheRules(), BuildStats(), min_day=0, max_day=11))
+    rest = list(iter_samples([path], CacheRules(), BuildStats(), min_day=12, max_day=None))
+    unfiltered = list(iter_samples([path], CacheRules(), BuildStats()))
+
+    # index 0(day0)・1(day5) 分がopening、index 2(day12) 分がrestへ入り、
+    # 最終フレーム(index3)は次の行動が無いのでどちらにも現れない。
+    assert {int(sample[0].step) for sample in opening} == {0, 1}
+    assert {int(sample[0].step) for sample in rest} == {2}
+    assert len(unfiltered) == len(opening) + len(rest)
+
+
 def test_bc_loss_excludes_structurally_illegal_labels() -> None:
     """固定mask上で不可能な有効ラベルをlossから除外する。"""
     from kaggriculture.policy.jax import actions as A
