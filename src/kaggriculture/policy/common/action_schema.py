@@ -1,4 +1,4 @@
-"""Backend-independent ordering and sizes of the fixed action vocabulary."""
+"""backend間で共有する固定行動語彙の順序と要素数。"""
 
 from kaggriculture.policy.common import vocab as V
 from kaggriculture.rules import constants as C

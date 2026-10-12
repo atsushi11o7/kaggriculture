@@ -1,9 +1,9 @@
-"""Land-purchase deadlines keyed by Kaggle's raw zero-based day."""
+"""Kaggleの0始まりraw dayに基づく土地購入期限。"""
 
 from __future__ import annotations
 
-# Modal purchase days measured directly from top-player replay observations.
-# Retrying after each threshold handles cash-dependent one-day delays.
+# 上位プレイヤーのリプレイ観測から直接求めた、最頻の土地購入日。
+# 各期限以降も再試行し、所持金による1日の遅れを許容する。
 LAND_PURCHASE_SCHEDULE = (("NE", 6, 1000), ("SW", 9, 2000), ("SE", 10, 4000))
 OPERATING_RESERVE = 300
 
@@ -12,12 +12,11 @@ _RESERVE_LEAD_DAYS = 1
 
 
 def required_capital(obs: dict, purchases_ahead: int = 0) -> int:
-    """Return cash to reserve for a pending scheduled land purchase.
+    """予定された土地購入のために確保する所持金を返す。
 
-    Only reserves starting the day before the purchase becomes eligible.
-    Replay evidence shows top players keep investing in crops and animals
-    through the run-up to each purchase (day-8 cash is often below the SW
-    price) rather than banking the full price for days in advance.
+    購入可能になる前日からのみ資金を確保する。リプレイでは、上位プレイヤーは
+    数日前から全額を貯めず、購入直前まで作物や動物へ投資していた
+    （day 8の所持金がSW価格を下回ることも多い）。
     """
     player = obs["player"]
     owned = set(obs["farms"][player]["unlocked_quadrants"])
@@ -31,7 +30,7 @@ def required_capital(obs: dict, purchases_ahead: int = 0) -> int:
 
 
 def next_forced_purchase(obs: dict, available_cash: float | None = None) -> list | None:
-    """Return BUY_LAND when the raw observation-day deadline is affordable."""
+    """raw observation dayの期限を迎え、購入可能ならBUY_LANDを返す。"""
     player = obs["player"]
     farm = obs["farms"][player]
     owned = set(farm["unlocked_quadrants"])

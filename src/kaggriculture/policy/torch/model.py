@@ -1,4 +1,4 @@
-"""PyTorch implementation of the fixed-slot policy."""
+"""固定slot方策のPyTorch実装。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ N_QUANTITIES = S.N_QUANTITIES
 
 
 class QueryBlock(nn.Module):
-    """Mix queries, attend to the fixed state memory, then apply an FFN."""
+    """queryを混合し、固定状態memoryを参照してからFFNを適用する。"""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -52,7 +52,7 @@ class QueryBlock(nn.Module):
 
 
 class ParallelQueryEncoder(nn.Module):
-    """Produce all unit and market slot representations in parallel."""
+    """全unit・市場slotの表現を並列に生成する。"""
 
     def __init__(
         self,
@@ -105,9 +105,15 @@ class ParallelQueryEncoder(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    """One-pass actor with an optional asymmetric critic."""
+    """任意の非対称criticを持つ1-pass Actor。"""
 
     def __init__(self, config: ModelConfig, *, actor_only: bool = False) -> None:
+        """固定slot方策と任意の非対称criticを構築する。
+
+        Args:
+            config: JAX実装と共有するモデル構成。
+            actor_only: Trueなら提出推論に不要なcritic moduleを構築しない。
+        """
         super().__init__()
         self.config = config
         self.actor_only = actor_only
@@ -156,7 +162,7 @@ class PolicyValueNet(nn.Module):
             )
 
     def embed_dense(self, index: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        """Embed fixed-width sparse features without constructing EmbeddingBag offsets."""
+        """EmbeddingBagのoffsetを作らず、固定幅の疎特徴量を埋め込む。"""
         embedded = self.token_embedding.bag.weight[index]
         return self.token_embedding.norm((embedded * value[..., None]).sum(dim=-2))
 
@@ -169,7 +175,7 @@ class PolicyValueNet(nn.Module):
         unit_inventory_index,
         unit_inventory_value,
     ):
-        """Encode public state into all parallel action slots."""
+        """公開状態を全並列行動slotへ符号化する。"""
         embedded = self.embed_dense(encoder_index, encoder_value)
         memory = self.encoder.forward_embedded(embedded)
         inventory = self.embed_dense(unit_inventory_index, unit_inventory_value)
@@ -229,17 +235,21 @@ class PolicyValueNet(nn.Module):
         return queries, value
 
     def unit_logits(self, hidden, mask):
+        """unit行動の固定語彙を採点する。"""
         return self.unit_head(hidden).masked_fill(~mask, -1e9)
 
     def market_logits(self, hidden, mask):
+        """市場行動の固定語彙を採点する。"""
         return self.market_head(hidden).masked_fill(~mask, -1e9)
 
     def unit_quantity_logits(self, hidden, action, mask):
+        """選択済みunit行動を条件として数量を採点する。"""
         selected = self.unit_action_embedding(action)
         hidden = self.unit_quantity_condition(torch.cat([hidden, selected], dim=-1))
         return self.quantity_head(hidden).masked_fill(~mask, -1e9)
 
     def market_quantity_logits(self, hidden, action, mask):
+        """選択済み市場行動を条件として数量を採点する。"""
         selected = self.market_action_embedding(action)
         hidden = self.market_quantity_condition(torch.cat([hidden, selected], dim=-1))
         return self.quantity_head(hidden).masked_fill(~mask, -1e9)

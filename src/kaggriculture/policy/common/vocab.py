@@ -135,9 +135,11 @@ class SparseVector:
     value: list[float] = field(default_factory=list)
 
     def add(self, index: int, value: float = 1.0) -> None:
+        """語彙indexと重みを1要素追加する。"""
         self.index.append(index)
         self.value.append(value)
 
     def extend(self, other: "SparseVector") -> None:
+        """別の疎特徴量を末尾へ連結する。"""
         self.index.extend(other.index)
         self.value.extend(other.value)

@@ -23,6 +23,26 @@ from kaggriculture.training.rl import compute_gae, terminal_win_rewards
 
 @dataclass(frozen=True)
 class PPOConfig:
+    """PPO目的関数、optimizer、方策評価の設定。
+
+    Attributes:
+        gamma: 将来報酬の割引率。
+        gae_lambda: GAEのbias・varianceを調整する係数。
+        clip_epsilon: 方策確率比のclip幅。
+        value_clip_epsilon: 旧valueから許容する予測変化のclip幅。
+        value_coef: 合計lossに掛けるvalue loss係数。
+        entropy_coef: 合計lossから引くentropy係数。
+        reference_actor_l2_coef: 参照Actorからの相対距離へ掛ける係数。
+        target_kl: epoch更新を打ち切る近似KL上限。Noneなら打ち切らない。
+        max_grad_norm: gradient clippingのglobal norm上限。
+        learning_rate: AdamWのlearning rate。
+        weight_decay: AdamWのweight decay係数。
+        temperature: rolloutと再評価で使う方策温度。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+        shed_capacity: 合法手判定に使うshed容量。
+        normalize_advantages: minibatch内でadvantageを標準化するか。
+    """
+
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
@@ -42,6 +62,20 @@ class PPOConfig:
 
 
 class PPOBatch(NamedTuple):
+    """PPO更新へ渡す平坦化済みsample。
+
+    Attributes:
+        states: intentを生成する直前のシミュレータ状態。
+        players: 各sampleで学習対象となるplayer index。
+        intent: rollout時にsampleした固定slotの行動候補index。
+        slot_mask: policy lossへ使用するslot。
+        old_slot_log_prob: rollout時のslot別log probability。
+        old_value: rollout時のvalue予測。
+        advantages: 各sampleのadvantage。
+        returns: criticの教師return。
+        counters: 各状態までの観測可能な累積実績。
+    """
+
     states: State
     players: jnp.ndarray
     intent: Intent
@@ -54,6 +88,15 @@ class PPOBatch(NamedTuple):
 
 
 class CriticBatch(NamedTuple):
+    """critic単独更新へ渡すsample。
+
+    Attributes:
+        states: valueを評価するシミュレータ状態。
+        targets: criticの教師value。
+        mask: lossへ使用するsample。
+        counters: 各状態までの観測可能な累積実績。
+    """
+
     states: State
     targets: jnp.ndarray
     mask: jnp.ndarray
@@ -61,12 +104,32 @@ class CriticBatch(NamedTuple):
 
 
 class CriticMetrics(NamedTuple):
+    """critic予測の評価値。
+
+    Attributes:
+        loss: 有効sampleに対する平均二乗誤差。
+        r2: 教師平均を基準とした決定係数。
+        correlation: 予測と教師のPearson相関。
+    """
+
     loss: jnp.ndarray
     r2: jnp.ndarray
     correlation: jnp.ndarray
 
 
 class Metrics(NamedTuple):
+    """1回のPPO更新で集計する評価値。
+
+    Attributes:
+        loss: optimizerへ渡す合計loss。
+        policy_loss: clipped surrogate policy loss。
+        value_loss: clipを適用したvalue loss。
+        entropy: 有効slotで平均した方策entropy。
+        approx_kl: 旧方策からの近似KL divergence。
+        clip_fraction: 確率比がclip範囲を外れたslotの割合。
+        reference_actor_l2: 参照Actorからの相対parameter距離。
+    """
+
     loss: jnp.ndarray
     policy_loss: jnp.ndarray
     value_loss: jnp.ndarray
@@ -83,7 +146,17 @@ def create_critic_train_state(
     learning_rate: float,
     max_grad_norm: float,
 ):
-    """Actorを固定し、critic moduleだけを更新するTrainStateを作る。"""
+    """Actorを固定し、critic moduleだけを更新するTrainStateを作る。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        variables: 初期化またはcheckpointから復元したvariables。
+        learning_rate: critic用Adamのlearning rate。
+        max_grad_norm: gradient clippingのglobal norm上限。
+
+    Returns:
+        Actor parameterへゼロ勾配を適用するcritic専用TrainState。
+    """
     labels = jax.tree_util.tree_map_with_path(
         lambda path, _: "critic" if path[0].key in CRITIC_PARAMETER_MODULES else "actor",
         variables["params"],
@@ -102,6 +175,16 @@ def create_critic_train_state(
 
 
 def create_train_state(model: M.PolicyValueNet, variables: dict, config: PPOConfig):
+    """Actor・criticを共同更新するPPO用TrainStateを作る。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        variables: 初期化またはcheckpointから復元したvariables。
+        config: optimizer設定を含むPPOConfig。
+
+    Returns:
+        gradient clipping付きAdamWを持つTrainState。
+    """
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
@@ -128,6 +211,17 @@ def _critic_loss(model, params, batch: CriticBatch, turns_per_day: int):
 
 @partial(jax.jit, static_argnums=(0, 3))
 def update_critic_minibatch(model, train_state, batch: CriticBatch, turns_per_day: int):
+    """1 minibatchの勾配でcriticだけを更新する。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        train_state: Actorの更新を無効化したTrainState。
+        batch: critic教師を含むCriticBatch。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+
+    Returns:
+        更新後のTrainStateと平均二乗誤差。
+    """
     loss, gradients = jax.value_and_grad(_critic_loss, argnums=1)(
         model, train_state.params, batch, turns_per_day
     )
@@ -144,7 +238,23 @@ def update_critic_epochs(
     minibatch_size: int,
     turns_per_day: int,
 ):
-    """固定したMonte Carlo教師でcriticだけを複数epoch更新する。"""
+    """固定したMonte Carlo教師でcriticだけを複数epoch更新する。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        train_state: critic専用のTrainState。
+        batch: 全sampleを含むCriticBatch。
+        key: epochごとのshuffleに使うJAX乱数key。
+        num_epochs: 同じ教師を反復するepoch数。
+        minibatch_size: 1回の更新に使うsample数。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+
+    Returns:
+        更新後のTrainStateと全epochの平均loss。
+
+    Raises:
+        ValueError: sample数をminibatch_sizeで割り切れない場合。
+    """
     sample_count = batch.targets.shape[0]
     if sample_count % minibatch_size:
         raise ValueError("critic sample count must be divisible by minibatch_size")
@@ -310,6 +420,18 @@ def _loss(model, params, batch: PPOBatch, config: PPOConfig, reference_params=No
 
 @partial(jax.jit, static_argnums=(0, 3))
 def update_minibatch(model, train_state, batch, config, reference_params=None):
+    """1 minibatchのclipped PPO目的でparameterを更新する。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        train_state: 更新前のTrainState。
+        batch: 1 minibatch分のPPOBatch。
+        config: PPO目的関数とoptimizerの設定。
+        reference_params: L2拘束の基準とするActor parameter。Noneなら使用しない。
+
+    Returns:
+        更新後のTrainStateとMetrics。
+    """
     (_, metrics), gradients = jax.value_and_grad(_loss, argnums=1, has_aux=True)(
         model, train_state.params, batch, config, reference_params
     )
@@ -320,6 +442,24 @@ def update_minibatch(model, train_state, batch, config, reference_params=None):
 def update_epochs(
     model, train_state, batch, key, config, num_epochs, minibatch_size, reference_params=None
 ):
+    """PPO batchをshuffleし、target KLまで複数epoch更新する。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        train_state: 更新前のTrainState。
+        batch: 全sampleを含むPPOBatch。
+        key: epochごとのshuffleに使うJAX乱数key。
+        config: PPO設定。
+        num_epochs: 同じbatchを反復する最大epoch数。
+        minibatch_size: 1回のparameter更新に使うsample数。
+        reference_params: L2拘束の基準とするActor parameter。Noneなら使用しない。
+
+    Returns:
+        更新後のTrainStateと、実行したepochで平均したMetrics。
+
+    Raises:
+        ValueError: sample数をminibatch_sizeで割り切れない場合。
+    """
     sample_count = batch.players.shape[0]
     if sample_count % minibatch_size:
         raise ValueError("sample count must be divisible by minibatch_size")

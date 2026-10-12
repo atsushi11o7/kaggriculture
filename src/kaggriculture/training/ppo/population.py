@@ -1,4 +1,4 @@
-"""Opponent-pool persistence, selection, and evaluation reporting."""
+"""対戦相手poolの永続化・選択・評価結果の出力。"""
 
 import logging
 import shutil
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def list_pool_members(pool_dir: Path) -> list[Path]:
-    """Return pool member checkpoints in promotion order."""
+    """pool memberのcheckpointを昇格順に返す。"""
     if not pool_dir.exists():
         return []
     members = [
@@ -24,7 +24,7 @@ def list_pool_members(pool_dir: Path) -> list[Path]:
 
 
 def add_to_pool(pool_dir: Path, train_state, metadata: dict, pool_size: int) -> None:
-    """Add a promoted candidate and prune the oldest excess members."""
+    """昇格候補を追加し、上限を超えた最古のmemberを削除する。"""
     pool_dir.mkdir(parents=True, exist_ok=True)
     existing = list_pool_members(pool_dir)
     next_index = 0
@@ -38,7 +38,7 @@ def add_to_pool(pool_dir: Path, train_state, metadata: dict, pool_size: int) -> 
 
 
 def initialize_pool(pool_dir: Path, checkpoints: list[Path], pool_size: int) -> None:
-    """Populate an empty opponent pool from existing compatible checkpoints."""
+    """空の対戦相手poolを既存の互換checkpointで初期化する。"""
     if list_pool_members(pool_dir) or not checkpoints:
         return
     selected = checkpoints[-pool_size:] if pool_size > 0 else checkpoints
@@ -52,9 +52,9 @@ def initialize_pool(pool_dir: Path, checkpoints: list[Path], pool_size: int) -> 
 def select_opponent(
     draw: float, has_pool: bool, anchor_probability: float, pool_probability: float
 ) -> str:
-    """Select anchor, pool, or self from one uniform draw.
+    """1回の一様乱数からanchor・pool・selfのいずれかを選ぶ。
 
-    Pool probability is assigned to the stable anchor while the pool is empty.
+    poolが空の間は、poolの確率を固定anchorへ割り当てる。
     """
     if not 0 <= anchor_probability <= 1 or not 0 <= pool_probability <= 1:
         raise ValueError("opponent probabilities must be between 0 and 1")
@@ -69,7 +69,7 @@ def select_opponent(
 
 
 def evaluation_summary(result) -> dict[str, float | int]:
-    """Summarize candidate-relative outcomes, cash, and PASS rates."""
+    """候補視点の勝敗・所持金・PASS率を集計する。"""
     outcome = jax.device_get(result.outcome)
     cash = jax.device_get(result.cash)
     games_per_seat = outcome.shape[0] // 2
@@ -92,7 +92,7 @@ def evaluation_summary(result) -> dict[str, float | int]:
 
 
 def log_evaluation(update: int, opponent: str, result) -> dict[str, float | int]:
-    """Log and return one evaluation summary."""
+    """1回分の評価結果をログへ出力して返す。"""
     summary = evaluation_summary(result)
     logger.info(
         "update=%d eval_opponent=%s win_rate=%.3f wins=%d draws=%d losses=%d "
@@ -115,7 +115,7 @@ def log_evaluation(update: int, opponent: str, result) -> dict[str, float | int]
 
 
 def prune_step_checkpoints(directory: Path, keep_last: int) -> None:
-    """Prune old step checkpoints while retaining best and pool directories."""
+    """bestとpoolを残し、古いstep checkpointを削除する。"""
     if keep_last <= 0 or not directory.exists():
         return
     paths = sorted(
@@ -127,7 +127,7 @@ def prune_step_checkpoints(directory: Path, keep_last: int) -> None:
 
 
 def opponent_for_choice(choice: str, anchor: dict, learner: dict, pool: dict | None = None) -> dict:
-    """Return variables for an opponent class selected by :func:`select_opponent`."""
+    """:func:`select_opponent`が選んだ対戦相手区分のvariablesを返す。"""
     if choice == "anchor":
         return anchor
     if choice == "self":

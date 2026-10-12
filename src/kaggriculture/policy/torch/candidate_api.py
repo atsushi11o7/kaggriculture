@@ -126,5 +126,5 @@ def trace_expert_candidates(
 
 
 def normalize_expert_action(observation: dict, action: dict, **rules) -> dict:
-    """Normalize replay actions against the same candidates used by tracing."""
+    """traceと同じ候補に照らしてリプレイ行動を正規化する。"""
     return D.normalize_expert_action(observation, action, **rules)

@@ -95,6 +95,7 @@ _MOVE_DELTA = jnp.asarray(C.FARMER_OP_MOVE_DELTA, dtype=jnp.int32)
 
 
 def unit_fields(state: State, player: jnp.ndarray, unit: jnp.ndarray):
+    """farmerまたはhandの位置と持ち物を同じ形式で返す。"""
     is_farmer = unit == 0
     hand = jnp.maximum(unit - 1, 0)
     pos = jnp.where(is_farmer, state.farmer_pos[player], state.hands_pos[player, hand])

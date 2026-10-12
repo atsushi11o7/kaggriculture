@@ -177,21 +177,21 @@ def is_legal_unit_action(
     item_name: str | None,
     shed_capacity: int = 100,
 ) -> bool:
-    """Return whether an intent is executable in the current shadow state.
+    """intentが現在の仮状態で実行可能か返す。
 
     Args:
-        farm: Current farm shadow state.
-        shed: Current shed shadow state.
-        seeds: Current seed shadow state.
-        inventory: Inventory of the acting unit.
-        pos: Current unit position as (x, y).
-        day: Current day.
-        op_name: Farmer operation name.
-        item_name: Optional item selected by the operation.
-        shed_capacity: Shed capacity.
+        farm: 現在の農場の仮状態。
+        shed: 現在のshedの仮状態。
+        seeds: 現在の種の仮状態。
+        inventory: 行動するunitの持ち物。
+        pos: ``(x, y)``形式の現在位置。
+        day: 現在のday。
+        op_name: farmer行動名。
+        item_name: 行動が選択した任意の品目名。
+        shed_capacity: shed容量。
 
     Returns:
-        Whether the operation and item occur in the current legal candidates.
+        行動と品目の組が現在の合法候補に含まれるか。
     """
     item_index = V.entity_index(item_name) if item_name is not None else None
     selected = tuple(_candidate(farmer_op=op_name, item_index=item_index).index)

@@ -1,4 +1,4 @@
-"""Opening handoff states for PPO rollouts from displayed day 12."""
+"""表示day 12からPPO rolloutを始めるためのopening引継ぎ状態。"""
 
 from __future__ import annotations
 
@@ -18,14 +18,14 @@ from kaggriculture.training.rl import estimated_assets
 
 
 class StateBank(NamedTuple):
-    """Batched simulator state and observable history at one handoff step."""
+    """1つの引継ぎstepにおけるbatch化済みシミュレータ状態と観測可能な履歴。"""
 
     state: State
     counters: EpisodeCounters
 
 
 class RolloutStart(NamedTuple):
-    """A sampled batch ready to enter a PPO rollout."""
+    """PPO rolloutへ渡せるsample済みbatch。"""
 
     state: State
     counters: EpisodeCounters
@@ -41,11 +41,10 @@ def _stack_leaves(*values):
 
 
 def load_state_bank(path: str | Path) -> StateBank:
-    """Load handoff entries and stack them into one device-resident bank.
+    """引継ぎentryを読み込み、device上の1つのbankへstackする。
 
-    Legacy files containing only ``State`` remain readable. Their counters are
-    initialized to zero, so they should only be used for policies that do not
-    rely on episode-history features.
+    ``State``だけを含む旧形式も読み込める。そのcounterは0で初期化されるため、
+    エピソード履歴特徴に依存しない方策だけで使用する。
     """
     entries = []
     with open(path, "rb") as stream:
@@ -68,7 +67,7 @@ def load_state_bank(path: str | Path) -> StateBank:
 
 
 def make_bank_start_fn(bank: StateBank) -> Callable[..., RolloutStart]:
-    """Build a JIT-safe sampler returning matched state and history rows."""
+    """対応するstate・history行を返すJIT-safeなsamplerを構築する。"""
     bank_size = jax.tree.leaves(bank.state)[0].shape[0]
 
     def bank_start(key, batch_size, board_size=None, starting_money=None):

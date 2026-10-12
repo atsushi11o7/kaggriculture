@@ -1,4 +1,4 @@
-"""Checkpoint compatibility and parameter restoration for PPO-family tools."""
+"""PPO系toolのcheckpoint互換性検証とparameter復元。"""
 
 from pathlib import Path
 
@@ -26,24 +26,24 @@ _ACTOR_CONFIG_FIELDS = (
 
 
 def validate_critic_architecture(metadata: dict, path: Path) -> None:
-    """Validate that a checkpoint uses the current critic architecture."""
+    """checkpointが現在のcriticアーキテクチャを使っているか検証する。"""
     if metadata.get("critic_architecture_version") != critic_version():
         raise ValueError(f"incompatible critic architecture: {path}")
 
 
 def load_actor_checkpoint(path: Path, variables: dict, target_config: ModelConfig) -> dict:
-    """Restore compatible Actor parameters while retaining the target critic.
+    """対象criticを維持したまま、互換性のあるActor parameterを復元する。
 
     Args:
-        path: Checkpoint directory.
-        variables: Initialized target variables, including critic parameters.
-        target_config: Target model configuration.
+        path: checkpointディレクトリ。
+        variables: critic parameterを含む初期化済みの対象variables。
+        target_config: 対象モデル構成。
 
     Returns:
-        Variables containing the restored Actor and initialized target critic.
+        復元したActorと初期化済み対象criticを含むvariables。
 
     Raises:
-        ValueError: If Actor configuration, names, or shapes are incompatible.
+        ValueError: Actorの構成、名前、shapeに互換性がない場合。
     """
     metadata = read_checkpoint_metadata(path)
     validate_checkpoint_metadata(metadata)
@@ -82,7 +82,24 @@ def load_value_checkpoint(
     *,
     allow_reward_mismatch: bool = False,
 ) -> dict:
-    """Restore a compatible jointly trained Actor and critic checkpoint."""
+    """互換性のある共同学習済みActor・critic checkpointを復元する。
+
+    Args:
+        path: value pretrainingまたは共同BCのcheckpointディレクトリ。
+        variables: 復元先モデルの初期化済みvariables。
+        target_config: 復元先のモデル構成。
+        gamma: PPOで使用する割引率。
+        daily_reward_coefficient: PPOの日次報酬係数。
+        daily_reward_scale: PPOの日次報酬正規化尺度。
+        daily_reward_maximum: PPOの日次報酬上限。
+        allow_reward_mismatch: Trueなら教師報酬設定の不一致を許可する。
+
+    Returns:
+        checkpointから全parameterを復元したvariables。
+
+    Raises:
+        ValueError: trainer、critic、報酬、モデル構成、parameterに互換性がない場合。
+    """
     metadata = read_checkpoint_metadata(path)
     validate_checkpoint_metadata(metadata)
     is_value_checkpoint = metadata.get("trainer") == "value_pretrain" or (
@@ -126,7 +143,19 @@ def load_value_checkpoint(
 
 
 def load_policy_value_checkpoint(path: Path, variables: dict, target_config: ModelConfig) -> dict:
-    """Restore all Actor and critic parameters from a compatible checkpoint."""
+    """互換checkpointからActor・criticの全parameterを復元する。
+
+    Args:
+        path: 復元元のcheckpointディレクトリ。
+        variables: 復元先モデルの初期化済みvariables。
+        target_config: 復元先のモデル構成。
+
+    Returns:
+        checkpointから全parameterを復元したvariables。
+
+    Raises:
+        ValueError: critic version、モデル構成、parameter名・shapeに互換性がない場合。
+    """
     metadata = read_checkpoint_metadata(path)
     validate_checkpoint_metadata(metadata)
     validate_critic_architecture(metadata, path)
@@ -154,7 +183,21 @@ def load_initial_bc_checkpoint(
     *,
     allow_reward_mismatch: bool = False,
 ) -> dict:
-    """Load a BC Actor and preserve its jointly trained critic when available."""
+    """BC checkpointをPPOの初期Actor/Criticとして読み込む。
+
+    Args:
+        path: BC checkpointディレクトリ。
+        variables: PPOモデルの初期化済みvariables。
+        target_config: PPOモデル構成。
+        gamma: PPOで使用する割引率。
+        daily_reward_coefficient: PPOの日次報酬係数。
+        daily_reward_scale: PPOの日次報酬正規化尺度。
+        daily_reward_maximum: PPOの日次報酬上限。
+        allow_reward_mismatch: Trueなら共同学習criticの報酬設定不一致を許可する。
+
+    Returns:
+        共同value学習済みならActor・critic、そうでなければActorだけを復元したvariables。
+    """
     metadata = read_checkpoint_metadata(path)
     if metadata.get("trainer") == "bc" and metadata.get("joint_value_training") is True:
         return load_value_checkpoint(
@@ -171,7 +214,7 @@ def load_initial_bc_checkpoint(
 
 
 def load_opponent_variables(directory: Path, train_state) -> dict:
-    """Restore only model parameters for a fixed PPO opponent."""
+    """固定PPO対戦相手のモデルparameterだけを復元する。"""
     metadata = read_checkpoint_metadata(directory)
     return load_policy_value_checkpoint(
         directory,

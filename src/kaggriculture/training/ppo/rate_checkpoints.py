@@ -43,6 +43,7 @@ def _load(directory: Path) -> tuple[dict, ModelConfig, dict]:
 
 
 def main() -> None:
+    """指定checkpointを総当たり評価し、rating結果を保存する。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoints", nargs="+", type=Path, help="評価するcheckpointディレクトリ")
     parser.add_argument("--games-per-seat", type=int, default=32)

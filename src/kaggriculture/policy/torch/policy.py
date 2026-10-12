@@ -1,4 +1,4 @@
-"""CPU inference for the fixed-slot policy without a JAX dependency."""
+"""JAXに依存しない固定slot方策のCPU推論。"""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def _evaluation(net: PolicyValueNet):
 
 
 def _positions(obs: dict, device: torch.device):
-    """Return active positions and padded position tensors."""
+    """有効位置とpadding済み位置tensorを返す。"""
     player = obs["player"]
     farm = obs["farms"][player]
     positions_xy = [farm["farmer"], *farm["hands"]]
@@ -62,7 +62,7 @@ def _unit_masks(
     *,
     shed_capacity: int,
 ) -> list[list[bool]]:
-    """Build legal and strategic masks for all padded unit slots."""
+    """padding済みの全unit slotについて合法・戦略maskを作る。"""
     farm = obs["farms"][obs["player"]]
     masks = []
     for slot, (position, inventory) in enumerate(zip(positions, inventories, strict=True)):
@@ -102,23 +102,23 @@ def predict_action(
     board_size: int = 10,
     counters: dict | None = None,
 ) -> dict:
-    """Generate one simulator-compatible action with one Transformer forward pass.
+    """Transformerの1回のforwardでシミュレータ互換の行動を1つ生成する。
 
     Args:
-        net: Actor-only policy network.
-        obs: One Kaggriculture observation.
-        turns_per_day: Number of turns in one game day.
-        shed_capacity: Maximum total shed inventory.
-        hire_mult: Multiplier applied to hand hiring costs.
-        episode_steps: Number of steps in one game.
-        board_size: Width and height of the square board.
-        counters: Episode-history counters.
+        net: Actor専用の方策network。
+        obs: Kaggricultureの1観測。
+        turns_per_day: ゲーム内の1日あたりのturn数。
+        shed_capacity: shed在庫の最大合計数。
+        hire_mult: hand雇用費へ掛ける倍率。
+        episode_steps: 1試合のstep数。
+        board_size: 正方形盤面の一辺の長さ。
+        counters: エピソード履歴のcounter。
 
     Returns:
-        A simulator-compatible action dictionary.
+        シミュレータ互換の行動辞書。
 
     Raises:
-        ValueError: If the network contains training-only critic parameters.
+        ValueError: networkが学習時専用のcritic parameterを含む場合。
     """
     if not net.actor_only:
         raise ValueError("submission inference requires an actor-only model")

@@ -28,6 +28,30 @@ from kaggriculture.training.rl import DailyRewardConfig, daily_asset_rewards, es
 
 @dataclass(frozen=True)
 class RolloutConfig:
+    """rollout収集の設定。
+
+    Attributes:
+        horizon: 1回のrolloutで進めるstep数。
+        board_size: 正方形盤面の一辺の長さ。
+        turns_per_day: ゲーム内の1日あたりのturn数。
+        shed_capacity: shed在庫の最大合計数。
+        weed_chance: 各stepの雑草発生確率。
+        shop_unlock_interval: shopを解放するday間隔。
+        shop_sell_interval: shopの需要を更新するday間隔。
+        center_sell_interval: 中央市場の需要を更新するstep間隔。
+        hire_mult: hand雇用費へ掛ける倍率。
+        max_shop_instances: 同時に存在できるshop数。
+        episode_steps: 1試合の総step数。
+        start_step: rollout開始状態に共通するstep番号。
+        starting_money: 通常reset時の初期所持金。
+        temperature: 行動sampleに使う方策温度。
+        daily_reward_coefficient: 日次資産差報酬の係数。
+        daily_reward_scale: 日次資産差を正規化する尺度。
+        daily_reward_maximum: 日次報酬の絶対値上限。
+        reset_fn: 通常の新局を生成する関数。
+        start_fn: 任意の途中状態を返すopening handoff sampler。
+    """
+
     horizon: int = 128
     board_size: int = 10
     turns_per_day: int = 24
@@ -55,7 +79,7 @@ class RolloutConfig:
 
 
 def initial_rollout_start(key, batch_size: int, config: RolloutConfig):
-    """Create a matched state/history/margin tuple for a rollout."""
+    """rollout用に対応の取れたstate・history・marginを作る。"""
     if config.start_fn is not None:
         return config.start_fn(
             key,
@@ -75,6 +99,28 @@ def initial_rollout_start(key, batch_size: int, config: RolloutConfig):
 
 
 class Rollout(NamedTuple):
+    """時間軸を保ったPPO rollout。
+
+    Attributes:
+        states: 各行動を生成する直前の状態。
+        intent: 方策がsampleした固定slotの候補index。
+        slot_mask: PPO policy lossへ使用するslot。
+        slot_log_prob: rollout時のslot別log probability。
+        value: rollout時のvalue予測。
+        rewards: terminal報酬と日次報酬の合計。
+        daily_rewards: 日次資産差だけから作った報酬。
+        dones: 各環境が終端へ到達したか。
+        counters: 行動前の観測可能な累積実績。
+        executor_invalid: Executorが無効化した全slot数。
+        executor_clamped: Executorが数量を制限した全slot数。
+        executor_invalid_unit: Executorが無効化したunit slot数。
+        executor_clamped_unit: Executorが数量を制限したunit slot数。
+        final_state: scan終了後の状態。
+        final_counters: scan終了後の累積実績。
+        final_margin: scan終了後の資産差。
+        bootstrap_value: final_stateに対するvalue予測。
+    """
+
     states: State
     intent: Intent
     slot_mask: jnp.ndarray
@@ -115,7 +161,20 @@ def _step(state, action, config):
 def collect_rollout(
     model, variables, config, initial_state, initial_counters, key, initial_margin=None
 ):
-    """1回の方策forwardを含む環境stepを時間軸scanする。"""
+    """方策生成と環境遷移を時間軸方向にscanする。
+
+    Args:
+        model: self-playするFlax Actor/Critic。
+        variables: 両playerが共有するモデルvariables。
+        config: rolloutとシミュレータの設定。
+        initial_state: scan開始時のState。
+        initial_counters: scan開始時のEpisodeCounters。
+        key: 各stepの行動sampleとresetに使うJAX乱数key。
+        initial_margin: 開始時のplayer 0視点資産差。Noneなら状態から計算する。
+
+    Returns:
+        時間軸を保ったRollout。
+    """
     batch_size = initial_state.step.shape[0]
     if initial_margin is None:
         assets = estimated_assets(initial_state)
@@ -335,6 +394,16 @@ def collect_rollout_vs_opponent(
 
 
 def to_ppo_batch(rollout: Rollout, gamma=0.999, gae_lambda=0.95):
+    """rolloutからGAEを計算し、PPO更新用のsample軸へ平坦化する。
+
+    Args:
+        rollout: 時間軸を保ったRollout。
+        gamma: 将来報酬の割引率。
+        gae_lambda: GAEのbias・varianceを調整する係数。
+
+    Returns:
+        ``[time, env, player]``を1次元sample軸へ変換したPPOBatch。
+    """
     advantages, returns = compute_gae(
         rollout.rewards, rollout.value, rollout.dones, rollout.bootstrap_value, gamma, gae_lambda
     )

@@ -1,1 +1,1 @@
-"""Behavior cloning for the fixed-slot policy."""
+"""固定slot方策のBehavior Cloning。"""
