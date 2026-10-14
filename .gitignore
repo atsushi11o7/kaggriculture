@@ -11,6 +11,8 @@ outputs/
 results/
 docs/*
 !docs/game-overview.md
+!docs/writeup_images/
+!docs/writeup_images/*
 logs/
 
 *.tar.gz
