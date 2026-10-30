@@ -68,8 +68,9 @@ shadow state更新・決定順を使います。方策内部のgeneratorや状�
 `temperature=0`はgreedy、正値は候補スコアからサンプリングします。既定値は少量の探索を
 入れる`0.15`です。
 
-同一GBDT同士だけの対局は分布が狭くなります。本格運用では、元の強いルールベース方策や
-異なるGBDT checkpointも相手へ混ぜ、生成データのclosed-loop成績を確認してください。
+同一GBDT同士だけの対局は分布が狭くなります。本格運用では、他の強い方策(ヒューリスティックや
+過去のBC/PPO checkpointなど)や異なるGBDT checkpointも相手へ混ぜ、生成データのclosed-loop成績を
+確認してください。
 
 ## 3. 既存BCへ渡す
 

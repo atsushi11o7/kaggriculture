@@ -1,6 +1,6 @@
 # kaggriculture.policy
 
-V3方策は、公開状態を1回だけ符号化し、unitと市場注文の全35 slotを並列生成します。
+この方策は、公開状態を1回だけ符号化し、unitと市場注文の全35 slotを並列生成します。
 JAX学習版とTorch提出版は同じ構造・mask・Executor規則を持ちます。
 
 ## 構造
@@ -108,5 +108,5 @@ uv run python -m kaggriculture.training.export_policy \
   /path/to/checkpoint /path/to/model_weights.pt
 ```
 
-モデル構造は`training/conf/model/default.yaml`の一種類だけです。V2 checkpointとは互換性がなく、
-architecture versionで早期に拒否します。
+モデル構造は`training/conf/model/default.yaml`の一種類だけです。checkpointにはarchitecture versionを
+記録してあり、構造と合わないcheckpointを読み込もうとした場合は早期に拒否します。
