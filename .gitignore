@@ -13,6 +13,8 @@ docs/*
 !docs/game-overview.md
 !docs/writeup_images/
 !docs/writeup_images/*
+!docs/writeup.md
+!docs/writeup_ja.md
 logs/
 
 *.tar.gz
