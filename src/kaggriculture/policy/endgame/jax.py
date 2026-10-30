@@ -1,4 +1,4 @@
-"""JAX endgame action overrides for GPU rollout."""
+"""GPU rollout用のJAX終盤行動override。"""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def apply(
     episode_steps: int = 720,
     board_size: int = 10,
 ) -> tuple[Action, jnp.ndarray, jnp.ndarray]:
-    """Apply endgame overrides and return overridden unit/market slot masks."""
+    """終盤overrideを適用し、変更したunit・市場slotのmaskを返す。"""
     positions = jnp.concatenate([state.farmer_pos[player][None], state.hands_pos[player]], axis=0)
     inventories = jnp.concatenate(
         [state.farmer_inventory[player][None], state.hands_inventory[player]], axis=0

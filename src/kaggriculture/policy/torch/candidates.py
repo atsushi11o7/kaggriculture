@@ -1,4 +1,4 @@
-"""Fixed action vocabularies shared by Torch inference and execution."""
+"""Torch推論と実行で共有する固定行動語彙。"""
 
 from kaggriculture.policy.common import action_schema as S
 from kaggriculture.policy.common import vocab as V
@@ -36,12 +36,12 @@ QUANTITY_VECTORS = actions.quantity_candidates(V.MAX_ACTION_QUANTITY)
 
 
 def key(vector: V.SparseVector) -> tuple[int, ...]:
-    """Return the stable identity used to compare sparse candidates."""
+    """疎候補の比較に使う安定した識別子を返す。"""
     return tuple(vector.index)
 
 
 def item_name(op: int, arg: int, *, market: bool) -> str | None:
-    """Convert fixed candidate metadata to the simulator item name."""
+    """固定候補のmetadataをシミュレータ上の品目名へ変換する。"""
     if arg < 0:
         return None
     if market and op == C.MARKET_OP_BUY_ANIMAL:

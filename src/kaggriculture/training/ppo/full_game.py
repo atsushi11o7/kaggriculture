@@ -55,7 +55,16 @@ class CompactGame(NamedTuple):
 
 
 def initial_state(reset_key, batch_size: int, config: RolloutConfig):
-    """回収と再生成で同じ状態・履歴・資産差を作る。"""
+    """収集時と再生成時で共通する開始状態を作る。
+
+    Args:
+        reset_key: 通常resetまたはstate bank sampleに使うJAX乱数key。
+        batch_size: 生成する環境数。
+        config: resetまたはopening handoffの設定。
+
+    Returns:
+        対応の取れたState、EpisodeCounters、player 0視点の資産差。
+    """
     return initial_rollout_start(reset_key, batch_size, config)
 
 
@@ -70,7 +79,21 @@ def collect_compact_game(
     reset_key,
     run_key,
 ) -> CompactGame:
-    """全環境を初期状態から最後まで回し、状態を保存せずに行動と統計だけを返す。"""
+    """全環境を終端まで進め、再生成に必要な行動と統計だけを保持する。
+
+    Args:
+        model: learnerと対戦相手が共有するFlax Actor/Critic。
+        learner_variables: 更新対象方策のvariables。
+        opponent_variables: 固定対戦相手のvariables。
+        learner_seat: learnerを配置するplayer index。
+        config: rolloutとシミュレータの設定。
+        batch_size: 並列対局数。
+        reset_key: 開始状態の生成に使うJAX乱数key。
+        run_key: 各stepの行動sampleに使うJAX乱数key。
+
+    Returns:
+        状態を除き、行動・旧方策統計・報酬・終端所持金を持つCompactGame。
+    """
     opponent_seat = 1 - learner_seat
     state, counters, margin = initial_state(reset_key, batch_size, config)
     daily_config = DailyRewardConfig(
@@ -174,7 +197,17 @@ def segment_bounds(steps: int, length: int) -> list[tuple[int, int]]:
 
 @partial(jax.jit, static_argnums=(0,))
 def replay_segment(config: RolloutConfig, state, counters, actions: Action):
-    """Replay actions and regenerate pre-action states and observable history."""
+    """行動を再生し、行動前の状態と観測可能な履歴を再生成する。
+
+    Args:
+        config: rolloutとシミュレータの設定。
+        state: 区間先頭のState。
+        counters: 区間先頭のEpisodeCounters。
+        actions: 時間軸を持つ再生対象Action。
+
+    Returns:
+        区間末尾のstate・countersと、各行動直前のstate・counters。
+    """
 
     def step(carry, action):
         state, counters = carry
@@ -204,7 +237,22 @@ def segment_gradient(
     learner_seat: int,
     permutation_key,
 ):
-    """Accumulate sample-weighted gradients without dropping a partial minibatch."""
+    """1区間のPPO勾配を端数sampleも含めて計算する。
+
+    Args:
+        model: 学習するFlax Actor/Critic。
+        params: 勾配を計算する現在のparameter。
+        reference_params: ActorのL2拘束に使う参照parameter。
+        states: 区間内の各行動直前にあるState。
+        rows: intent、旧方策統計、advantage、returnを持つ辞書。
+        ppo_config: PPO目的関数の設定。
+        minibatch: 1回の勾配計算に使うsample数。
+        learner_seat: 固定対戦時にlossへ含めるplayer index。
+        permutation_key: sampleのshuffleに使うJAX乱数key。
+
+    Returns:
+        実sample数で重み付けした勾配和、指標和、sample数。
+    """
     steps, batch = rows["slot_mask"].shape[:2]
     total = steps * batch
 

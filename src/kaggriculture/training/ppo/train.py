@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_training_config(cfg) -> None:
-    """Validate relationships between PPO batch and warm-up settings."""
+    """PPO batchとwarm-up設定の整合性を検証する。"""
     if cfg.ppo.critic_warmup_updates < 0:
         raise ValueError("critic_warmup_updates must be nonnegative")
     if cfg.ppo.critic_warmup_updates > 0:
@@ -82,7 +82,7 @@ def _validate_training_config(cfg) -> None:
 
 
 def _checkpoint_metadata(cfg, model_config, reference_path: Path, **progress) -> dict:
-    """Build metadata shared by warm-up and PPO checkpoints."""
+    """warm-upとPPO checkpointで共有するmetadataを作る。"""
     return {
         **checkpoint_shape_metadata(),
         "trainer": "ppo",
@@ -95,7 +95,7 @@ def _checkpoint_metadata(cfg, model_config, reference_path: Path, **progress) ->
 
 
 def _save_runtime(directory: Path, key, state, counters, daily_margin) -> None:
-    """Save the environment state needed for an exact training resume."""
+    """学習を厳密に再開するために必要な環境状態を保存する。"""
     save_pytree(
         directory / "runtime.msgpack",
         {"key": key, "state": state, "counters": counters, "daily_margin": daily_margin},
@@ -142,6 +142,7 @@ def _rollout_config(cfg, bank_path=None):
 
 @hydra.main(version_base=None, config_path="../conf", config_name="ppo")
 def main(cfg: DictConfig) -> None:
+    """Hydra設定からPPO学習、評価、checkpoint保存を実行する。"""
     _validate_training_config(cfg)
     samples = cfg.env.batch_size * cfg.ppo.rollout_horizon * 2
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))

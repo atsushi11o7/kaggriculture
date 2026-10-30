@@ -1,4 +1,4 @@
-"""CPU endgame action overrides for submission inference."""
+"""提出時のCPU推論に使う終盤行動override。"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def apply(
     turns_per_day: int = 24,
     board_size: int = 10,
 ) -> dict:
-    """Apply forced cargo return and final shed liquidation to one action."""
+    """1つの行動へ強制帰還と最終shed売却を適用する。"""
     step = observation["day"] * turns_per_day + observation["hour"]
     last_step = episode_steps - 2
     remaining = last_step - step + 1

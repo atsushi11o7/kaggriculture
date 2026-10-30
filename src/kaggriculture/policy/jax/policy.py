@@ -148,7 +148,24 @@ def sample_actions(
     shed_capacity: int = 100,
     hire_mult: float = 1.0,
 ) -> PolicyOutput:
-    """全slotを1回のTransformer計算で共同生成する。"""
+    """全slotを1回のTransformer計算で共同生成する。
+
+    Args:
+        model: 評価するFlax Actor/Critic。
+        variables: モデルparameterを含むvariables。
+        states: batch化されたシミュレータ状態。
+        players: 各状態で行動するplayer index。
+        key: categorical sampleに使うJAX乱数key。
+        counters: 各playerの観測可能な累積実績。
+        temperature: logitを割るsampling温度。
+        greedy: Trueならsampleせず最大logitを選ぶ。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+        shed_capacity: 合法手判定に使うshed容量。
+        hire_mult: hand雇用費へ掛ける倍率。
+
+    Returns:
+        intent、解決済みAction、方策統計、value、Executor統計を持つPolicyOutput。
+    """
     value, unit_hidden, market_hidden, unit_logits, market_logits, unit_active, _, _ = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
@@ -245,7 +262,22 @@ def evaluate_intent(
     turns_per_day: int = 24,
     shed_capacity: int = 100,
 ) -> EvaluationOutput:
-    """保存したintentを一括再評価する。PPO用の逐次traceは不要。"""
+    """保存したintentを現在の方策で一括再評価する。
+
+    Args:
+        model: 評価するFlax Actor/Critic。
+        variables: 現在のモデルparameterを含むvariables。
+        states: intentを生成した直前の状態。
+        players: 各状態でintentを生成したplayer index。
+        intent: BC教師またはrollout時に保存した固定slotの候補index。
+        counters: 各playerの観測可能な累積実績。
+        temperature: logitを割る方策温度。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+        shed_capacity: 合法手判定に使うshed容量。
+
+    Returns:
+        slot別log probability、mask、entropy、valueを持つEvaluationOutput。
+    """
     value, uh, mh, ul, ml, active, unit_mask, market_mask = _logits(
         model, variables, states, players, counters, turns_per_day, shed_capacity
     )
@@ -326,7 +358,19 @@ def evaluate_intent(
 
 
 def sample_self_play_actions(model, variables, states, key, counters=None, **kwargs):
-    """両プレイヤーを同じ大batchとして一括生成する。"""
+    """両playerを同じ大batchとして一括生成する。
+
+    Args:
+        model: 評価するFlax Actor/Critic。
+        variables: モデルparameterを含むvariables。
+        states: 環境batchのシミュレータ状態。
+        key: categorical sampleに使うJAX乱数key。
+        counters: ``[env, player, ...]``形の累積実績。
+        **kwargs: :func:`sample_actions`へ渡す方策・環境設定。
+
+    Returns:
+        player軸を``[env, player, ...]``へ戻したPolicyOutput。
+    """
     batch = states.step.shape[0]
     doubled = jax.tree.map(lambda x: jnp.concatenate([x, x]), states)
     players = jnp.concatenate([jnp.zeros(batch, jnp.int32), jnp.ones(batch, jnp.int32)])
@@ -353,7 +397,18 @@ def sample_self_play_actions(model, variables, states, key, counters=None, **kwa
 
 
 def state_values(model, variables, states, counters=None, turns_per_day=24):
-    """batch内の両プレイヤー価値を返す。"""
+    """batch内の両playerについてvalueを一括計算する。
+
+    Args:
+        model: 評価するFlax Actor/Critic。
+        variables: モデルparameterを含むvariables。
+        states: 環境batchのシミュレータ状態。
+        counters: ``[env, player, ...]``形の累積実績。
+        turns_per_day: 観測token化に使う1日あたりのturn数。
+
+    Returns:
+        形状``[env, player]``のvalue予測。
+    """
     batch = states.step.shape[0]
     doubled = jax.tree.map(lambda x: jnp.concatenate([x, x]), states)
     players = jnp.concatenate([jnp.zeros(batch, jnp.int32), jnp.ones(batch, jnp.int32)])

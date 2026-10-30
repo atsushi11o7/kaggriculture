@@ -11,7 +11,8 @@ uv run python -m kaggriculture.training.bc.train
 Transformer・損失・更新をJAX/GPUで処理します。
 
 ```bash
-# 選別manifest
+# 選別manifest(data.selection_dirは、training.replay_curation.selectで
+# 自分が作った選別結果のディレクトリ名に置き換える。broad_winnersは一例)
 uv run python -m kaggriculture.training.bc.train \
   data.selection_dir=data/training_sets/broad_winners
 

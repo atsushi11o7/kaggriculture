@@ -1,1 +1,1 @@
-"""PPO training for the fixed-slot policy."""
+"""固定slot方策のPPO学習。"""

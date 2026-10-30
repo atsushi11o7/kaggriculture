@@ -1,4 +1,4 @@
-"""JAX training backend for the fixed-slot policy."""
+"""固定slot方策を学習するJAX backend。"""
 
 from .model import PolicyValueNet
 from .policy import evaluate_intent, sample_actions, sample_self_play_actions, state_values

@@ -1,4 +1,4 @@
-"""Resolve fixed-slot Torch intents against sequential simulator constraints."""
+"""固定slotのTorch intentをシミュレータの逐次制約に従って解決する。"""
 
 from kaggriculture.policy.torch import actions as A
 from kaggriculture.policy.torch import candidates as K
@@ -7,7 +7,7 @@ from kaggriculture.rules import constants as C
 
 
 def copy_environment(obs: dict) -> tuple[dict, dict, dict, dict, list[dict]]:
-    """Copy the mutable observation fields used for sequential resolution."""
+    """逐次解決で変更する観測fieldをコピーする。"""
     player = obs["player"]
     source = obs["farms"][player]
     farm = {
@@ -48,7 +48,7 @@ def unit_quantity_upper_bound(
     inventory: dict,
     farm: dict,
 ) -> int:
-    """Return the Torch scoring bound corresponding to the JAX unit mask."""
+    """JAXのunit maskに対応するTorch採点上限を返す。"""
     item = K.item_name(op, arg, market=False)
     tile = farm["tiles"][position[1]][position[0]]
     if op == C.FARMER_OP_PLACE and not A.is_animal_placement(item, tile):
@@ -68,7 +68,7 @@ def execute_units(
     turns_per_day: int,
     shed_capacity: int,
 ) -> list[list]:
-    """Resolve selected unit intents in simulator order."""
+    """選択済みunit intentをシミュレータの順序で解決する。"""
     unit_ops = [K.UNIT_META[choice] for choice in selected_units[: len(positions)]]
     plant_counts = {crop: 0 for crop in C.CROPS}
     for op, arg in unit_ops:
@@ -119,7 +119,7 @@ def execute_market(
     shed_capacity: int,
     hire_mult: float,
 ) -> list[list]:
-    """Resolve market intents until STOP while updating the market shadow state."""
+    """市場の仮状態を更新しながら、STOPまで市場intentを解決する。"""
     entries: list[list] = []
     for offset, choice in enumerate(selected_market):
         op, arg = K.MARKET_META[choice]
@@ -161,7 +161,20 @@ def resolve_action(
     shed_capacity: int,
     hire_mult: float,
 ) -> dict:
-    """Convert fixed-slot choices to one simulator-compatible action dictionary."""
+    """固定slotの選択をシミュレータ互換の行動辞書へ変換する。
+
+    Args:
+        obs: 1 player視点のKaggriculture観測。
+        selected_units: farmer・hand slotごとのunit候補index。
+        selected_market: 市場slotごとの市場候補index。
+        selected_quantities: unit slotに続けて市場slotを並べた数量候補index。
+        turns_per_day: ゲーム内の1日あたりのturn数。
+        shed_capacity: shed在庫の最大合計数。
+        hire_mult: hand雇用費へ掛ける倍率。
+
+    Returns:
+        逐次制約を解決したKaggle形式の行動辞書。
+    """
     player = obs["player"]
     farm_view = obs["farms"][player]
     positions = [farm_view["farmer"], *farm_view["hands"]]

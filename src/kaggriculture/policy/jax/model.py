@@ -187,21 +187,21 @@ class PolicyValueNet(nn.Module):
         return queries, self.value_head(value_input)[:, 0]
 
     def unit_logits(self, hidden, mask):
-        """Score the fixed unit action vocabulary."""
+        """unit行動の固定語彙を採点する。"""
         return jnp.where(mask, self.unit_head(hidden), -1e9)
 
     def market_logits(self, hidden, mask):
-        """Score the fixed market action vocabulary."""
+        """市場行動の固定語彙を採点する。"""
         return jnp.where(mask, self.market_head(hidden), -1e9)
 
     def unit_quantity_logits(self, hidden, action, mask):
-        """Score quantities conditioned on a selected unit action."""
+        """選択済みunit行動を条件として数量を採点する。"""
         selected = self.unit_action_embedding(action)
         hidden = self.unit_quantity_condition(jnp.concatenate([hidden, selected], -1))
         return jnp.where(mask, self.quantity_head(hidden), -1e9)
 
     def market_quantity_logits(self, hidden, action, mask):
-        """Score quantities conditioned on a selected market action."""
+        """選択済み市場行動を条件として数量を採点する。"""
         selected = self.market_action_embedding(action)
         hidden = self.market_quantity_condition(jnp.concatenate([hidden, selected], -1))
         return jnp.where(mask, self.quantity_head(hidden), -1e9)

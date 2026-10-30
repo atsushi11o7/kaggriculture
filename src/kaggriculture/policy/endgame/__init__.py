@@ -1,1 +1,1 @@
-"""Deterministic endgame constraints shared by training and submission."""
+"""学習と提出で共有する決定論的な終盤制約。"""

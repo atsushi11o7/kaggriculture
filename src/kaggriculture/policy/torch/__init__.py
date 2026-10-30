@@ -1,4 +1,4 @@
-"""CPU submission backend and replay candidate utilities."""
+"""提出用CPU backendとリプレイ候補処理。"""
 
 from .model import PolicyValueNet
 from .policy import predict_action

@@ -11,10 +11,16 @@ outputs/
 results/
 docs/*
 !docs/game-overview.md
+!docs/writeup_images/
+!docs/writeup_images/*
+!docs/writeup.md
+!docs/writeup_ja.md
 logs/
 
 *.tar.gz
-submission/
+submission/*
+!submission/build_submission.sh
+!submission/main.py
 nohup.out
 
 .claude/

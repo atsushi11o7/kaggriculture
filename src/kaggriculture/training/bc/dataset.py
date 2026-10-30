@@ -23,6 +23,17 @@ from kaggriculture.training.value_pretrain.dataset import episode_from_data
 
 
 class BCBatch(NamedTuple):
+    """固定shapeへまとめたBCの入力と教師。
+
+    Attributes:
+        states: 各教師行動の直前にあるシミュレータ状態。
+        players: 各状態で教師対象となるplayer index。
+        intent: 固定slotへ変換した教師行動。
+        slot_mask: policy lossへ使用するslot。
+        value_target: critic共同学習用の教師return。
+        counters: 各状態までの観測可能な累積実績。
+    """
+
     states: State
     players: np.ndarray
     intent: Intent
@@ -33,6 +44,14 @@ class BCBatch(NamedTuple):
 
 @dataclass
 class BuildStats:
+    """dataset変換の集計。
+
+    Attributes:
+        accepted: 学習sampleへ採用した状態数。
+        discarded: 変換できず除外した状態数。
+        reasons: 除外理由ごとの件数。
+    """
+
     accepted: int = 0
     discarded: int = 0
     reasons: Counter[str] = field(default_factory=Counter)

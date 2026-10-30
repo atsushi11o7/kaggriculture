@@ -13,10 +13,11 @@
 PPOで自己対戦学習し、最後にActorだけをPyTorchへ変換する流れです。
 
 ```bash
-# 学習用リプレイmanifestを作る
+# 学習用リプレイmanifestを作る(出力先のディレクトリ名は自分で選ぶ)
 uv run python -m kaggriculture.training.replay_curation.select
 
-# Behavior Cloning
+# Behavior Cloning(data.selection_dirは上で作った選別結果のディレクトリ名。
+# broad_winnersは一例で、実在するパスではない)
 uv run python -m kaggriculture.training.bc.train \
   data.selection_dir=data/training_sets/broad_winners
 

@@ -68,7 +68,7 @@ def _sources(cfg):
 
 
 def _steps_per_epoch(paths, batch_size: int) -> int:
-    """Return the number of complete training batches in one epoch."""
+    """1 epochに含まれる完全な学習batch数を返す。"""
     total = 0
     for path in paths:
         stats = json.loads(path.with_suffix(".stats.json").read_text(encoding="utf-8"))
@@ -77,18 +77,18 @@ def _steps_per_epoch(paths, batch_size: int) -> int:
 
 
 def _schedule_steps(steps_per_epoch: int, max_epochs: int, max_steps: int) -> int:
-    """Return the configured number of optimizer updates.
+    """設定されたoptimizer更新回数を返す。
 
     Args:
-        steps_per_epoch: Number of complete batches in one epoch.
-        max_epochs: Maximum number of passes over the dataset.
-        max_steps: Positive global update limit, or a non-positive value for no limit.
+        steps_per_epoch: 1 epochに含まれる完全なbatch数。
+        max_epochs: datasetを周回する最大回数。
+        max_steps: 正なら全体の更新上限、0以下なら上限なし。
 
     Returns:
-        Number of updates covered by the learning-rate schedule.
+        learning rate scheduleが対象とする更新回数。
 
     Raises:
-        ValueError: If the dataset cannot produce a complete batch.
+        ValueError: datasetから完全なbatchを作れない場合。
     """
     if steps_per_epoch <= 0:
         raise ValueError("training data must contain at least one complete batch")
@@ -190,6 +190,7 @@ def _validate(model, params, paths, cfg, bc_config):
 
 @hydra.main(version_base=None, config_path="../conf", config_name="bc")
 def main(cfg: DictConfig) -> None:
+    """Hydra設定からdatasetを準備し、BC学習を実行する。"""
     model_config = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
     joint_value_training = cfg.train.value_loss_coefficient > 0
     if cfg.train.value_gamma <= 0 or cfg.train.value_gamma > 1:

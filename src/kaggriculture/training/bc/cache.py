@@ -105,6 +105,7 @@ def prepare_episodes(sources, directory: Path, rules: CacheRules, reward: dict |
 
 
 def load_shard(path: Path) -> BCBatch:
+    """保存済みのepisode shardをBC batchとして読み込む。"""
     with np.load(path, allow_pickle=False) as data:
         states = State(*(data[f"{_STATE_PREFIX}{name}"] for name in State._fields))
         intent = Intent(*(data[f"{_INTENT_PREFIX}{name}"] for name in Intent._fields))

@@ -1,4 +1,4 @@
-"""Model-independent sequential candidate generation for replay and GBDT data."""
+"""リプレイとGBDTデータ向けのモデル非依存な逐次候補生成。"""
 
 from __future__ import annotations
 

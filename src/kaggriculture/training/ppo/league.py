@@ -120,6 +120,7 @@ def _load_all(specs: list[str]):
 
 
 def main() -> None:
+    """CLI引数の候補と対戦相手を固定seed・両座席で評価する。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", action="append", required=True, help="label=ppo|bc:PATH")
     parser.add_argument("--opponent", action="append", required=True, help="label=ppo|bc:PATH")

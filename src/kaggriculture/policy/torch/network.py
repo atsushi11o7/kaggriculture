@@ -1,4 +1,4 @@
-"""Shared embedding and Encoder components for the CPU policy backend."""
+"""CPU方策backendで共有する埋め込みとEncoder。"""
 
 import torch
 import torch.nn as nn
@@ -111,13 +111,13 @@ class Encoder(nn.Module):
         return self.forward_embedded(embedded)
 
     def forward_embedded(self, embedded: torch.Tensor) -> torch.Tensor:
-        """Encode an already embedded fixed-width observation.
+        """埋め込み済みの固定幅観測を符号化する。
 
         Args:
-            embedded: Tensor with shape ``(batch, tokens, d_model)``.
+            embedded: 形状``(batch, tokens, d_model)``のtensor。
 
         Returns:
-            Encoder output including the CLS token.
+            CLS tokenを含むEncoder出力。
         """
         batch_size = embedded.size(0)
         cls = self.cls_token.expand(batch_size, 1, -1)

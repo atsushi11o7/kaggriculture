@@ -24,6 +24,7 @@ class EpisodeCounters(NamedTuple):
 
     @classmethod
     def zeros(cls) -> "EpisodeCounters":
+        """1プレイヤー分を0で初期化した累積実績を返す。"""
         values = jnp.zeros((C.N_PRODUCTS,), dtype=jnp.float32)
         return cls(values, values, values, values, jnp.zeros((C.N_PRODUCTS,), dtype=bool))
 

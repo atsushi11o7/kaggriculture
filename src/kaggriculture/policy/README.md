@@ -1,6 +1,6 @@
 # kaggriculture.policy
 
-V3方策は、公開状態を1回だけ符号化し、unitと市場注文の全35 slotを並列生成します。
+この方策は、公開状態を1回だけ符号化し、unitと市場注文の全35 slotを並列生成します。
 JAX学習版とTorch提出版は同じ構造・mask・Executor規則を持ちます。
 
 ## 構造
@@ -81,11 +81,13 @@ JAX/Torch共通条件で候補から除外します。即時作業に使えるHI
 
 ## 序盤コントローラの境界
 
-序盤をルールで固定する場合は、`policy/opening/`をActorの上位に置きます。ルールがactionを返す局面では
-それを使い、それ以外は既存Actorへ委譲します。Torch提出推論だけへ埋め込むとJAX rolloutと挙動がずれるため、
-判定仕様を共通化し、JAX学習とTorch提出の両方から同じ境界で呼び出します。
+`policy/opening/land_rule.py`は、Actorを置き換える序盤方策ではなく、Actorの出力後にBUY_LANDを
+補う反応的な安全網です。トップ層のリプレイから求めたraw dayの最頻購入日を期限とし、未購入の土地と
+価格に運転資金を加えた所持金を確認します。期限時点で購入できなければ、それ以降のターンでも再試行します。
 
-序盤ルールを導入するまではディレクトリや抽象クラスを先に作らず、現在のActor APIを維持します。
+Torch提出推論では、Actorの市場注文にBUY_LANDが無い場合に先頭へ挿入します。JAXでは、opening
+handoff用のstate bankを生成するときに、同じ購入日・価格・運転資金を使うベクトル化した処理を適用します。
+PPO rolloutは生成済みのhandoff状態から始まるため、rollout中にこのルールを再実行しません。
 
 ## API
 
@@ -106,5 +108,5 @@ uv run python -m kaggriculture.training.export_policy \
   /path/to/checkpoint /path/to/model_weights.pt
 ```
 
-モデル構造は`training/conf/model/default.yaml`の一種類だけです。V2 checkpointとは互換性がなく、
-architecture versionで早期に拒否します。
+モデル構造は`training/conf/model/default.yaml`の一種類だけです。checkpointにはarchitecture versionを
+記録してあり、構造と合わないcheckpointを読み込もうとした場合は早期に拒否します。
