@@ -18,7 +18,9 @@ docs/*
 logs/
 
 *.tar.gz
-submission/
+submission/*
+!submission/build_submission.sh
+!submission/main.py
 nohup.out
 
 .claude/
